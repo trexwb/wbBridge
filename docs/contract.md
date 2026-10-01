@@ -6,9 +6,12 @@
 > 3. 本文件的表格
 >
 > ⚠ 自动化现状（如实标注）：原先实读这三处并断言集合相等的契约测试 `src/core/test/contract.test.js`
-> 已随 Node 核心一起归档，**当前仓库没有三处一致性的自动门禁**，改动任一动作表必须人工核对另外两处。
-> 现存的自动保护只有 `src-tauri/core/src/server.rs` 内的单测（断言每个动作路由都挂在 `/admin/` 下、且不与
-> `/v1/*` 等业务路由冲突）与 `src-tauri/core/tests/red_lines.rs`（鉴权、Origin、限流等安全红线）。
+> 已随 Node 核心一起归档。**两张代码内的动作表现在有自动门禁**：`src-tauri/src/lib.rs` 的
+> `shell_action_routes_match_the_core_contract` 实读 `ADMIN_ROUTES` 与 `src-tauri/core/src/server.rs` 的
+> `ACTION_ROUTES` 并断言逐项一致（`cargo test --lib`，在 `src-tauri/` 下运行）。
+> **本文件的表格仍是第三份手写副本，没有自动校验**，改动任一动作表时须人工核对这里。
+> 其余自动保护：`src-tauri/core/src/server.rs` 内单测（每个动作路由挂在 `/admin/` 下、不与 `/v1/*` 冲突）
+> 与 `src-tauri/core/tests/red_lines.rs`（鉴权、Origin、限流、运行时下载来源等安全红线）。
 >
 > 核心是静态链接进壳的 Rust 库（crate `wbbridge-core`，编排层 `src-tauri/core/src/orchestration.rs`），
 > 不再是独立 sidecar 进程；但两侧仍按本机回环 HTTP 通信，本契约的路由与鉴权语义不变。
@@ -25,9 +28,19 @@
 
 面板侧链路：`src/core/bridge.js` 的 `action(name, value)`（前端内核，不是后端）→ Tauri 命令
 `core_action(action, payload)` → `admin_route()` → `admin_call()`；例外是面板的 `restart` 动作，它不经
-`/admin/*`，直接映射为壳命令 `restart_core`。壳另有 `core_running`、`data_dir_path` 两个命令，状态由壳
-轮询 `status.json` 后推给面板：`core-status` 是**剥掉 `activity` 与 `modelResults` 的轻量快照**，
-这两个字段单独走 `core-activity`（每 500ms 轮询只在内容变化时发），失败走 `core-failed`。面板
+`/admin/*`，直接映射为壳命令 `restart_core`。壳另有 **三个**命令（均不经 `/admin/*`）：
+
+| 壳命令 | 载荷 | 返回 / 语义 |
+|---|---|---|
+| `core_running` | 无 | 查询核心是否在运行 |
+| `data_dir_path` | 无 | 取当前数据目录路径 |
+| `read_log` | **无参数** | 只读数据目录下 `opencode.log` 的**尾部**，返回 `{ text, truncated, bytes }`；尾部截断 256KB / 最多 1200 行，不读 `opencode.log.previous`；不接受路径入参、不写任何文件 |
+
+新增 / 改名只读命令必须同步 `src-tauri/src/lib.rs` 的 `generate_handler`；自有命令不经 capability 授权，
+`capabilities/default.json` 无需改动。
+
+状态由壳轮询 `status.json` 后推给面板：`core-status` 是**剥掉 `activity` 与 `modelResults` 的轻量快照**（顶层 `usage` 仍随该快照下发），
+这两个字段单独走 `core-activity`（每 500ms 轮询只在内容变化时发），失败走 `core-failed`——**壳判定核心不可用（启动失败或任务已结束）期间不再推送残影 `status.json`，改为每 ~4s 重播一次 `core-failed`**，因此面板监听器必须对同一原因的重复投递幂等；核心恢复后壳会作废「上一份内容」缓存并重新推送一次完整状态。面板
 `src/core/bridge.js` 必须把两路合并成完整状态再交给订阅者，否则逐模型明细与活动文案永远为空。
 
 ## 鉴权与结果判据

@@ -55,16 +55,48 @@ export async function action(name, value) {
       return { ok: true, result: {} }
     }
     if (name === 'import' && !value) {
-      const selected = await window.__TAURI__.dialog.open({
-        multiple: false,
-        directory: false,
-        filters: [{ name: 'WorkBuddy models.json', extensions: ['json'] }],
-      })
-      if (!selected) return { ok: true, result: { canceled: true } }
-      value = { modelsFile: selected }
+      // 核心的 /admin/import 在不传 modelsFile 时就是「同步到已解析配置」（与归档 JS 核心的
+      // importModels() 语义一致）；只有定位不到配置时才需要用户手选文件。因此弹框是兜底，
+      // 不是无条件的前置步骤——否则每次点「导入 WorkBuddy」都会被要求选目录。
+      // 能走到这里按钮必然处于可用态（phase=ready），lastState 已由 core-status 填好。
+      const resolved = typeof lastState.modelsFile === 'string' && lastState.modelsFile
+      if (!resolved) {
+        const selected = await window.__TAURI__.dialog.open({
+          multiple: false,
+          directory: false,
+          filters: [{ name: 'WorkBuddy models.json', extensions: ['json'] }],
+        })
+        if (!selected) return { ok: true, result: { canceled: true } }
+        value = { modelsFile: selected }
+      }
     }
     const result = await invoke('core_action', { action: name, payload: value ?? null })
     return { ok: true, result }
+  } catch (error) {
+    return { ok: false, error: String(error) }
+  }
+}
+
+// 以下两条是**只读**调用（新增视图用），与上面的 action/onState/onDismiss 契约互不影响：
+// 面板不得借它们写文件，也不接受任何路径参数。
+
+// 运行日志尾部：由壳读数据目录下的日志文件，截断上限在壳侧常量里（不在前端拼接路径）。
+export async function readLog() {
+  ensureBridge()
+  try {
+    const { invoke } = window.__TAURI__.core
+    return { ok: true, result: await invoke('read_log') }
+  } catch (error) {
+    return { ok: false, error: String(error) }
+  }
+}
+
+// 壳实际使用的数据目录（status.json / 运行日志都在这里）。
+export async function dataDir() {
+  ensureBridge()
+  try {
+    const { invoke } = window.__TAURI__.core
+    return { ok: true, result: await invoke('data_dir_path') }
   } catch (error) {
     return { ok: false, error: String(error) }
   }

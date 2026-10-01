@@ -77,6 +77,8 @@ const TRANSLATOR_ORDER: [&str; 4] = [
 ];
 
 /// status.json 的结构版本号；壳侧读取时校验，不一致只提示不阻断。
+/// 口径：向后兼容的**加法式**顶层字段（如 `usage`）不递增本值；删除 / 改名顶层字段或改变既有字段语义时才 +1
+/// （须与壳侧 `src-tauri/src/lib.rs` 的 `STATUS_SCHEMA_VERSION` 同步）。
 const STATUS_SCHEMA_VERSION: u32 = 1;
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -153,6 +155,49 @@ fn write_exclusive(path: &str, text: &str) -> std::io::Result<()> {
     }
     let mut file = options.open(path)?;
     file.write_all(text.as_bytes())
+}
+
+/// 以 `0600` 覆盖写入密钥文件（`write_exclusive` 只能独占创建，空白文件已存在时必须改写它）。
+/// 权限位在 Windows 上不适用，与 `write_exclusive` 保持同一限制。
+fn write_secret_file(path: &str, text: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // `mode` 只在新建时生效：覆盖已存在的空白文件必须显式 chmod，
+        // 否则轮换出来的密钥可能留在 0644 上。失败一律上报，不静默降级。
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(text.as_bytes())
+}
+
+/// 读取或生成 `api-key`，返回 `(key, 本轮是否重新写入)`。
+///
+/// 空白内容必须重新生成而不是沿用：`server.rs` 把期望头拼成 `format!("Bearer {key}")`，
+/// 空 key 会让任何带 `Authorization: Bearer ` 的本地进程通过鉴权（安全红线 1）。
+/// 空白文件此前不可能被任何客户端用过，因此重写不丢弃任何可用凭据。
+fn resolve_api_key(token_file: &str) -> Result<(String, bool), String> {
+    match std::fs::read_to_string(token_file) {
+        Ok(text) if !text.trim().is_empty() => Ok((text.trim().to_string(), false)),
+        Ok(_) => {
+            let key = random_hex(32);
+            write_secret_file(token_file, &key).map_err(|error| error.to_string())?;
+            Ok((key, true))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let key = random_hex(32);
+            write_exclusive(token_file, &key).map_err(|error| error.to_string())?;
+            Ok((key, true))
+        }
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// 向 `opencode.log` 追加一行（带 ISO 时间戳）；日志句柄缺省时静默丢弃。
@@ -309,6 +354,14 @@ impl App {
 /// 落盘由 `persist_status` 触发 —— 二者分开是为了保证「先取快照、后释放锁」，
 /// 避免 std::Mutex 跨越 await 持有。
 fn update(patch: Value) -> Value {
+    update_with_usage(patch, None)
+}
+
+/// `update` 的用量变体：可选的 `(clientModelId, ok, durationMs)` 在**同一次持锁**内累加 `usage`。
+///
+/// 必须与补丁合并共用一把锁：`status.json` 是全量快照而不是增量日志，并发请求各自读旧值再各自
+/// 回写时，后写者会覆盖先写者的计数。`None` 即原来的 `update` 语义。
+fn update_with_usage(patch: Value, usage_entry: Option<(&str, bool, i64)>) -> Value {
     let app = global_app();
     let mut guard = lock(&app.state);
     if let (Some(target), Some(patch)) = (guard.as_object_mut(), patch.as_object()) {
@@ -317,7 +370,78 @@ fn update(patch: Value) -> Value {
         }
         target.insert("updatedAt".to_string(), json!(now_iso8601()));
     }
+    if let Some((model, ok, duration_ms)) = usage_entry {
+        let current = guard.get("usage").cloned().unwrap_or(Value::Null);
+        let next = accumulate_usage(&current, model, ok, duration_ms);
+        if let Some(target) = guard.as_object_mut() {
+            target.insert("usage".to_string(), next);
+            target.insert("updatedAt".to_string(), json!(now_iso8601()));
+        }
+    }
     guard.clone()
+}
+
+/// 用量口径：只有真实客户端请求（`source == "request"`）计入；探测与任何其它来源都不计。
+///
+/// 客户端取消的请求不会走到 `record`（`server.rs` 在 AbortSignal 取消时不回调 `on_result`），
+/// 因此「取消不得记成功」由调用链保证，而不是靠这里过滤。
+fn usage_counted(source: &str) -> bool {
+    source == "request"
+}
+
+/// 全新用量基线：`since` 取首次开始统计的时刻（跨重启由既有状态延续，见 `bootstrap`）。
+fn fresh_usage() -> Value {
+    json!({
+        "since": now_iso8601(),
+        "total": { "requests": 0, "ok": 0, "failed": 0 },
+        "models": {},
+    })
+}
+
+/// 形状校验：`total` / `models` 必须是对象，否则视为上一份状态不可用（重建基线，不沿用脏值）。
+fn is_usage_shape(value: &Value) -> bool {
+    value.get("total").is_some_and(Value::is_object) && value.get("models").is_some_and(Value::is_object)
+}
+
+/// 累加一次真实请求的用量。
+///
+/// `lastMs` 是最近一次耗时；`avgMs` 由「累计均值」递推（四舍五入）得到 —— 因此不需要额外
+/// 落一个总耗时字段，status.json 的 `usage` 形状保持规格给定的五个字段。
+fn accumulate_usage(current: &Value, model: &str, ok: bool, duration_ms: i64) -> Value {
+    let mut usage = if is_usage_shape(current) { current.clone() } else { fresh_usage() };
+    if let Some(total) = usage.get_mut("total").and_then(Value::as_object_mut) {
+        let requests = total.get("requests").and_then(Value::as_i64).unwrap_or(0) + 1;
+        let succeeded = total.get("ok").and_then(Value::as_i64).unwrap_or(0) + i64::from(ok);
+        let failed = total.get("failed").and_then(Value::as_i64).unwrap_or(0) + i64::from(!ok);
+        total.insert("requests".to_string(), json!(requests));
+        total.insert("ok".to_string(), json!(succeeded));
+        total.insert("failed".to_string(), json!(failed));
+    }
+    // 解析不出客户端模型 ID 的请求只进 total：计数必须诚实，不能凭空造一个模型名。
+    if !model.is_empty() {
+        if let Some(models) = usage.get_mut("models").and_then(Value::as_object_mut) {
+            let entry = models.entry(model.to_string()).or_insert_with(|| {
+                json!({ "requests": 0, "ok": 0, "failed": 0, "lastMs": 0, "avgMs": 0 })
+            });
+            if let Some(entry) = entry.as_object_mut() {
+                let requests = entry.get("requests").and_then(Value::as_i64).unwrap_or(0) + 1;
+                let succeeded = entry.get("ok").and_then(Value::as_i64).unwrap_or(0) + i64::from(ok);
+                let failed = entry.get("failed").and_then(Value::as_i64).unwrap_or(0) + i64::from(!ok);
+                let previous_avg = entry.get("avgMs").and_then(Value::as_f64).unwrap_or(0.0);
+                let average = if requests > 1 {
+                    (previous_avg * (requests - 1) as f64 + duration_ms as f64) / requests as f64
+                } else {
+                    duration_ms as f64
+                };
+                entry.insert("requests".to_string(), json!(requests));
+                entry.insert("ok".to_string(), json!(succeeded));
+                entry.insert("failed".to_string(), json!(failed));
+                entry.insert("lastMs".to_string(), js_number(duration_ms as f64));
+                entry.insert("avgMs".to_string(), js_number(average.round()));
+            }
+        }
+    }
+    usage
 }
 
 /// 把状态快照串行写入 `status.json`（对应 `statusWrites` 链）。
@@ -559,6 +683,11 @@ async fn record(
             json!({ "lastPermission": { "time": result["time"].clone(), "entries": permissions } })
         });
 
+    // 用量口径：只有真实客户端请求计入（探测与其它来源既不进 total 也不进 models）。
+    // 无论本次结果是否会撤销发布（REQUEST_SHAPED_FAILURES 早退），这次请求都已经真实发生过，
+    // 因此必须在早退之前算出待累加的条目。
+    let usage_entry = usage_counted(source).then_some((model, ok, duration_ms));
+
     if !ok
         && source == "request"
         && REQUEST_SHAPED_FAILURES.iter().any(|shaped| Some(*shaped) == code)
@@ -567,7 +696,7 @@ async fn record(
         let mut patch = Map::new();
         patch.insert("lastRequest".to_string(), result.clone());
         insert_all(&mut patch, captured.as_ref());
-        persist_status(update(Value::Object(patch)));
+        persist_status(update_with_usage(Value::Object(patch), usage_entry));
         return;
     }
 
@@ -602,7 +731,7 @@ async fn record(
         ),
     );
     insert_all(&mut patch, captured.as_ref());
-    persist_status(update(Value::Object(patch)));
+    persist_status(update_with_usage(Value::Object(patch), usage_entry));
 }
 
 // ---------------------------------------------------------------------------
@@ -753,7 +882,11 @@ fn start_probes(model_id: Option<Value>, reveal: bool, auto_import: bool) -> Val
     if selected.is_empty() {
         return json!({ "error": { "message": "模型不在当前目录中", "type": "invalid_request_error" } });
     }
-    app.probing.store(true, Ordering::Relaxed);
+    // 真正的占用声明必须原子：两个并发 `/admin/probe` 都能通过上面的 `load` 检查，
+    // 先后 `store(true)` 就会各起一批探测，同一模型被并发探测、结果互相覆盖。
+    if app.probing.swap(true, Ordering::Relaxed) {
+        return json!({ "started": false, "message": "检测正在进行" });
+    }
     let pending: Vec<String> = selected
         .iter()
         .filter_map(|model| model.get("id").and_then(Value::as_str).map(str::to_string))
@@ -766,6 +899,14 @@ fn start_probes(model_id: Option<Value>, reveal: bool, auto_import: bool) -> Val
     });
     *lock(&app.probe_task) = Some(Slot::new(id, done_rx));
     json!({ "started": true })
+}
+
+/// 从「待探测」列表移除当前模型。`pending` 只收录带字符串 `id` 的条目，缺 id 的模型不在其中，
+/// 因此不能按位置 `remove(0)`（列表提前耗尽会 panic 并让整批探测停在 running 态）。
+fn drop_pending(pending: &mut Vec<String>, model_id: &str) {
+    if let Some(index) = pending.iter().position(|id| id == model_id) {
+        pending.remove(index);
+    }
 }
 
 async fn run_probe_batch(
@@ -819,7 +960,7 @@ async fn run_probe_batch(
         let error = match outcome {
             ProbeOutcome::Passed => {
                 record(&model_id, true, None, None, None, duration_ms, "probe", None, &meta.snapshot()).await;
-                pending.remove(0);
+                drop_pending(&mut pending, &model_id);
                 update_and_persist(json!({ "probe": { "running": true, "pending": pending.clone() } }));
                 continue;
             }
@@ -829,7 +970,7 @@ async fn run_probe_batch(
         let timed = deadline.signal().is_aborted() && !app.probe_abort.signal().is_aborted();
         let error = probe::probe_failure(error, timed);
         if app.stopping.load(Ordering::Relaxed) {
-            pending.remove(0);
+            drop_pending(&mut pending, &model_id);
             update_and_persist(json!({ "probe": { "running": true, "pending": pending.clone() } }));
             continue;
         }
@@ -896,7 +1037,7 @@ async fn run_probe_batch(
             )
             .await;
         }
-        pending.remove(0);
+        drop_pending(&mut pending, &model_id);
         update_and_persist(json!({ "probe": { "running": true, "pending": pending.clone() } }));
     }
     if auto_import && !app.stopping.load(Ordering::Relaxed) {
@@ -1027,20 +1168,6 @@ async fn refresh(restart_runtime: bool, use_system_proxy: Option<bool>) -> Resul
     }
     let current_proxy = truthy(app.snapshot().get("useSystemProxy").unwrap_or(&Value::Bool(false)));
     let enabled = use_system_proxy.unwrap_or(current_proxy);
-    let proxy_env = to_env_map(
-        &system_proxy_environment(enabled)
-            .await
-            .map_err(|error| BackendError::plain(error.message))?,
-    );
-
-    lock(&app.validated).clear();
-    *lock(&app.models) = Vec::new();
-    update_and_persist(json!({
-        "phase": "reading",
-        "message": "正在读取免费模型…",
-        "models": [],
-        "availableModels": []
-    }));
 
     // 任务在链位登记之后才开始（gate），否则先结束的这一轮会把链位清成 None 再被写回。
     let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1054,7 +1181,25 @@ async fn refresh(restart_runtime: bool, use_system_proxy: Option<bool>) -> Resul
     let recorded = slot.outcome.clone();
     tokio::spawn(async move {
         let _ = gate_rx.await;
-        let outcome = run_refresh(restart_runtime, enabled, proxy_env).await;
+        // 代理解析与「正在读取」的清理都挪到链位登记之后：这一段有 await，留在登记之前的话
+        // 两个并发 refresh（面板双击、启动刷新撞上手动刷新）都会在空中链位处判定「无人刷新」，
+        // 各自跑完整轮，把隔离运行时重启两次、把彼此的模型结果覆盖掉。
+        let outcome = match system_proxy_environment(enabled).await {
+            Err(error) => Err(BackendError::plain(error.message)),
+            Ok(env) => {
+                let proxy_env = to_env_map(&env);
+                let app = global_app();
+                lock(&app.validated).clear();
+                *lock(&app.models) = Vec::new();
+                update_and_persist(json!({
+                    "phase": "reading",
+                    "message": "正在读取免费模型…",
+                    "models": [],
+                    "availableModels": []
+                }));
+                run_refresh(restart_runtime, enabled, proxy_env).await
+            }
+        };
         // 对应 JS 的 `finally { refreshing = null }`：只有当前代次才有权释放链位。
         if *lock(&global_app().refresh_generation) == generation {
             *lock(&global_app().refresh) = None;
@@ -1376,7 +1521,10 @@ fn bootstrap(options: &StartOptions) -> Result<Arc<App>, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700));
+        // 数据目录内是 api-key / status.json / 隔离配置，0700 失败必须终止启动，
+        // 否则密钥文件所在目录对外可读，红线只剩文件权限这一层。
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("数据目录 {data_dir} 权限设为 0700 失败：{error}"))?;
     }
 
     // 3. 单实例锁（service.pid）：进程仍存活即视为已在运行。
@@ -1397,17 +1545,9 @@ fn bootstrap(options: &StartOptions) -> Result<Arc<App>, String> {
     }
     write_exclusive(&lock_file, &std::process::id().to_string()).map_err(|error| error.to_string())?;
 
-    // 4. api-key（缺失时随机生成 32 字节 hex，0600）。
+    // 4. api-key（缺失或内容为空白时随机生成 32 字节 hex，0600）。
     let token_file = join_host(&[&data_dir, "api-key"]);
-    let api_key = match std::fs::read_to_string(&token_file) {
-        Ok(text) => text.trim().to_string(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let key = random_hex(32);
-            write_exclusive(&token_file, &key).map_err(|error| error.to_string())?;
-            key
-        }
-        Err(error) => return Err(error.to_string()),
-    };
+    let (api_key, key_written) = resolve_api_key(&token_file)?;
 
     // 5. settings.json（容错解析）。
     let settings: Value = std::fs::read_to_string(join_host(&[&data_dir, "settings.json"]))
@@ -1447,6 +1587,14 @@ fn bootstrap(options: &StartOptions) -> Result<Arc<App>, String> {
             let _ = writeln!(guard, "{} 未注入 BUDDY_DATA_DIR，使用平台默认数据目录 {data_dir}（Tauri 壳运行时以壳的 app_data_dir 为准）", now_iso8601());
         }
     }
+    // 密钥重新生成必须留痕（值本身绝不落日志）：WorkBuddy 侧的旧 Bearer 会因此失效，
+    // 无声轮换会被当成"服务突然 401"来排查。
+    if key_written {
+        if let Some(handle) = log_handle.as_ref() {
+            let mut guard = lock(handle);
+            let _ = writeln!(guard, "{} api-key 缺失或内容为空，已重新生成随机密钥（值不写入日志）", now_iso8601());
+        }
+    }
 
     let use_system_proxy = settings.get("useSystemProxy") == Some(&json!(true))
         || (platform::host_platform() == "win32"
@@ -1464,6 +1612,13 @@ fn bootstrap(options: &StartOptions) -> Result<Arc<App>, String> {
         "opencodeVersion": Value::Null,
         "models": [],
         "modelResults": previous.get("modelResults").cloned().unwrap_or_else(|| json!({})),
+        // 用量跨重启延续（与 modelResults 同法）：上一份形状合法就整体沿用，`since` 与累计值都不重置；
+        // 缺字段/形状不对（旧版核心写的 status.json）才重建基线。
+        "usage": previous
+            .get("usage")
+            .cloned()
+            .filter(is_usage_shape)
+            .unwrap_or_else(fresh_usage),
         "sync": Value::Null,
         "availableModels": [],
         "probe": { "running": false },
@@ -1810,6 +1965,64 @@ fn install_signal_handlers() {
 mod tests {
     use super::*;
 
+    /// `drop_pending` 按 id 移除：待探测列表只收录带字符串 id 的模型，按位置 `remove(0)` 在列表
+    /// 提前耗尽时会 panic，整批探测停在 `running` 且 `probing` 永远为真。
+    #[test]
+    fn pending_probe_list_only_drops_the_matching_id() {
+        let mut pending = vec!["a".to_string(), "b".to_string()];
+        drop_pending(&mut pending, "a");
+        assert_eq!(pending, vec!["b".to_string()]);
+        // 缺 id / 已移除的 id 都应为无操作，而不是越界。
+        drop_pending(&mut pending, "");
+        drop_pending(&mut pending, "a");
+        assert_eq!(pending, vec!["b".to_string()]);
+        drop_pending(&mut pending, "b");
+        drop_pending(&mut pending, "b");
+        assert!(pending.is_empty());
+    }
+
+    /// api-key 引导红线：空白文件必须重新生成，而不是 `trim()` 成空串沿用。
+    /// 空 key 会让 `server.rs` 的期望头退化成 `"Bearer "`，任何本地进程都能通过鉴权。
+    #[test]
+    fn a_blank_api_key_file_is_regenerated_instead_of_accepted() {
+        let dir = std::env::temp_dir().join(format!(
+            "wbbridge-apikey-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("临时数据目录可建");
+        let file = dir.join("api-key");
+        let path = file.to_str().expect("临时路径是 utf-8");
+
+        std::fs::write(&file, "   \n").expect("空白密钥文件可写");
+        let (first, regenerated) = resolve_api_key(path).expect("空白密钥必须被修复，而不是沿用");
+        assert!(regenerated, "空白文件必须报告为已重新生成");
+        assert_eq!(first.len(), 64, "重新生成的是 32 字节 hex，长度 {}/64", first.len());
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("密钥文件可读").trim(),
+            first,
+            "落盘内容必须与实际使用的密钥一致"
+        );
+
+        // 已生成的密钥必须沿用，否则每次重启都轮换、WorkBuddy 侧 Bearer 立刻失效。
+        let (second, regenerated) = resolve_api_key(path).expect("有效密钥可沿用");
+        assert_eq!(second, first, "同一密钥文件不得每次读取都轮换");
+        assert!(!regenerated, "沿用时应报告未重写");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file)
+                .expect("密钥文件可统计")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "覆盖写入的密钥权限位必须是 0600");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 串行链登记必须原子：并发登记时只允许一个线程拿到「无前驱」。
     /// 若两个线程读到同一个 predecessor，写链就分叉 —— 两条分支并发执行同一次写，
     /// 且后登记的一方覆盖先登记的 Slot，`drain()` 等不到被覆盖的那条写。
@@ -1860,5 +2073,70 @@ mod tests {
             Some(Err(error)) => assert_eq!(error.message, "运行时下载失败"),
             None => panic!("复用者必须读得到首个调用者的失败"),
         }
+    }
+
+    /// 用量口径：只有真实客户端请求计入，探测不计（`probe` 与空来源都必须被挡在计数之外）。
+    #[test]
+    fn usage_only_counts_real_client_requests() {
+        assert!(usage_counted("request"));
+        assert!(!usage_counted("probe"));
+        assert!(!usage_counted(""));
+    }
+
+    /// 基线形状必须自证合法；旧版核心写的 status.json（无 usage）与写坏的形状都必须判脏重建。
+    #[test]
+    fn usage_baseline_shape_is_validated() {
+        let baseline = fresh_usage();
+        assert!(is_usage_shape(&baseline), "全新基线必须形状合法：{baseline}");
+        assert!(baseline["since"].as_str().is_some(), "基线必须带 ISO 起始时刻");
+        assert_eq!(baseline["total"], json!({ "requests": 0, "ok": 0, "failed": 0 }));
+        assert_eq!(baseline["models"], json!({}));
+
+        assert!(!is_usage_shape(&Value::Null));
+        assert!(!is_usage_shape(&json!({ "total": { "requests": 1 } })), "缺 models 必须判脏");
+        assert!(!is_usage_shape(&json!({ "total": 1, "models": {} })), "total 非对象必须判脏");
+    }
+
+    /// 真实请求逐次累加：total 与逐模型的 requests/ok/failed/lastMs/avgMs 都必须对得上，
+    /// 且累加不得重置 `since`（跨重启延续靠它）。
+    #[test]
+    fn accumulate_usage_tracks_totals_and_per_model_stats() {
+        let baseline = fresh_usage();
+        let since = baseline["since"].clone();
+
+        let usage = accumulate_usage(&baseline, "OC · A", true, 1200);
+        let usage = accumulate_usage(&usage, "OC · A", false, 800);
+        let usage = accumulate_usage(&usage, "OC · A", true, 1000);
+
+        assert_eq!(usage["total"], json!({ "requests": 3, "ok": 2, "failed": 1 }));
+        assert_eq!(usage["models"]["OC · A"]["requests"], 3);
+        assert_eq!(usage["models"]["OC · A"]["ok"], 2);
+        assert_eq!(usage["models"]["OC · A"]["failed"], 1);
+        assert_eq!(usage["models"]["OC · A"]["lastMs"], 1000, "lastMs 是最近一次耗时");
+        assert_eq!(usage["models"]["OC · A"]["avgMs"], 1000, "avgMs = (1200+800+1000)/3");
+        assert_eq!(usage["since"], since, "累加不得重置 since");
+    }
+
+    /// 不同模型各自成条：A 的计数不得串到 B；`avgMs` 为累计均值（四舍五入到整数毫秒）。
+    #[test]
+    fn accumulate_usage_keeps_models_separate() {
+        let usage = accumulate_usage(&fresh_usage(), "OC · A", true, 100);
+        let usage = accumulate_usage(&usage, "OC · B", true, 300);
+        assert_eq!(usage["models"]["OC · A"]["requests"], 1);
+        assert_eq!(usage["models"]["OC · B"]["requests"], 1);
+        assert_eq!(usage["total"]["requests"], 2);
+
+        let usage = accumulate_usage(&usage, "OC · A", false, 200);
+        assert_eq!(usage["models"]["OC · A"]["avgMs"], 150, "(100 + 200) / 2");
+        assert_eq!(usage["models"]["OC · A"]["lastMs"], 200);
+        assert_eq!(usage["models"]["OC · B"]["avgMs"], 300, "B 的均值不得被 A 的请求污染");
+    }
+
+    /// 判不出客户端模型 ID 的请求只进 total：不得凭空造模型名，也不能丢计数。
+    #[test]
+    fn accumulate_usage_without_model_id_only_counts_total() {
+        let usage = accumulate_usage(&fresh_usage(), "", false, 50);
+        assert_eq!(usage["total"], json!({ "requests": 1, "ok": 0, "failed": 1 }));
+        assert_eq!(usage["models"], json!({}), "无模型 ID 时不得创建模型条目");
     }
 }
