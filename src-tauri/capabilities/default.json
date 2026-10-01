@@ -1,0 +1,16 @@
+[
+  {
+    "identifier": "default",
+    "description": "WB Bridge 主窗口能力：窗口 / 事件等核心插件 API 的最小集合。注意：本应用自有的 IPC 命令（core_action / restart_core / core_running / data_dir_path，见 src-tauri/src/lib.rs 的 generate_handler）属于应用命令，不经 capability 授权，因此这里既不需要也无法为它们列条目；本文件只声明插件侧权限。",
+    "windows": ["main"],
+    "permissions": [
+      "core:default",
+      "core:window:allow-start-dragging",
+      "core:window:allow-close",
+      "core:window:allow-hide",
+      "core:window:allow-show",
+      "core:event:allow-listen",
+      "dialog:allow-open"
+    ]
+  }
+]

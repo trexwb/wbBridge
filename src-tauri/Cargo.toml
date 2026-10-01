@@ -1,0 +1,34 @@
+[package]
+name = "wbbridge"
+version = "1.0.0"
+description = "WB Bridge — 让 WorkBuddy 使用 OpenCode 免费模型"
+authors = ["WB Bridge"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "wbbridge_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+# 核心代理以库形式嵌进壳进程（不再有 sidecar 子进程）：编排层见 src-tauri/core/src/orchestration.rs。
+# 核心仍是独立 crate（path 依赖）：它的 195 个测试不需要编译 tauri/webkit 图，也能单独跑出 wbbridge-core 二进制。
+wbbridge-core = { path = "core" }
+# 核心需要独立的专用运行时（不能嵌进 Tauri 自己的异步上下文里 block_on）。
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

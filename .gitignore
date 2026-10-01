@@ -1,0 +1,115 @@
+# Dependencies
+node_modules/
+jspm_packages/
+bower_components/
+web_modules/
+
+# Build / Output
+dist/
+dist-ssr/
+dist-electron/
+build/Release/
+.next/
+out/
+.nuxt/
+.vuepress/dist/
+lib-cov/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Diagnostic reports
+report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage
+coverage/
+*.lcov
+.nyc_output/
+
+# Cache & Intermediate
+.grunt/
+.lock-wscript
+.tsbuildinfo
+.npm/
+.eslintcache
+.rpt2_cache/
+.rts2_cache_cjs/
+.rts2_cache_es/
+.rts2_cache_umd/
+.node_repl_history
+.cache/
+.parcel-cache/
+.fusebox/
+.dynamodb/
+.tern-port
+.serverless/
+
+# Yarn v2
+.yarn/cache/
+.yarn/unplugged/
+.yarn/build-state.yml
+.yarn/install-state.gz
+.pnp.*
+.yarn-integrity
+
+# Lock files
+# package-lock.json 必须入库：.github/workflows/release.yml 全流程使用 npm ci，缺 lock 会直接失败。
+
+# Environment variables
+.env
+.env.development
+.env.test
+.env.stage
+.env.production
+*.local
+
+# IDE / Editor
+.vscode/
+.vscode-test/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# AI / Agent local files
+.qwen/
+.cursor/
+.marvis/
+.workbuddy/
+.trae/
+.codex/
+.dumate/
+.zwork/
+
+# OS
+.DS_Store
+
+# Temp
+.tmp/
+
+# Rust / Tauri
+src-tauri/target/
+src-tauri/gen/schemas/
+src-tauri/gen/icons/
+**/target/
+
+# 本地密钥与凭据（严禁提交）
+.env.local
+
+# 核心已内嵌进 Tauri 壳（src-tauri/core 编成静态库），不再有 externalBin sidecar。
+# 这条规则留着只是防止误把历史 sidecar 产物加回仓库。
+src-tauri/binaries/
