@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
-use wbbridge_core::{backend, platform, probe, runtime, server, sync};
+use wbbridge_core::{backend, platform, probe, providers, runtime, server, sync};
 
 const KEY: &str = "red-line-test-key";
 
@@ -272,6 +272,45 @@ fn subprocess_environment_only_passes_the_allow_list() {
 }
 
 #[test]
+fn version_probe_child_environment_only_passes_the_allow_list() {
+    // `--version` 探测跑的是「尚未取得信任的外部二进制」（托管下载的运行时、本机各处候选）。
+    // 这一类一次性 spawn 曾走过 `env: None` 分支，等于把宿主的 provider Key 整体交给它。
+    let mut host = HashMap::new();
+    for name in [
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+        "WorkBuddy_TOKEN",
+        "HOME",
+        "PATH",
+    ] {
+        host.insert(name.to_string(), format!("leak-{name}"));
+    }
+    host.insert("LANG".to_string(), String::new());
+
+    let allowed = runtime::allowed_environment(&host);
+    for name in allowed.keys() {
+        assert!(
+            runtime::ENV_ALLOW.contains(&name.as_str()),
+            "白名单之外的变量进了子进程：{name}"
+        );
+    }
+    for name in [
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+        "WorkBuddy_TOKEN",
+    ] {
+        assert!(!allowed.contains_key(name), "宿主凭据泄漏进探测子进程：{name}");
+    }
+    assert_eq!(allowed.get("HOME").map(String::as_str), Some("leak-HOME"));
+    assert!(
+        !allowed.contains_key("LANG"),
+        "空值不得透传：子进程会看到 LANG=\"\"，与「未设置」是两种行为"
+    );
+}
+
+#[test]
 fn sync_only_owns_entries_tagged_with_its_marker() {
     assert_eq!(
         sync::OWNER,
@@ -336,5 +375,57 @@ async fn runtime_downloads_never_leave_the_registry_allow_list() {
     assert!(
         attempted.iter().all(|url| url.ends_with("/latest")),
         "元数据判为不可信后不应再发起任何下载：{attempted:?}"
+    );
+}
+
+/// 平台接入面（凭据红线 + 供应链红线的交叉处）。
+///
+/// 1. 注册表是**复核过的集合**：往 `providers.rs` 里加一家平台，等于把一个没人审过的上游
+///    接进「用户的 Key 会随请求头发出去」这条链路，必须同步改这里才允许通过。
+/// 2. `provider-status` 是面板唯一能读到的平台信息：即使数据目录里真的存着 Key，它的输出也
+///    不得含任何 Key 材料、凭据文件名或 `apiKey` 字段。
+#[test]
+fn provider_registry_is_reviewed_and_status_echoes_no_key_material() {
+    let mut ids: Vec<&str> = providers::PROVIDERS.iter().map(|provider| provider.id).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec!["modelscope", "siliconflow-cn", "tencent-tokenhub", "zhipuai"],
+        "接入的平台集合是复核过的，改动 providers.rs 必须同步这条断言"
+    );
+    for provider in providers::PROVIDERS {
+        assert!(
+            provider.base_url.starts_with("https://"),
+            "{} 的 baseURL 必须是 HTTPS：平台 Key 会作为 Bearer 头发出去",
+            provider.id
+        );
+        assert_eq!(
+            provider.npm, "@ai-sdk/openai-compatible",
+            "{} 的 SDK 形态变了：注入路径与探测判定都要重新核对",
+            provider.id
+        );
+    }
+
+    const SECRET: &str = "red-line-provider-secret";
+    let dir = std::env::temp_dir().join(format!("wbbridge-red-line-providers-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("临时数据目录");
+    providers::set_key(&dir.to_string_lossy(), "modelscope", SECRET).expect("写入测试 Key");
+    let status = providers::status(&dir.to_string_lossy());
+    let text = serde_json::to_string(&status).expect("状态可序列化");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        !text.contains(SECRET) && !text.contains("apiKey"),
+        "provider-status 回显了凭据字段或 Key：{text}"
+    );
+    let listed = status["providers"].as_array().expect("providers 是数组");
+    assert_eq!(listed.len(), providers::PROVIDERS.len());
+    assert_eq!(
+        listed
+            .iter()
+            .filter(|item| item["configured"] == json!(true))
+            .count(),
+        1,
+        "只应有一个平台显示为已配置"
     );
 }
