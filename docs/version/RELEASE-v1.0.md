@@ -4,7 +4,77 @@
 > 命名规则：`RELEASE-v{主版本}.md`；次版本迭代追加到文件顶部新分节。
 > 版本纪律以根目录 `AGENTS.md`「当前基准版本」章节为准，本文件不另立规则。
 > 整理规则：同类问题多次修复的条目合并为一条，统一记述于最终修复版本；被合并的早期版本保留编号与合并指向，不再重复正文。
-> 当前最新版本：**v1.0.1**。
+> 当前最新版本：**v1.0.2**。
+
+---
+
+## v1.0.2 · 📝 待发布
+
+> **状态**: 📝 待发布（改动在工作区，**尚未提交、尚未打标签**；GUI 未实机启动、`release.yml` 未在 CI 跑过、v1.0.2 的安装包未构建）
+> **日期**: 2026-10-02
+> **上一版本**: v1.0.1（远端标签 `v1.0.1` → `679a2cb`，含版本推进提交 `46c7c56`；**本地标签仍指 `f046208`**，同步动作属维护者）
+> **GitHub Release 正文**: [`RELEASE-NOTES-v1.0.2.md`](RELEASE-NOTES-v1.0.2.md)
+> **本版主题**: 自动更新链路接入（updater + process 插件、签名产物、`latest.json` 单一写者）+ 发布链路自证（标签↔版本闸门、产物名自检）+ 面板偏好持久化；2026-10-03 追加一轮渲染与轮询降耗（不推进版本号）。
+> **版本推进理由**: 本版新增内容与 v1.0.1 **不同类、不同根因**——把「升级只能靠手动重装」变成「应用内检查 → 下载 → 重启生效」，并给发布链路加上防标签指错的门禁与偏好持久化。**推进动作由维护者本人执行**（工作区 5 处落点已改为 `1.0.2`，`npm run version:check` 通过），Agent 未擅自推进。
+
+### 一、版本号落点（`npm run version:set -- 1.0.2` + `npm run version:check` 实测）
+
+| 位置 | 值 | 说明 |
+|---|---|---|
+| 根 `package.json` → `version` | **1.0.2** | 版本单一来源；本版另加 `test:prefs`、`test:manifest` 脚本 |
+| `src-tauri/tauri.conf.json` → `version` | **1.0.2** | 打包产物版本（安装包名随之为 `WB Bridge_1.0.2_*`）与 `plugins.updater` 清单的 `version` 来源 |
+| `src-tauri/Cargo.toml` → `[package] version` | **1.0.2** | 壳工程同步落点（`src-tauri/Cargo.lock` 内 `wbbridge` 同为 1.0.2） |
+| `AGENTS.md`「当前基准版本」两行 | **1.0.2** | 文档侧同步落点 |
+| 面板 `__APP_VERSION__` | `v1.0.2` | `vite.config.js` 构建期从 `package.json` 注入（「关于与更新」展示），非独立落点 |
+| `src-tauri/core/Cargo.toml` → `version` | `0.1.0`（**未改**） | crate 内部版本，与产品版本有意解耦 |
+| `orchestration.rs` 写入 `status.json` 的 `version` | `0.2.0`（**未改**） | 历史沿革值；`schemaVersion` 仍为 `1`（本版未新增/改名 `status.json` 顶层字段） |
+
+`npm run version:check` 实测输出：**全部 5 处版本号一致（1.0.2）**。
+
+### 二、本版内容（详见 `RELEASE-NOTES-v1.0.2.md` 与 `docs/validation.md` 同日条目）
+
+- **自动更新接线（壳）**：`src-tauri/Cargo.toml` 新增 `tauri-plugin-updater` + `tauri-plugin-process`（官方插件、同一维护方），`lib.rs` 的 builder 链注册两者；`tauri.conf.json` 加 `bundle.createUpdaterArtifacts: true` 与 `plugins.updater`（内嵌 `pubkey`，key ID `126D4E208E0F17BA`；端点 `https://github.com/trexwb/wbBridge/releases/latest/download/latest.json`）；`capabilities/default.json` 只加 `updater:default` + `process:allow-restart`（**刻意不用 `process:default`**：它含 `allow-exit`，会让 WebView 绕过 `quit_app` 的优雅关停链硬杀进程）。
+- **重启路径不再冻窗口**：`RunEvent::ExitRequested` 由事件循环线程上的无界 `graceful_stop` 改为 **`stop_core_bounded`**（复用 `STOP_BUDGET = 8s`）——`process.relaunch()` 也走这条分支，无界停止会让「重启」看起来像卡死。⚠ 该项**无单测覆盖**（需真实 `AppHandle`），效果属必须实机看的一类。
+- **面板更新区**：`src/core/update.js` 状态机（`idle/checking/available/downloading/ready/uptodate/error`，冷启动 5s 后静默检查、静默失败不打扰）+ `src/core/bridge.js` 的 `checkUpdate/downloadUpdate/relaunchApp`（调官方插件命令，联网在 Rust 侧，CSP 无需放宽，**未新增自有 IPC 命令/事件**）；`AboutView.vue` 只在真有新版本时出现更新条，进度百分比只在上游给出 `contentLength` 时显示。
+- **`latest.json` 单一写者**：`scripts/gen-latest-json.mjs`（平台键取自产物**目录名**的 target triple，默认六平台缺一即退出 1）+ CI 末尾 `update-manifest` 作业；三个 build 作业的 `tauri-action` 全部 `includeUpdaterJson: false`（6 个并发作业各写一次会互相覆盖）。macOS 更新包由 CI 补架构后缀（tauri 原名 `WB Bridge.app.tar.gz` 不带版本与架构，两个 mac runner 会同名互相覆盖）。
+- **发布链路自证（A9）**：CI `test` 作业新增**标签↔版本闸门**（`GITHUB_REF_NAME` 去前导 `v` 必须等于 `tauri.conf.json` 的 `version`，否则 exit 1；`workflow_dispatch` 跳过）；三个 build 作业上传前打印 bundle 文件名与源码版本；`update-manifest` 汇总六平台安装包并把「产物版本 = 标签版本」自检三分类写进 run summary（**advisory warning 而非硬失败**，因非 macOS 产物名仍未实测）。
+- **`latest.json` 生成器入库行为基线（A6-7b）**：新增 `scripts/gen-latest-json.test.mjs`（`node --test`，**9 通过**，命令 `npm run test:manifest`），用 `mkdtemp` 临时产物目录跑**真脚本**，钉住「平台键只由 artifact 目录名的 target triple 决定」以及四类必须失败的路径（缺平台 / 缺 `.sig` / mac 资产名漏架构后缀 / 同一平台多个候选目录或互不相干的已签名包），并覆盖 Linux 双层打包时优先取 `.tar.gz` 的降级口径。此前这些结论只在一次性手写夹具里验证过、**未入库**，回归无从保护；现在这类错误的暴露点从「用户装上才发现平台缺席」提前到 CI。测试**不联网**、不读 `src-tauri/target/` 下的真实产物。
+- **面板偏好持久化（A8 + A6-7）**：新增 `src/core/prefs.js`——`localStorage` 键前缀 `wb.`、**写入前键白名单校验** + 值字段投影 + 序列化后 2KB 上限、存储不可用/抛错一律静默降级为默认值；`App.vue` 持久化当前视图，`update.js` 持久化「启动后自动检查更新」开关与上次**成功**检查时间戳（12 小时节流），`AboutView.vue` 提供该开关。凭据类字段（`api-key`、`OPENCODE_SERVER_PASSWORD`、models 文件路径）在设计上不可能进入 `localStorage`，由 `src/core/prefs.test.js`（`node --test`，**8 通过**）钉住，命令 `npm run test:prefs`。
+- **文档（A5 / A7 / A10）**：`.env.example` 写清三个签名环境变量的真实分工（`tauri build|bundle` 只读 `TAURI_SIGNING_PRIVATE_KEY`，值可为私钥全文或**绝对路径**）；`docs/wiki/版本与发布.md` 新增「商业签名与公证（A7 预留位，尚未接入）」「失败路径与回滚」「标签纪律」三节并扩充发布前检查清单；`docs/wiki/常见问题与故障排查.md` 补更新失败/回滚/偏好开关/Gatekeeper 四条；`docs/wiki/已知限制与未验证项.md` 按实测状态更正未验证项与已知限制表。
+
+### 三、基线与验证边界（本版真实执行）
+
+- 核心 `cargo test` → **207 通过 / 0 失败**（lib 187 + `js_parity` 11 + `red_lines` 9）；核心 `cargo clippy --all-targets` → **0 warning**（`touch src/lib.rs` 强制重检后仍为 0）。
+- 壳 `cargo test --lib` → **9 通过 / 0 失败**；壳 `cargo clippy --no-deps --all-targets` → **0 warning**（版本改写触发重新检查，无告警）。
+- `npm run test:prefs` → **8 通过 / 0 失败**；`npm run test:manifest` → **9 通过 / 0 失败**；`npx eslint .` → **0 problem**；`npm run vite:build` → ✓ built；`npm run version:check` → 5 处一致（1.0.2）；`release.yml` YAML 解析通过。两组 JS 测试都已接入 CI 的 `test` 作业。
+- 本机签名构建（发生在 `1.0.1` 源码版本上，产物名因此带 `1.0.1`）：`bundle/dmg/WB Bridge_1.0.1_aarch64.dmg`（3,720,766 B）+ `bundle/macos/WB Bridge.app.tar.gz`（3,595,514 B）与配对 `.sig`，key ID 与配置公钥一致；dmg 只读挂载核对、`codesign --verify --deep --strict` 通过（adhoc + hardened runtime，**未公证**）。
+- ❌ **未验证**：GUI 实机启动与面板交互、v1.0.2 的任何安装包、`release.yml` 在 CI 实跑、`latest.json` 发布后被真实客户端消费、一次完整的「检查 → 下载 → 安装 → 重启 → 首启」与失败回滚、`relaunch` 后带新核心的重启、`localStorage` 在真实 WebView 内的行为、Windows/Linux 产物名与签名、GitHub Secrets 是否已配（本机无 `gh`、未联网核验）。
+
+### 四、兼容与升级口径
+
+- **对外契约未变**：HTTP 路由、错误码、`status.json` 字段（本版无新增/改名）、自有 IPC 命令名与事件名全部保持 v1.0.1 原样；`STATUS_SCHEMA_VERSION` 两侧仍为 `1`。
+- **新增的是插件权限**（`updater:default`、`process:allow-restart`）与两个官方插件依赖，不影响既有命令。
+- **v1.0.1 及更早的用户收不到自动更新**：那一版没有接线更新器（产物无 `.sig`、面板无更新区），必须**手动下载 v1.0.2 安装包覆盖安装一次**；此后 v1.0.2 → v1.0.3 才可能走应用内更新。
+- 数据目录与 WorkBuddy 写入规则不变；`api-key` 沿用，无需重装后重配。
+
+### 五、2026-10-03 追加（不推进版本号）：渲染与轮询降耗 + 同日代码复审修正
+
+- **壳**（`src-tauri/src/lib.rs`）：`watch_status` 原先每 500ms 都 `read_to_string` 整份 `status.json`（实测 8.6 KB）再逐字节比对；改为先用 `(mtime, 长度)` 前置过滤，两者都没变即跳过，只有变了才读内容，`stamp` 只在成功读到内容后记录（避免读取失败的那一轮被误当稳态）。
+- **核心**（`src-tauri/core/Cargo.toml` + `src-tauri/Cargo.lock` + `src-tauri/core/Cargo.lock`）：`reqwest` 拆除 `brotli` feature；同处留注 `base64 = "0.22"` 不动。
+- **面板**（`src/core/bridge.js`、`src/views/ModelList.vue`、`src/App.vue`）：`core-status` / `core-activity` / `core-failed` 改为状态操作入队 + `requestAnimationFrame` 每帧最多 flush 一次；无结果的行与详情共用 `EMPTY_RESULT` 稳定引用，「请求中」判断由逐行 `some()` 改为一次成 `Set`。
+- **不推进版本号**：降耗与同日复审修正都属同一未发布版本（v1.0.2）内的打磨与再修复，未引入新功能、无新根因修复，版本保持 **1.0.2**（`npm run version:check` 复验 5 处一致）。
+
+**同日代码复审（两个独立 code-reviewer 并行复审上述改动）的结论与修正**：
+
+- 🔴 **修 1（会冻结面板状态）**：原先 `meta.modified().unwrap_or(UNIX_EPOCH)` 让 mtime 不可得时 stamp 退化成 `(EPOCH, 长度)`，此后**长度不变的改写被永久跳过**、面板不再收到任何推送。改为 `meta.modified().ok().map(...)` + 新增 `status_read_needed()`：**拿不到 mtime 就不启用快路径**，一律回落读内容。
+- 🔴 **修 2（吞掉既有保障）**：恢复运行分支原先只 `last.clear()`，没作废 stamp；而该分支注释的整条理由就是「重启后 status.json 可能与故障前逐字节相同，不重置就永远不会再推送」——粗粒度 mtime 文件系统上这条保障被快路径抵消。现补 `last_stamp = None`。
+- 🟠 **修 3（队列无上限）**：替换型事件（`core-status` / `core-failed`，其 payload 整体替换状态）入队前先 `pendingOps.length = 0`。这与逐条折叠**严格等价**（后面的替换本就丢弃前面所有 op 的产出），却让队列天然封顶——否则窗口不可见、rAF 停摆期间队列每 ~0.5s 堆两个持有整份 payload 的闭包。
+- 🟠 **修 4（注释与事实不符）**：「合并语义与逐个执行**完全**等价」不成立——订阅者侧等价，但 `lastState` 要到帧末才更新，事件到达与 flush 之间的**同步读取点**（`action()` 里的 `lastState.modelsFile`、`onState()` 的首次回放）会读到旧一帧。按最小改动只更正注释、不改逻辑（影响是极小概率多弹一次文件选择框，下一帧自愈）。
+- 🟡 **修 5（依赖注释的事实修正）**：`base64` 注释的「依赖树里的两份」口径**只对核心 workspace 成立**（实读 `src-tauri/core/Cargo.lock`：0.22.1 ← reqwest、0.23.1 ← hyper-util；壳 workspace 是**三份**，另有一份 0.21.7 ← `swift-rs`），注释已限定范围。「npm registry 回 gzip」本轮**独立复测**（`curl -H 'Accept-Encoding: gzip, br'`）：两白名单源的元数据均 `content-encoding: gzip`，而 tarball（npmjs 直连、npmmirror 的 CDN 目标）均为 `application/octet-stream` 且**不带 content-encoding**——即 brotli 在真实链路上从不被用到，去掉它不影响 sha512 校验语义。另补口径边界：这是**核心 crate 自身**依赖树的收益，壳产物里 brotli 仍会经 `tauri-codegen` 引入，安装包总体积不会因此等量减少。
+- ✅ **复审确认无恙的项**（不再重复怀疑）：`service_down` 分支 emit `core-failed` 后直接 `continue`，故障期间不发 `core-status`，故 FIFO 折叠不会出现「status 洗掉 error」；`EMPTY_RESULT` 共享单例安全（`ModelRow.vue`、`ModelDetails.vue` 对 `props.result` 全为只读取值）；`props.activity || []` **不是冗余**（壳在缺键时会发 `activity: null`，prop 默认值拦不住 null）；两份 Cargo.lock 无多删漏删（核心恰好移除 brotli/brotli-decompressor/alloc-stdlib/alloc-no-stdlib，壳只删 async-compression 的一行引用）；未新增 IPC 命令或事件名、未写 localStorage、未引入外部请求、未推进版本号。
+- ⚠️ **仍无单测的项**：新补的 `status_read_needed_only_skips_when_mtime_is_known` 只覆盖快路径**判定**；`watch_status` 整条循环仍需真实 `AppHandle`，面板帧合并也没有 JS 单测（JS 侧仍只有 `test:prefs` 8 + `test:manifest` 9 两套）。
+- **验证（2026-10-03 复审后复跑）**：核心 `cargo test` **207 通过 / 0 失败**、壳 `cargo test --lib` **9 通过 / 0 失败**（8 → 9，新增上述快路径判定）、核心与壳 `cargo clippy` **0 warning**、`npm run test:prefs` **8 通过**、`npm run test:manifest` **9 通过**、`npx eslint .` **0 problem**、`npm run vite:build` ✓ built（`dist/assets/index-*.js` 100.87 kB / gzip 37.95 kB）、`npm run version:check` **5 处一致（1.0.2）**。细节见 `docs/validation.md` 2026-10-03 条目与 [`RELEASE-NOTES-v1.0.2.md`](RELEASE-NOTES-v1.0.2.md)。
+- ⚠️ 渲染 / 轮询收益仍需实机确认：GUI 从未启动，rAF 在 WKWebView 中最小化 / `hide()` 下的真实停摆行为未实测。
 
 ---
 
@@ -55,7 +125,7 @@
 > **版本范围**: 项目首个基线版本——Tauri 托盘壳 + **Rust 核心（crate `wbbridge-core`，path 依赖静态链接）** 的桥接工具，面向 WorkBuddy 提供隔离托管的 OpenCode 免费模型服务；Node.js 仅用于 Vite 构建面板与两个版本号脚本，**不存在 sidecar / pkg / `src-tauri/binaries/`**
 > **版本号说明**: 本次仅新增 `docs/version/`（本文档 + `README.md`），属纯文档更新，按版本纪律**不推进版本号**，仍按约定建分节留痕；2026-10-01 的核心迁移更正同样**不推进版本号**（产品版本保持 1.0.0）
 
-> ⚠ **2026-10-01 迁移更正说明**：本节下方「一、版本号基线核验」「二、代码与资产快照」「三、尚未入库/未实现项」最初按 Node/sidecar 形态记录，现已按迁移后的真实仓库状态更正；原记录中的 **97 通过 / 0 失败**（`node --test`）属于**已归档的 JS 核心**（连同其测试移到仓库外 `/Users/wbtrex/website/localServer/node/trexwb/backup/wbBridge-node-20261001/`），不再是当前基线。当前基线：`cargo test`（`src-tauri/core/`）**207 通过 / 0 失败**（lib 187 + `js_parity` 11 + `red_lines` 9），壳侧另有 `cargo test --lib`（`src-tauri/`）**5 通过**（该分节口径；同日第九轮「关窗即退出」补 3 项壳侧单测后为 **8 通过**，见顶部 v1.0.1 分节）。同日历史：迁移复验轮 **195**（lib 177）→ 全量代码审查修复轮 **197**（lib 179）→ 面板与只读视图轮 **202**（lib 184）→ 安全与并发修复轮 **207**（本轮，详见 `docs/validation.md`）。
+> ⚠ **2026-10-01 迁移更正说明**：本节下方「一、版本号基线核验」「二、代码与资产快照」「三、尚未入库/未实现项」最初按 Node/sidecar 形态记录，现已按迁移后的真实仓库状态更正；原记录中的 **97 通过 / 0 失败**（`node --test`）属于**已归档的 JS 核心**（连同其测试移到仓库外 `/Users/wbtrex/website/localServer/node/trexwb/backup/wbBridge-node-20261001/`），不再是当前基线。当前基线：`cargo test`（`src-tauri/core/`）**207 通过 / 0 失败**（lib 187 + `js_parity` 11 + `red_lines` 9），壳侧另有 `cargo test --lib`（`src-tauri/`）**5 通过**（该分节口径；同日第九轮「关窗即退出」补 3 项壳侧单测后为 **8 通过**，见顶部 v1.0.1 分节；2026-10-03 代码复审修正轮补快路径判定后为 **9 通过**，见顶部 v1.0.2 分节）。同日历史：迁移复验轮 **195**（lib 177）→ 全量代码审查修复轮 **197**（lib 179）→ 面板与只读视图轮 **202**（lib 184）→ 安全与并发修复轮 **207**（本轮，详见 `docs/validation.md`）。
 
 > ⚠ **2026-10-01 面板布局改造说明**：同日面板（`src/`，Vue 3）完成一次布局改造，本节「二、代码与资产快照」的 `src/` 一条已按改造后状态记录：详情面板改为**右侧常驻分栏**（`--details-w: clamp(300px, 45%, 360px)`，可收起，`Esc` / 详情头部按钮 / 窗口失焦三条等价路径，无遮罩层、不覆盖列表）、**删除 `<900px` 上下堆叠降级**；默认窗口由 980×680 调整为 **1120×720**（最小 `860×560` 不变）；侧栏宽 `--sidebar-w` 由 224px 调整为 **208px** 并改为分组导航（模型 / 运行 / 集成 / 其他 + 运行设置），其中 4 个入口当时仅为禁用态 + 「规划中」标签（同日第四轮已把 5 个入口全部实现，见下方快照与 `docs/validation.md`）；`styles/variables.css` 新增 `--muted-strong`。属同一未发布版本的界面调整，**不推进版本号**；验证证据见 `docs/validation.md`「面板布局改造」（**仅在浏览器引擎内经 CDP 实测，GUI 仍未实机启动**）。
 

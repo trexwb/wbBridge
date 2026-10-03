@@ -2,8 +2,10 @@
 // 根组件：布局壳 + 全局状态持有者。
 // 状态经 src/core/bridge.js 订阅（与 Electron 版 window.buddy 契约一致），
 // 下发给视图组件；跨组件动作也统一走 bridge.action()。
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { action, onState, onDismiss } from './core/bridge.js'
+import { loadView, saveView } from './core/prefs.js'
+import { startSilentCheck } from './core/update.js'
 import SideBar from './views/SideBar.vue'
 import ModelList from './views/ModelList.vue'
 import ModelDetails from './views/ModelDetails.vue'
@@ -17,9 +19,14 @@ import AboutView from './views/AboutView.vue'
 
 const state = ref({})
 const selected = ref(null)
+// 详情无结果时共享同一个空对象：引用稳定，ModelDetails 不被无关状态推送触发更新。
+const EMPTY_RESULT = {}
 // 当前视图：与 SideBar 的 item.id 一一对应（'models' | 'logs' | 'usage' | 'workbuddy' | 'about'）。
 // 视图状态由根组件持有，侧栏只派发切换事件，避免两处各存一份选中态。
-const view = ref('models')
+// 初值来自 prefs（上次停留的视图）；非法或已删除的视图名会在读取时回落 'models'。
+const view = ref(loadView())
+// 记住视图属于界面偏好，写入即发即忘：偏好写失败（隐私模式 / 配额）绝不能影响切换本身。
+watch(view, next => { saveView(next) })
 // 进行中的动作名（null = 空闲）：模板按动作名点亮对应按钮的 spinner。
 const busyAction = ref(null)
 const feedback = ref(null) // { text, error }
@@ -96,6 +103,8 @@ onMounted(() => {
   onState(apply)
   onDismiss(dismiss)
   window.addEventListener('keydown', onKeydown)
+  // 更新检查与核心状态无关，可以并行；延迟交给 update.js，避免和启动探测抢带宽。
+  startSilentCheck()
 })
 
 onUnmounted(() => {
@@ -187,7 +196,7 @@ onUnmounted(() => {
         <ModelDetails
           v-if="selected"
           :model="selected"
-          :result="(state.modelResults || {})[selected.id] || {}"
+          :result="(state.modelResults || {})[selected.id] || EMPTY_RESULT"
           @collapse="dismiss"
         />
       </div>

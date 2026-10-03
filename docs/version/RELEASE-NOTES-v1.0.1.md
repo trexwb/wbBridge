@@ -1,14 +1,3 @@
----
-AIGC:
-    Label: "1"
-    ContentProducer: 001191440300708461136T1XGW3
-    ProduceID: 75cf1e850e5668c557334a2fa39f707b_bb484d25bd8e11f197eb525400393706
-    ReservedCode1: xZlpuAQrYZgGgfJC7ZJV9MWbbRfXd/9SzusGmGxCejbeWM/5rkGHG/FbJY5quSG/sP9Yb6K3U1e4bVgRNixsCBK4tmqbXF239ekw7JGf0HhfdNwPc3KW2HCj4DFVkmNTKb8iPS5SLt2BF9Wn9UZLebquXwtQi8XaJeuZBvyVbwZbZTBtWSjihehqnNQ=
-    ContentPropagator: 001191440300708461136T1XGW3
-    PropagateID: 75cf1e850e5668c557334a2fa39f707b_bb484d25bd8e11f197eb525400393706
-    ReservedCode2: xZlpuAQrYZgGgfJC7ZJV9MWbbRfXd/9SzusGmGxCejbeWM/5rkGHG/FbJY5quSG/sP9Yb6K3U1e4bVgRNixsCBK4tmqbXF239ekw7JGf0HhfdNwPc3KW2HCj4DFVkmNTKb8iPS5SLt2BF9Wn9UZLebquXwtQi8XaJeuZBvyVbwZbZTBtWSjihehqnNQ=
----
-
 # WB Bridge v1.0.1
 
 > **GitHub Release 正文**（推送 `v1.0.1` 标签或手动运行 `release.yml` 时，可直接复制本文件内容作为 Release body）。
@@ -127,6 +116,14 @@ AIGC:
 4. 免费模型名单、额度与可用性由上游 OpenCode 决定，本工具不控制也不缓存额度。
 5. 浅色主题下 3 处次要文字（`App.vue` 副标题与页脚、`ModelRow.vue` 耗时行）仍用 `--muted`，对比度约 4.01/4.01/3.73，**低于 WCAG AA 的 4.5:1**；既有问题，本版未处理。
 6. 无确定性单测的既有条目：`service.pid` 单实例、探测路径禁用辅助模型转写、转写排除刚失败模型、格式类失败不撤发布、仅回环绑定、目录 `0700` 的失败分支、并发 `refresh()` 去重（依赖 await 交错，难以稳定构造）。
+
+## 🍎 macOS 首次打开（ad-hoc 签名放行）
+
+应用使用 ad-hoc 签名（未做 Apple 公证）。首次打开若被拦截：先尝试打开，再到「系统设置 → 隐私与安全性」点击「仍要打开」；若提示「已损坏」，确认来源可信后执行：
+
+```sh
+xattr -dr com.apple.quarantine "/Applications/WB Bridge.app"
+```
 
 ## 🧭 升级与兼容
 

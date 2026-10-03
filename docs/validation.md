@@ -1,10 +1,169 @@
-# WB Bridge v1.0.1 验证记录
+# WB Bridge v1.0.2 验证记录
 
 > 阅读顺序：最新记录在前。自 **2026-10-01** 起核心已从 Node.js sidecar 迁移为 Rust 库（静态链接进壳），
 > 该日期之后的条目描述 Rust 形态；下方的 2026-09-30 条目属于**迁移前的 Node/sidecar 时代**，作为历史
 > 保留原样（其 97 项测试、`src/core/`、`src-tauri/binaries/` 等结论已不再对应当前仓库）。
 
-日期：2026-10-01（本机 macOS，Apple Silicon；Rust 核心 + Vue 面板）
+日期：2026-10-02（本机 macOS，Apple Silicon；Rust 核心 + Vue 壳 + Vue 面板）
+
+日期：2026-10-03（本机 macOS，Apple Silicon；Rust 核心 + Vue 壳 + Vue 面板）
+
+## v1.0.2 追加：上一节降耗改动的代码复审与修正（2026-10-03，不推进版本号）
+
+复审方式：两个独立 `code-reviewer` 子代理**并行**复审上一节的 7 个改动文件（互不告知对方结论），主 Agent 再对两条 🔴 逐条实读源码确认后落地修正。**只修被查出的缺陷，未做任何重构**。
+
+### 查出的缺陷与修正
+
+| 级别 | 缺陷（复审前） | 修正 | 落点 |
+|---|---|---|---|
+| 🔴 会冻结面板状态 | `meta.modified().unwrap_or(UNIX_EPOCH)`：拿不到 mtime 时 stamp 退化成 `(EPOCH, 长度)`，此后**长度不变的改写被永久跳过**，面板再收不到任何 `core-status` | 改 `meta.modified().ok().map(...)`，stamp 变 `Option`；抽出 `status_read_needed(stamp, last_stamp)`：**`stamp` 为 `None` 时不启用快路径**，一律回落读内容 | `src-tauri/src/lib.rs` |
+| 🔴 吞掉既有保障 | 恢复运行分支只 `last.clear()`，未作废 `last_stamp`；而该分支注释的整条理由就是「重启后 `status.json` 可能与故障前逐字节相同，不重置就永远不会再推送」，粗粒度 mtime 文件系统上这条保障被快路径抵消 | 补 `last_stamp = None` | 同上 |
+| 🟠 队列无界 | rAF 在窗口不可见时暂停，替换型事件持续入队 → 队列只增不减；且原注释称「与逐个执行完全等价」过头 | `enqueue(op, replaces)`：替换型 op 入队前 `pendingOps.length = 0`（与逐条折叠严格等价且天然封顶）；注释改为**只对订阅者等价**——`lastState` 在帧末才更新，`action()` 读 `lastState.modelsFile` 与 `onState()` 首帧重放会看到上一帧，下一帧自愈 | `src/core/bridge.js` |
+| 🟠 不实的技术声明 | 「npm registry 仍回 gzip」是上游改动方的转述；「base64 两份来自 reqwest/hyper-util」在壳 workspace 不成立 | 用 `curl -H 'Accept-Encoding: gzip, br'` **实测两个白名单源**：registry **元数据**均回 `content-encoding: gzip`，**tarball** 是 `application/octet-stream` 且**不带** `content-encoding` → brotli 确无用；`Cargo.lock` 实读确认核心 workspace 两份（`0.22.1`←reqwest、`0.23.1`←hyper-util），**壳 workspace 有三份**（多出 `0.21.7`←`swift-rs`），注释因此限定范围并补上「壳仍经 `tauri-codegen` 引入 brotli，装机体积收益不等同」的口径边界 | `src-tauri/core/Cargo.toml` |
+| 🟡 文档口径 | 三处声明已写出「完全等价 / 零渲染损耗 / 纯属体积浪费」 | 随上两条同步改写，并把新增的未验证项（WKWebView 里 rAF 的真实暂停行为、mtime 粗粒度是否真的命中）显式标注 | `AGENTS.md`、`docs/version/*`、`docs/wiki/*` |
+
+### 复审同时判定为正确、未改动的点
+
+- `watch_status` 里读内容失败不会污染 stamp（`last_stamp` 只在成功读后记录）；
+- `EMPTY_RESULT` 共享空对象安全（无任何写入路径）；
+- `ModelList.vue` 的 `props.activity || []` **不是冗余**（壳在停机时确实下发 `activity: null`）；
+- 未新增 IPC 命令 / 事件、未碰 `prefs.js` 白名单、无外部请求、锁文件仅随 feature 变化；
+- 版本号按纪律保持 **1.0.2**。
+
+### 真实执行的验证（修正后复跑）
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test`（`src-tauri/core/`） | **207 通过 / 0 失败**（lib 187 + `js_parity` 11 + `red_lines` 9） |
+| `cargo clippy --all-targets`（核心） | **0 warning** |
+| `cargo test --lib`（`src-tauri/`） | **9 通过 / 0 失败**（8 → 9，新增 `status_read_needed_only_skips_when_mtime_is_known`：`None/Some→true`、`None/None→true`、同 stamp→false、mtime 变→true、长度变→true、`Some/None→true`） |
+| `cargo clippy --no-deps --all-targets`（壳） | **0 warning** |
+| `npm run test:prefs` | **8 通过 / 0 失败** |
+| `npm run test:manifest` | **9 通过 / 0 失败** |
+| `npx eslint .` | **0 problem** |
+| `npm run vite:build` | ✓ built（`dist/assets/index-B75qEZKZ.js` 100.87 kB / gzip 37.95 kB） |
+| `npm run version:check` | **5 处一致（1.0.2）** |
+
+### 仍未验证（不得伪装）
+
+- ❌ **GUI 仍未实机启动**：轮询快路径的真实命中情况、粗粒度 mtime 文件系统、帧级合并后面板的视觉与交互表现，全部只有「编译 + 单测 + 构建」证据。
+- ❌ 新增单测只钉住 `status_read_needed` 的**判定表**，不覆盖 `watch_status` 的完整循环（那需要真实 `AppHandle` 与文件系统）。
+- ❌ rAF 在 WKWebView 后台窗口是否真的暂停**未实测**（封顶改动让两种答案都安全，但收益大小依赖它）。
+- ❌ 上一节的「无单测覆盖」结论已由本轮的 1 项壳单测部分收窄，其余部分仍然成立。
+
+---
+
+## v1.0.2 追加：渲染与轮询降耗（2026-10-03，不推进版本号）
+
+> ⚠️ **本节已被上方「代码复审与修正」条目部分修正**：其中「两者都没变即跳过」（缺 mtime 不可得的守卫）、「合并语义与逐个执行等价 / 零渲染损耗」「npm registry 仍回 gzip（实测，指改动方自己的声明）」「本轮改动无单测覆盖」四项表述以修正后的版本为准；本节按下文原样保留，作为改动当时的记录（只增不改）。
+
+### 落地的改动
+
+| 项 | 内容 | 落点 |
+|---|---|---|
+| 壳侧轮询降耗 | `watch_status` 原先每 500ms 都 `read_to_string` 整份 `status.json`（实测 8.6 KB）再逐字节比对；改为先用 `(mtime, 长度)` 前置过滤，两者都没变即跳过读取，只有变了才读内容；`stamp` 只在成功读到内容后记录，避免读取失败的那一轮被误当稳态 | `src-tauri/src/lib.rs` |
+| 核心去掉未使用的 brotli 解压 | `reqwest` 移除 `brotli` feature：npm registry 在 `Accept-Encoding: gzip, br` 下仍回 gzip（实测），本地 OpenCode 不压缩，brotli 解压链纯属体积浪费；依赖树随之移除 brotli 相关 crate。同处留注 `base64 = "0.22"` 为何不动（依赖树里的两份来自 `reqwest` 0.22 与 `hyper-util` 0.23，由上游固定） | `src-tauri/core/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/core/Cargo.lock` |
+| 面板帧级合并发布 | `core-status` / `core-activity` / `core-failed` 三类事件改为按到达顺序折算成状态操作入队 + `requestAnimationFrame` 每帧最多 flush 一次（合并语义与逐个执行等价：status=替换、activity=合并、failed=替换；渲染从「每事件一次」降为「每帧一次」，窗口隐藏时 rAF 暂停、零渲染损耗；无 rAF 环境回落 `setTimeout(cb, 16)`） | `src/core/bridge.js` |
+| 行级 / 详情 props 引用稳定 | 无结果的行与详情共用同一个 `EMPTY_RESULT` 空对象（不随父级重渲染换引用，`ModelRow` / `ModelDetails` 只在自身数据真正变化时更新）；「请求中」判断由逐行 `activity.some()`（行数 × 活动数、每趟渲染重做）改为一次成 `Set` 后 `has()` | `src/views/ModelList.vue`、`src/App.vue` |
+
+- **版本号**：本追加属同一未发布版本（v1.0.2）内的打磨，未引入新功能、无新根因修复，**不推进版本号**，`npm run version:check` 复验 5 处落点仍一致（1.0.2）。
+- ⚠️ 本轮改动**无单测覆盖**，GUI 仍未实机启动，渲染 / 轮询收益需实机确认（未验证项见 `docs/wiki/已知限制与未验证项.md`）。
+
+### 真实执行的验证（2026-10-03 复跑）
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test`（`src-tauri/core/`） | **207 通过 / 0 失败**（lib 187 + `js_parity` 11 + `red_lines` 9） |
+| `cargo test --lib`（`src-tauri/`） | **8 通过 / 0 失败** |
+| `cargo clippy --all-targets`（核心）/ `cargo clippy --no-deps --all-targets`（壳） | 均 **0 warning** |
+| `npm run test:prefs` | **8 通过 / 0 失败** |
+| `npm run test:manifest` | **9 通过 / 0 失败** |
+| `npx eslint .` | **0 problem** |
+| `npm run vite:build` | ✓ built（`dist/assets/index-*.js` 100.84 kB / gzip 37.94 kB） |
+| `npm run version:check` | **5 处一致（1.0.2）** |
+
+---
+
+## v1.0.2 交付闭环：发布门禁、面板偏好、签名与回滚文档（2026-10-02，同日第一轮）
+
+### 落地的改动
+
+| 项 | 内容 | 落点 |
+|---|---|---|
+| A9 发布链路自证 | 三个 build 作业上传前打印「源码版本 / 触发引用 / bundle 文件名」；`update-manifest` 新增「产物版本自检」步骤，把六平台安装包按「文件名含本次版本 / 按设计不含版本（macOS 更新包）/ 待人工核对」三分类写进 `$GITHUB_STEP_SUMMARY`。**刻意只 `::warning::` 不硬失败**——非 macOS 产物名仍未实测，硬失败会把首跑 CI 全部标红 | `.github/workflows/release.yml` |
+| A8 面板偏好持久化 | 新增 `src/core/prefs.js`：`wb.` 前缀 + **写入前键白名单** + 值字段投影 + 序列化后 2KB 上限 + 存储不可用/抛错静默回落默认值。持久化两项：当前视图（`App.vue` `ref(loadView())` + `watch` 回写）、「启动后自动检查更新」开关与上次**成功**检查时间戳（`update.js` 新增 `setAutoCheck(enabled)`，`startSilentCheck()` 前置 `shouldSilentCheck()` 做 12h 节流），开关 UI 在「关于与更新」 | `src/core/prefs.js`、`src/App.vue`、`src/core/update.js`、`src/views/AboutView.vue` |
+| A6-7 偏好测试 | `src/core/prefs.test.js`（`node --test`，**8 用例**）+ 根脚本 `npm run test:prefs`；不引测试框架、不依赖 DOM（`globalThis.localStorage` + `withStorage(fakeStorage(), fn)`） | `src/core/prefs.test.js`、`package.json` |
+| A6-7b 更新清单测试（本轮追加） | `scripts/gen-latest-json.test.mjs`（`node --test`，**9 用例**）+ `npm run test:manifest`：`spawnSync` 跑真脚本 + `mkdtempSync` 临时产物目录，钉住六平台成功路径（平台键只由目录名 triple 决定、url 空格编码、签名取自 `.sig`）与七类失败/告警路径；版本号现读 `tauri.conf.json`，**不随版本推进失效**。此前这组检查只用一次性 `/tmp` 夹具跑过、未入库、无法复跑，本轮补成仓库内基线并纳入 CI `test` 作业 | `scripts/gen-latest-json.test.mjs`、`package.json`、`.github/workflows/release.yml` |
+| A7 签名预留位 | 「商业签名与公证」表：macOS `bundle.macOS.signingIdentity`（当前 `"-"`）+ 公证**只走环境变量**（Apple ID 路线 `APPLE_ID`/`APPLE_PASSWORD`/`APPLE_TEAM_ID`，或 ASC 路线 `APPLE_API_ISSUER`/`APPLE_API_KEY`/`APPLE_API_KEY_PATH`）、CI 钥匙串四变量；Windows `bundle.windows.certificateThumbprint` + `digestAlgorithm` + `timestampUrl`。键名经官方文档核对（Context7 实读），`tauri.conf.json` 是严格 JSON 不能写注释，故预留位只落在文档 | `docs/wiki/版本与发布.md` |
+| A10 失败路径与回滚 | 四条失败路径表（检查失败 / 下载或安装失败 → **不存在半更新** / 重启走有界停止 / 更新后首启失败报 `core-failed`）+ 5 步手动回滚 + 对应故障排查条目（含「macOS 更新后被 Gatekeeper 重新拦下」） | `docs/wiki/版本与发布.md`、`docs/wiki/常见问题与故障排查.md` |
+| A5 发布日志 | `docs/version/RELEASE-v1.0.md` 顶部新增 v1.0.2 分节；新增 `docs/version/RELEASE-NOTES-v1.0.2.md` 作 GitHub Release 正文；`docs/version/README.md` 索引与落点表更新 | `docs/version/*` |
+| 文档口径更正 | `docs/wiki/已知限制与未验证项.md`：未验证项补第 9（偏好持久化 GUI 未实测）、10（回滚链路未实机）两行，第 2/3/4 行按实测状态改写，「已验证对照」补壳 8 通过 + prefs 8 通过；已知限制第 10/11 行换成当前事实（产品版本 1.0.2、103 个被跟踪文件、v1.0.2 未提交），新增第 15（偏好只两项，并注明代理开关其实由核心持久化在 `settings.json`）与第 16（存储里绝不写凭据）。标签纪律一节按实读换成「远端 `v1.0.1` → `679a2cb`（含版本推进提交 `46c7c56`）、本地标签仍指 `f046208`」 | 三个 wiki 页 + `AGENTS.md` |
+
+### 真实执行的验证（2026-10-02）
+
+| 命令 | 结果 |
+|---|---|
+| `cargo test`（`src-tauri/core/`） | **207 通过 / 0 失败**（lib 187 + `js_parity` 11 + `red_lines` 9） |
+| `cargo clippy --all-targets`（核心） | **0 warning**（`touch src/lib.rs` 强制重检后仍为 0） |
+| `cargo test --lib`（`src-tauri/`） | **8 通过 / 0 失败** |
+| `cargo clippy --no-deps --all-targets`（壳） | **0 warning**（版本改写触发重新检查） |
+| `npm run test:prefs` | **8 通过 / 0 失败** |
+| `npm run test:manifest` | **9 通过 / 0 失败** |
+| `npx eslint .` | **0 problem**（含新增两个测试文件） |
+| `npm run vite:build` | ✓ built（`dist/assets/index-*.js` 100.54 kB / gzip 37.76 kB） |
+| `npm run version:check` | **全部 5 处版本号一致（1.0.2）** |
+| `python3 -c "yaml.safe_load(...)"` | `release.yml` 解析通过，作业 `test / build-macos / build-windows / build-linux / update-manifest`，`test` 作业 8 步（含新增单测步与标签闸门） |
+
+### 未验证（不得伪装）
+
+- ❌ **GUI 从未实机启动**：视图恢复、`autoCheck` 开关的真实 `localStorage` 行为、更新条与重启流程都只有单测 + 构建证据。
+- ❌ `release.yml` **未在 CI 跑过**（新增的产物名打印与自检步骤同样只做过 YAML 结构校验）；GitHub Secrets 是否已配**本机无法核验**（无 `gh`、未联网查证）。
+- ❌ 未构建 v1.0.2 安装包；本机上一次打包发生在 `1.0.1` 源码版本（只出过 macOS aarch64 的 dmg + updater 包 + `.sig`，且 `.app` 未运行）。
+- ❌ 一次真实的「检查 → 下载 → 安装 → 重启 → 首启」与其失败回滚从未走过；需要一次真实的 v1.0.2 → v1.0.3 才能验证。
+
+### 本轮范围决定（如实记录）
+
+- A8 只做计划里**已有 UI 控件**的两项（视图 + 自动检查开关）：计划中的其余项（详情栏收起状态、代理开关、窗口尺寸/位置）要么本就没有 UI、要么需要新依赖 `tauri-plugin-window-state`，其在无 GUI 实测下与 `quit_app` 关停时序的交互无法确认，**未接入**，留待用户决策。
+- 产物名自检选择「告警而非硬失败」，理由同上（非 macOS 命名未实测）。
+- 未提交、未打标签、未推任何东西；未启动 GUI（会写真实的 `~/.workbuddy/models.json`）。
+
+## updater 接线、真实签名构建与更新清单（2026-10-01，同日第十轮）
+
+### 落地的改动
+
+- **Rust 侧**：`src-tauri/Cargo.toml` 新增 `tauri-plugin-updater = "2"`、`tauri-plugin-process = "2"`（Cargo.lock +298 行 / **24 个新传递 crate**；理由：官方 Tauri 插件、与既有 tauri 同一维护方，是应用内更新的唯一正规路径）。`lib.rs` builder 链注册两者。
+- **配置**：`tauri.conf.json` 加 `bundle.createUpdaterArtifacts: true` 与 `plugins.updater`（内联 `pubkey`，端点 `https://github.com/trexwb/wbBridge/releases/latest/download/latest.json`）。
+- **权限**：`capabilities/default.json` 加 `updater:default` + **`process:allow-restart`**（不是 `process:default`：后者含 `allow-exit`，会让 WebView 绕过 `quit_app` 的优雅关停链直接杀进程）。
+- **前端**：`src/core/bridge.js` 加 `checkUpdate/downloadUpdate/relaunchApp`（`Update` 句柄只留在模块内，视图拿可序列化快照）；新增 `src/core/update.js` 状态机（`idle|checking|available|downloading|ready|uptodate|error`，冷启动 5s 后静默检查、静默失败不打扰）；`App.vue` 挂载时启动静默检查；`AboutView.vue` 换成真实更新区；`base.css` 新增确定型进度条 `.progress`（`prefers-reduced-motion` 允许清单同步补 `.progress.is-active > i::after`）。
+- **脚本 / CI**：新增 `scripts/gen-latest-json.mjs`（`npm run gen:latest`）；`release.yml` 三个构建作业补 `.sig` / `.app.tar.gz` / `.AppImage.tar.gz` glob 与签名环境变量、`includeUpdaterJson: false`、**macOS 补架构后缀**步骤，末尾新增 `update-manifest` 作业单点写 `latest.json`。
+- **依赖判断更正**：**不需要**任何 `@tauri-apps/plugin-*` npm 包 —— `app.withGlobalTauri` 会把插件 API 注入 `window.__TAURI__.updater` / `.process`（读 `@tauri-apps/cli` 内的 `api-iife.js` 证实）。面板因此仍无外部请求、CSP 不变。
+
+### 实测证据（本轮真实执行）
+
+| 步骤 | 结果 |
+|---|---|
+| `cargo test`（`src-tauri/core/`） | ✅ **207 通过 / 0 失败**（lib 187 + js_parity 11 + red_lines 9） |
+| `cargo test --lib`（`src-tauri/`） | ✅ **8 通过 / 0 失败** |
+| `cargo clippy --all-targets`（核心）/ `--no-deps --all-targets`（壳） | ✅ **0 warning**（两者） |
+| `npx eslint .` | ✅ 0 problems（`.vue` 不在 `eslint.config.js` 匹配范围内，仍是既有缺口） |
+| `npm run vite:build` | ✅ 通过 |
+| `node scripts/gen-latest-json.mjs` 合成产物测试 | ✅ 正例 4 项：六平台齐全、linux 裸 `.AppImage` 与 `.tar.gz` 并存（取 `.tar.gz` 并告警）、只有裸 `.AppImage`、`--expect` 收窄 + `--tag` 覆盖；负例 5 项全部退出 1：mac 资产缺架构后缀、某平台缺 `.sig`、同目录互不相干的两个已签名包、平台目录缺失、产物目录不存在 |
+| 真实签名构建 `tauri build --bundles app` | ✅ 产出 `WB Bridge.app.tar.gz`（3,595,514 B）+ `WB Bridge.app.tar.gz.sig`（428 B）；解析签名包体得 key ID **`126D4E208E0F17BA`**，与 `tauri.conf.json` 内嵌公钥一致；trusted comment 含 `version:1.0.1` |
+| `tauri build --bundles dmg` | ✅ 产出 `WB Bridge_1.0.1_aarch64.dmg`（3,720,766 B / 3.55 MiB）；只读挂载后核对：`WB Bridge.app` + `Applications` 软链，Mach-O **arm64**、`CFBundleShortVersionString=1.0.1`、id `app.wbbridge.desktop`；`codesign` 显示 `flags=0x10002(adhoc,runtime)`、`Signature=adhoc`、无 TeamID；`codesign --verify --deep --strict` = valid on disk + satisfies DR；核对后已 `hdiutil detach` |
+
+### 本轮推翻了四条此前写进文档的结论
+
+1. **`latest.json` 不能交给 tauri-action**：官方文档那句 "Tauri Action generates a static JSON file" 在**单平台**成立；本工作流是 6 个并发作业往同一个 tag 上传，各写一次清单会互相覆盖并静默漏平台。因此改为 `includeUpdaterJson: false` + 末尾单一 `update-manifest` 作业。
+2. **平台键不能靠产物文件名推**：macOS 的 updater 包实测就叫 `WB Bridge.app.tar.gz` —— 既无版本也无架构，两个 mac runner 的名字完全相同（会互覆盖 Release 资产）。故键名改由 artifact **目录名**（含 target triple）推导，并在 mac 作业补一道改名。
+3. **签名变量的分工**：`tauri build|bundle` 只读 `TAURI_SIGNING_PRIVATE_KEY`（值可为私钥全文**或私钥文件绝对路径**，本机用路径形式实测通过）；`TAURI_SIGNING_PRIVATE_KEY_PATH` 只对 `tauri signer sign` 生效（等价 `-f`），`signer sign -k` 要的是**私钥字符串**，误传路径报 `failed to decode base64 secret key: Invalid symbol 46`。
+4. **前端 npm 插件包并非必需**（见上「依赖判断更正」）。
+
+### 密钥事实与遗留风险（不得对外宣称已闭环）
+
+- 历史文件 `~/.tauri/wbBridge-updater.key`（key ID `2B11F78BEA8A43F`）**不可用**：带密码且 `~/.tauri/wbBridge.env` 里那个口令解不开，且与现配置公钥不配对。按用户决定新生成 wbBridge 专用钥 `~/.tauri/wbBridge-updater-20261001.key`（`0600`、无密码），`pubkey` 已同步换成新公钥；旧文件**未删除、未改写**。
+- ⚠ 本机权限隐患（`ls -l` 实测，2026-10-01）：两把私钥本体都是 `0600`（含旧钥），**真正 0644 的是配套的凭据文件**——`~/.tauri/wbBridge.env` 与仓库本地 `.env`（各含非空 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`，只核对过变量名与是否有值，未读取内容）。仓库侧安全：`.gitignore:71` 忽略 `.env`、`git ls-files` 只有 `.env.example`，两者均未入库。收紧这两个文件的权限属**本机操作、留给用户决定**，Agent 不改 `~/.tauri` 与仓库外的凭据文件。
+- 任何打 tag 的 CI 运行之前，必须先在 GitHub **Secrets** 写入 `TAURI_SIGNING_PRIVATE_KEY`（私钥全文）与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`（当前为空）；缺任一项，`createUpdaterArtifacts` 会让三个平台的构建作业**全部失败**（这是有意的 fail-closed，不静默产出无签名包）。
+- **仍未验证**：Windows / Linux 产物的真实文件名与签名、`latest.json` 上传后客户端能否真的完成一次「检查 → 下载 → 安装 → 重启」、`relaunch()` 与 `service.pid` 单实例锁 / 托盘的时序，以及 **GUI 实机启动**（本轮只做挂载与静态核对，未运行 `.app`——真跑会写用户真实的 `~/.workbuddy/models.json`）。更新链路的端到端验证只能从 **v1.0.2 → v1.0.3** 起做。
 
 ## 关窗即退出应用（2026-10-01，同日第九轮）
 
