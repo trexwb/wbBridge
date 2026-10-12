@@ -53,11 +53,11 @@ WB Bridge 是一个**跨平台托盘工具**，通过**隔离的 OpenCode 技术
 
 | 目的 | 命令 | 执行目录 | 说明 |
 |---|---|---|---|
-| 安装前端依赖 | `npm install` | 仓库根 | 根 `package.json`（devDeps：`@tauri-apps/cli`、`vite`、`@vitejs/plugin-vue`、`eslint`、`@eslint/js`；deps：`vue`） |
+| 安装前端依赖 | `npm install` | 仓库根 | 根 `package.json`（devDeps：`@tauri-apps/cli`、`vite`、`@vitejs/plugin-vue`、`eslint`、`@eslint/js`；deps：`vue`、`@tauri-apps/api`、`@tauri-apps/plugin-dialog`、`@tauri-apps/plugin-updater`、`@tauri-apps/plugin-process`——`src/core/bridge.js` 按需 import 这些 JS 绑定，缺任何一个 `node --test` 与 `vite build` 都会以 `ERR_MODULE_NOT_FOUND` 直接失败） |
 | 运行全部核心测试 | `cargo test`（或 `npm run test`） | `src-tauri/core/` | lib 单测 + `js_parity` 对拍 + `red_lines` 红线三层；壳侧另有 `cargo test --lib`（`src-tauri/`，含 `shell_action_routes_match_the_core_contract` 逐项对齐 8 条动作） |
 | 运行面板偏好测试 | `npm run test:prefs` | 仓库根 | = `node --test src/core/prefs.test.js`（白名单/凭据字段投影/视图清洗/坏数据回落/存储不可用降级/超大值拒写/静默检查节流）；只测 `src/core/prefs.js`，不联网、不编译 Rust |
 | 运行操作守卫测试 | `npm run test:ops` | 仓库根 | = `node --test src/core/ops.test.js`（成功反馈文案、在飞互斥、完成冷却、拒绝节流、时钟回拨）；只测 `src/core/ops.js` 纯函数，不联网、不编译 Rust |
-| 运行 AI 助手引擎测试 | `npm run test:ai` | 仓库根 | = `node --test src/core/ai.test.js`（Markdown 渲染的转义面、`maskKey`、`validateToolCall` 的未知工具/缺参/非法平台与模型 id/Key 含换行、工具表与 `TOOL_META` 自洽、快照与 system prompt 如实转述不编数字、`validateConfig`/`validateSelfConfig` 的分工、`trimRequest` 按整块裁剪不留孤儿 tool 消息、只读 `runTool` 不发请求）；只测 `src/core/ai.js` 纯函数，不联网、不起 Tauri |
+| 运行 AI 助手引擎测试 | `npm run test:ai` | 仓库根 | = `node --test src/core/ai.test.js`（Markdown 渲染的转义面、`maskKey`、`validateToolCall` 的未知工具/缺参/非法平台与模型 id/Key 含换行、**18 条工具表与 `TOOL_META` 自洽 + 写入/高危名单逐字钉住**、`PROVIDER_PAGES` 的主机名逐条对账壳侧 `EXTERNAL_HOSTS`、快照（含能力档位行）与 system prompt 如实转述不编数字、`validateConfig`/`validateSelfConfig` 的分工（含 `WB · auto` 免校验）、`trimRequest` 按整块裁剪不留孤儿 tool 消息、只读 `runTool` 不发请求）；只测 `src/core/ai.js` 纯逻辑，不联网、不起 Tauri |
 | 运行更新清单生成测试 | `npm run test:manifest` | 仓库根 | = `node --test scripts/gen-latest-json.test.mjs`；用临时产物目录跑真脚本，钉住六平台成功路径与缺平台/缺签名/漏架构后缀/歧义产物等失败路径。**严禁**改成真实联网或读仓库 `src-tauri/target/` 下的产物 |
 | 运行 updater 签名注入测试 | `npm run test:updater-key` | 仓库根 | = `node --test scripts/with-updater-key.test.mjs`；钉住 env 文件取值优先级（进程环境 > `.env.local` > `.env` > `~/.tauri/wbBridge{,-updater}.env`，**显式空口令压过文件里的口令**、`~/…` 先展开）、内联位的两种形态（单行 base64 全文 vs `.key` 文件路径 → 读成全文并 **trim**，尾部换行会让 tauri 报 `Invalid symbol 10`）、路径注入后删除与之互斥的 `_PATH`、明文钥显式置空口令、加密钥缺口令**只告警不阻断**、公钥配对**只认配置里第一条且只告警**、`buildCommand` 的三种入参形态、CLI 在**相对路径**调用下确实执行且**任何输出都不回显密钥**。接线断言：`tauri:build` 确实经本包装器、`build` 链 `make:dmg`、`release.yml` 把私钥读成 `vars.` 且调用 `npm run tauri:build`（不再有 `tauri-action`、不再有私钥前置步骤）、`plugins.updater.pubkey` **恰好一条公钥**、`bundle.targets` **不含 dmg**。**不联网、不调 tauri CLI、不读 `~/.tauri`、不碰真实私钥**（用合成的假 base64 串与临时目录） |
 | 静态检查 | `cargo clippy --all-targets` | `src-tauri/core/` | 必须保持 0 warning |
@@ -142,7 +142,7 @@ wbBridge/
 │   ├── core/prefs.js             ← 面板偏好的唯一读写边界（localStorage 键白名单 + 值字段投影 + 坏数据静默回落）
 │   ├── core/prefs.test.js        ← `npm run test:prefs`（node --test，9 用例）
 │   ├── core/ai.js                ← AI 助手引擎（纯逻辑）：工具表与 schema、校验/摘要/掩码、状态快照、system prompt、请求裁剪、受控 Markdown；网络只经 bridge.aiChat
-│   ├── core/ai.test.js           ← `npm run test:ai`（node --test，16 用例）
+│   ├── core/ai.test.js           ← `npm run test:ai`（node --test，18 用例）
 │   ├── core/activity.js          ← 活动文案（托盘与面板共用，禁止两套文案）
 │   ├── views/                    ← SideBar.vue（分组导航 + 运行设置）、ModelList.vue、ModelDetails.vue（详情右栏）、
 │   │                                ServiceStatus.vue、MetricsBar.vue、FeedbackBar.vue、
@@ -349,7 +349,7 @@ start_backend
 - **JS 侧五个套件都用 `node --test`（不引测试框架、不依赖 DOM）**：
   - `npm run test:prefs` = `node --test src/core/prefs.test.js`：`prefs.js` 的键白名单、值字段投影（凭据类字段绝不落 `localStorage`）、坏数据回落默认值、存储不可用/抛错时静默降级、超大值拒写、静默检查 12h 节流。
   - `npm run test:ops` = `node --test src/core/ops.test.js`：`src/core/ops.js` 的常量合法性、终态动作集合与文案表、在飞互斥文案稳定性、完成冷却窗口与时钟回拨、成功反馈文案边界。
-  - `npm run test:ai` = `node --test src/core/ai.test.js`：`ai.js` 的受控 Markdown 渲染（原始 HTML 一律转义、未闭合围栏当代码块）、`maskKey`、`validateToolCall`（未知工具/缺参/非法 id/Key 含换行）、工具表与 `TOOL_META` 自洽、`summarizeToolCall`/`toolCallPreview` 的 Key 只以掩码出现、快照与 system prompt 如实转述不编数字、`validateConfig`（外部端点）与 `validateSelfConfig`（本机大脑只认名单内 id）的分工、`trimRequest` 按整块裁剪不留孤儿 `tool` 消息、只读 `runTool` 不发网络请求。不联网、不起 Tauri。
+  - `npm run test:ai` = `node --test src/core/ai.test.js`：`ai.js` 的受控 Markdown 渲染（原始 HTML 一律转义、未闭合围栏当代码块）、`maskKey`、`validateToolCall`（未知工具/缺参/非法平台与模型 id/Key 含换行）、**工具表自洽（18 条、schema 名唯一、写工具与高危工具名单逐字钉住、`TOOL_META` 全覆盖）**、`summarizeToolCall`/`toolCallPreview` 的 Key 只以掩码出现、`PROVIDER_PAGES` 的主机名必须逐条落在壳侧 `EXTERNAL_HOSTS`（跨语言对账，防「工具成功但壳拒绝」）、快照（含**能力档位**：支持工具调用 / 支持图片 / 仅对话各几个，以及 `WB · auto` 说明行）与 system prompt（含**更新固定顺序**与「做不到的事」清单）如实转述不编数字、`phaseLabel` 未知阶段原样回显、`validateConfig`（外部端点）与 `validateSelfConfig`（本机大脑：`WB · auto` 免校验、指定 id 须在名单内）的分工、`currentConfig` 默认回落（`selfModel` 默认 `WB · auto`）、`trimRequest` 按整块裁剪不留孤儿 `tool` 消息、只读 `runTool` 不发网络请求。不联网、不起 Tauri。
   - `npm run test:manifest` = `node --test scripts/gen-latest-json.test.mjs`：`latest.json` 六平台成功路径（平台键只由 artifact 目录名决定、url 空格编码、签名取自配对 `.sig`）与各类必须失败/告警的路径；用 `spawnSync` 跑真脚本 + 临时目录，**不联网、不碰真实产物**。
   - `npm run test:updater-key` = `node --test scripts/with-updater-key.test.mjs`：签名注入包装器的取值优先级、内联位两种形态的归一、互斥 `_PATH` 的删除、明文钥显式置空口令、公钥配对只认第一条且只告警、`buildCommand` 入参形态，以及接线断言（`tauri:build` 确实经本包装器、`build` 链 `make:dmg`、`release.yml` 用 `vars.` 且调用 `npm run tauri:build`、`plugins.updater.pubkey` 恰好一条、`bundle.targets` 不含 dmg）。**不联网、不调 tauri CLI、不读 `~/.tauri`、不碰真实私钥**。
   五组都已进 CI 的 `test` 作业（「运行面板偏好、操作守卫、AI 引擎、更新清单与签名注入单测」一步）。改 `prefs.js` 的白名单/投影、`ai.js` 的工具表/校验/裁剪/渲染、`ops.js` 的守卫判定与文案、`gen-latest-json.mjs` 的平台识别与失败判定、或 `with-updater-key.mjs` 的取值/归一/口令/配对判定，**必须同步改对应测试**。
@@ -378,9 +378,9 @@ start_backend
   禁止新增按宽度堆叠的媒体查询或 `<900px` 降级分支——`src/` 内现存的媒体查询只有 `prefers-color-scheme`（`variables.css`）与
   `prefers-reduced-motion`（`base.css`）两处。收起详情有三条等价路径：`Esc`（`App.vue::onKeydown`）、详情头部「收起详情」按钮、
   窗口失焦（`onDismiss`）；收起即清空选中，列表占满主区宽度。
-- **侧栏是分组导航**：分组为「模型 / 运行 / 集成 / 其他」，底部为「运行设置」（系统代理开关 + 版本号）。**6 个入口都是已实现的视图**（视图状态由 `src/App.vue` 的 `view` 持有，侧栏按 `current` 高亮并带 `aria-current="page"`）：
+- **侧栏是分组导航**：分组为「模型 / 运行 / 集成 / 其他」，底部为「运行设置」（系统代理开关 + 版本号）。**7 个入口都是已实现的视图**（视图 ID 的唯一名单是 `prefs.js` 的 `VIEW_IDS`，视图状态由 `src/App.vue` 的 `view` 持有，侧栏按 `current` 高亮并带 `aria-current="page"`）：
   模型与服务（`.top` + `.content`，保留主从两栏）、平台（`src/views/ProvidersView.vue`，填写/清除四家平台 Key，只显示「已配置 / 未配置」）、运行日志（`src/views/LogsView.vue`，经 `read_log` 只读拉取日志尾部）、用量与额度（`src/views/UsageView.vue`，渲染 `status.json` 顶层 `usage`）、
-  WorkBuddy 集成（`src/views/IntegrationView.vue`，只读展示配置定位与最近发布结果，唯一动作是复用既有 `import`）、关于与更新（`src/views/AboutView.vue`，版本与数据目录只读 + **自动更新区**：启动后静默检查、发现新版本才出现更新条、由用户点「下载并安装」，进度百分比只在上游给出 `contentLength` 时显示，装完点「重启应用」经 `process.relaunch` 走 `ExitRequested` 的有界停止）。
+  WorkBuddy 集成（`src/views/IntegrationView.vue`，只读展示配置定位与最近发布结果，唯一动作是复用既有 `import`）、**AI 助手**（`src/views/AssistantView.vue` + `src/core/ai.js`：自然语言入口，只读工具立即执行、写入工具一律先作提案再逐条确认；大脑默认本机 `WB · auto`，也可切外部 OpenAI 兼容端点；对话与端点 Key 都**只在会话内存**，见 `prefs.js` 的 `ai` 键白名单）、关于与更新（`src/views/AboutView.vue`，版本与数据目录只读 + **自动更新区**：启动后静默检查、发现新版本才出现更新条、由用户点「下载并安装」，进度百分比只在上游给出 `contentLength` 时显示，装完点「重启应用」经 `process.relaunch` 走 `ExitRequested` 的有界停止）。
   **禁止**再出现「规划中」标签、禁用占位或可点击却无响应的假入口。
 - **`usage` 口径（`status.json` 顶层字段）**：`{"since": ISO, "total": {requests, ok, failed}, "models": {"<clientModelId>": {requests, ok, failed, lastMs, avgMs}}}`；只累计 `source == "request"` 的真实客户端请求——探测（`probe`）不计；客户端取消（连接断开）走 `server.rs` 的两条早退路径，**整条不计入**（`requests` 也不 +1，不是记为失败）；启动时从上一份 `status.json` 读回，与 `modelResults` 同法跨重启延续。
 - **`schemaVersion` 升级口径**：向后兼容的**加法式**顶层字段（旧壳忽略未知字段即可）**不**递增两侧 `STATUS_SCHEMA_VERSION`，本次保持 `1`；只有删除 / 改名顶层字段、或改变既有字段语义（非兼容变更）时，才把 `src-tauri/src/lib.rs` 与 `src-tauri/core/src/orchestration.rs` 两侧常量**同步 +1**（规则原文见两处注释）。
@@ -476,9 +476,9 @@ start_backend
 
 | 项 | 值 | 来源 |
 |---|---|---|
-| 版本单一来源 | **1.4.0** | 根 `package.json` 的 `version` |
-| 壳工程同步落点 | **1.4.0** | `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `[package] version` |
-| 核心 crate 版本 | **1.4.0** | `src-tauri/core/Cargo.toml`（`wbbridge-core --version` 输出；随产品版本同步，`version:set`/`version:check` 均覆盖） |
+| 版本单一来源 | **1.4.1** | 根 `package.json` 的 `version` |
+| 壳工程同步落点 | **1.4.1** | `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `[package] version` |
+| 核心 crate 版本 | **1.4.1** | `src-tauri/core/Cargo.toml`（`wbbridge-core --version` 输出；随产品版本同步，`version:set`/`version:check` 均覆盖） |
 
 > `status.json` 内写入的 `version` 是历史沿革值 `0.2.0`，**不属版本落点**，不得在无用户指令的情况下静默改动（见「关键常量」）。
 

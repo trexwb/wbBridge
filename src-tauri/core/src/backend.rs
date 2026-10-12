@@ -2388,7 +2388,9 @@ mod tests {
         let catalog = json!({ "all": [
             { "id": "opencode", "models": { "free": free_model("Free") } },
             { "id": "zhipuai", "models": { "glm-4.5-flash": free_model("GLM-4.5 Flash") } },
-            { "id": "modelscope", "models": { "Qwen/Qwen3-8B": free_model("Qwen3 8B") } },
+            // 取注册表权威清单里的真实 id：`free_models_in` 会按 `served_models` 过滤，
+            // 目录里随手编的 id 会被挡掉（那正是「过期 id 不再进探测队列」这道保护）。
+            { "id": "modelscope", "models": { "ZhipuAI/GLM-4.7-Flash": free_model("GLM-4.7 Flash") } },
             // 目录里有但用户没配 Key：不得进入发现（否则对无 Key 平台探测必然 401、白烧额度）。
             { "id": "tencent-tokenhub", "models": { "hy3": free_model("Hy3") } },
         ] });
@@ -2411,7 +2413,11 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec!["opencode/free", "zhipuai/glm-4.5-flash", "modelscope/Qwen/Qwen3-8B"],
+            vec![
+                "opencode/free",
+                "zhipuai/glm-4.5-flash",
+                "modelscope/ZhipuAI/GLM-4.7-Flash"
+            ],
             "opencode 在前，其余按注入的已配置顺序；未配置平台不出模型"
         );
 

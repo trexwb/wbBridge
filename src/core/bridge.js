@@ -156,7 +156,8 @@ export async function readLog() {
 }
 
 // 用系统浏览器打开外部链接（申请 Key 的官方页）。WebView 里 target=_blank 默认点不开，
-// 必须经壳的 open_external 命令转发（壳侧有 https + 字符白名单校验）。只收 URL、不做任何 IO。
+// 必须经壳的 open_external 命令转发（壳侧有 https + 字符白名单 + 精确主机名名单 EXTERNAL_HOSTS
+// 三重校验，名单外的域名一律拒绝）。只收 URL、不做任何 IO。
 export async function openExternal(url) {
   ensureBridge()
   try {
@@ -198,8 +199,6 @@ function aiEvents(listen, chatId, handlers) {
 //   { ok: false, error, partial }                   请求失败（partial 是已生成部分）
 export async function aiChat(request, onDelta) {
   ensureBridge()
-  const { invoke } = window.__TAURI__.core
-  const { listen } = window.__TAURI__.event
   const chatId = `ai-${++aiSeq}-${Date.now().toString(36)}`
   activeChatId = chatId
   const tools = Array.isArray(request.tools) && request.tools.length ? request.tools : null
@@ -248,7 +247,6 @@ export async function aiChat(request, onDelta) {
 export async function aiAbort() {
   ensureBridge()
   if (!activeChatId) return
-  const { invoke } = window.__TAURI__.core
   try {
     await invoke('ai_abort', { chatId: activeChatId })
   } catch {
