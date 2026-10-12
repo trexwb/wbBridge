@@ -77,7 +77,8 @@ WB Bridge 是一个**跨平台托盘工具**，通过**隔离的 OpenCode 技术
 - **自动更新已接线**：`src-tauri/Cargo.toml` 依赖 `tauri-plugin-updater` + `tauri-plugin-process`，`lib.rs` 的 builder 链注册两者，`tauri.conf.json` 有 `bundle.createUpdaterArtifacts: true` 与 `plugins.updater`（`pubkey` 内联公钥串 + `endpoints` 指向 `https://github.com/trexwb/wbBridge/releases/latest/download/latest.json`）。因此**本地构建必须给出签名私钥**，否则打包在生成 updater 产物那一步失败并报「A public key has been found, but no private key」。
 - 构建入口 `npm run tauri:build` = `node scripts/with-updater-key.mjs tauri build`：包装器**只做注入**——按「进程环境 → 仓库 `.env.local` / `.env` → `~/.tauri/wbBridge.env`、`~/.tauri/wbBridge-updater.env` → 兜底 `~/.tauri/wbBridge-updater.key`」汇齐私钥与口令，把 `.key` 路径（含 `~/…`，Node 与 tauri 都不展开 `~`）读成内联全文并 trim，删掉与内联值互斥的 `TAURI_SIGNING_PRIVATE_KEY_PATH`，明文钥**显式**置空口令，然后 exec 目标命令。它**不判形态、不试签、公私钥配对不符也只告警不阻断**；全程只输出来源文件名与公开的 key ID，绝不回显密钥与口令。
 - 产物每平台额外得到 `<安装包>.sig`：macOS `*.app.tar.gz`、Windows `*-setup.exe`（MSI 不参与更新）、Linux `*.AppImage`（`.deb` 也带 `.sig` 但不参与更新）。
-- ⚠ **配置里只有一条公钥、也只有第一条生效**：`tauri-plugin-updater` 的 `verify_signature()` → `minisign-verify` 的 `PublicKey::decode()` 只读解码文本的前两行，后面的公钥被静默丢弃。**换钥必须同步换 `plugins.updater.pubkey`**，否则产物的 `.sig` 与配置公钥不配对、客户端验签必失败；老客户端只认它自己内嵌的那条，换钥那一次发布必须能让老版本先收到最后一更。
+- ⚠ **配置里只有一条公钥、也只有第一条生效**：`tauri-plugin-updater` 的 `verify_signature()` → `minisign-verify` 的 `PublicKey::decode()` 只读解码文本的前两行，后面的公钥被静默丢弃。**换钥必须同步换 `plugins.updater.pubkey`**，否则产物的 `.sig` 与配置公钥不配对、客户端验签必失败；老客户端只认它自己内嵌的那条，换钥那一次发布必须能让老版本先收到最后一更。当前 `plugins.updater.pubkey` 内联**恰好一条**（key ID `2B11F78BEA8A43F`），`bundle.createUpdaterArtifacts: true`。
+- capabilities 声明 `updater:default` + `process:allow-restart`（**刻意不用 `process:default`**，它含 `allow-exit`，会让 WebView 绕过 `quit_app` 的优雅关停链）。
 - ⚠ 变量分工：`tauri build|bundle` **只读 `TAURI_SIGNING_PRIVATE_KEY`**（值可为私钥全文或文件路径）；`TAURI_SIGNING_PRIVATE_KEY_PATH` 只对 `tauri signer sign` 生效（等价 `-f`）；`signer sign -k` 要的是**私钥字符串**，误传路径会报 `failed to decode base64 secret key: Invalid symbol 46`。
 - ⚠ 空值 / 损坏 → 报错文案映射：私钥取到**空值**时报 `failed to decode secret key: incorrect updater private key password: Missing comment in secret key`（看着像口令错，其实不是）；尾部多换行 / 中间空格 → `Invalid symbol 10 / 32, offset …`；多包一层 base64 或误存公钥 → `Missing encoded key in secret key`；`.pub` 当私钥 → `failed to fill whole buffer`；加密钥 + 口令错 / 空 → `Wrong password for that key`。⚠ 「截掉尾部」与「去掉开头 4 字符」两类损坏**会被静默接受**，注入器不拦，签坏了只有客户端验签时才暴露，取值来源那几行日志要人工看一眼。
 - 环境变量模板 `.env.example` → 复制为 `.env.local`（已被 `.gitignore` 忽略，**严禁提交**）。`TAURI_SIGNING_PRIVATE_KEY` 可用私钥全文或文件路径（本地推荐路径形式，密钥内容不进环境）；`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 为私钥口令，**当前这把钥口令非空**，CI 必须配该变量，留空即 `Wrong password`；显式给空串表示这把钥确实无口令（变量只要**存在**就按显式处理，不再回落 `.env*`）。取值优先级为「进程环境 > `.env.local` > `.env` > `~/.tauri/wbBridge{,-updater}.env`」，**逐项打印来源**（混搭出问题时 tauri 只报「口令不对」，看不出哪项错）。CI 侧私钥与口令用仓库级 **Variables**（明文值，工作流绝不 echo 这两个变量；想换回 Secrets 只需把 `vars.` 改回 `secrets.`）。
@@ -300,7 +301,8 @@ start_backend
 | 关停窗口 | SIGTERM → `4s` → SIGKILL | `runtime.rs::stop_backend` |
 | 权限文本截断 | `shrink_permission(value, limit)`，调用侧固定传 `400` | `backend.rs` |
 | 同步归属标记 | `OWNER = "buddy-bridge-v1"` | `sync.rs` |
-| status schema | `STATUS_SCHEMA_VERSION = 1` | `orchestration.rs` |
+| status schema | `STATUS_SCHEMA_VERSION = 1`（口径：向后兼容的加法式顶层字段**不递增**，如新增的 `usage`；删除 / 改名或改变既有字段语义才同步 +1） | `orchestration.rs` |
+| `status.json` 顶层 `usage` | `{since, total:{requests,ok,failed}, models:{<clientModelId>:{requests,ok,failed,lastMs,avgMs}}}`；**只累计真实请求**（`source == "request"`，客户端取消的不计为成功），跨重启延续 | `orchestration.rs` |
 | 状态内置版本 | `"0.2.0"`（写入 `status.json`，历史沿革值） | `orchestration.rs` 状态初值 |
 | 格式类失败集合 | `REQUEST_SHAPED_FAILURES`（4 项） | `orchestration.rs` |
 | 转写首选名单 | `TRANSLATOR_ORDER`（4 项，须排除刚失败模型） | `orchestration.rs` |
@@ -330,6 +332,11 @@ start_backend
 - 文件写入优先走 `atomic.rs::replace_with_retry` 或 `sync.rs::atomic_write`，禁止裸 `rename` 覆盖；Windows 需考虑 `.exe` 与不能替换运行中镜像。
 - 新建目录/敏感文件显式权限（目录 `0700`、密钥文件 `0600`）。
 - 路径拼接使用 `platform.rs` 提供的原语，禁止硬编码分隔符。
+
+### 核心特例约束（发布链别名与备份清扫）
+
+- **`WB · auto` 合成路由条目只在生产发布链写入插件配置**：`sync.rs::merge_models_auto` 走 `SyncOptions.auto_route`，该字段**默认 `false`**——JS 侧从来没有这一条，`tests/js_parity.rs::sync_options` 显式钉 `false`，因此对拍路径逐字节不变（把默认值翻成 `true`，`tests/fixtures/sync.json` 会立刻失败，那是**预期护栏生效**，不是要修的测试）。条目 `id` 刻意**绕过** `client_model_id`（否则变成 `OC · WB · auto`，与 `server.rs::chat()` 的字面比较永不匹配 ⇒ 改写不生效）。`sync.rs::owned_count` **必须排除别名**，否则 `sync.count` / `status.json` 的 `sync.targets.<目标>.count` 不再是「发布的模型数」。别名只进插件文档的 `availableModels`，**不进** `status.json` 的模型列表，面板因此没有也别新增这一行。`supportsToolCall` 必须取自 `auto::any_tool_capable(models)`，不得写成固定 `true`。
+- **插件配置写入不再产生任何备份**：`sync.rs` 写路径现存的是 `sweep_old_backups(file)`——在**两条出口**都调用（`atomic_write_with` 成功之后，以及内容无变化的早退之前），按**逐段白名单**（文件名以 `<配置文件名>.buddy-bridge-` 开头、以 `.bak` 结尾、中段全是 ASCII 数字、必须是普通文件；跳过目录、`read_dir` 失败静默）只清理本工具**旧版**攒下的存量备份。不得新增备份逻辑，也不得把判定放宽成通配删除（用户自己命名的 `*.bak`、`*.tmp` 一律不碰）。写盘保护只剩三道：文件锁 + 写前二次读取 + 原子替换（同目录临时文件再 `rename`）。
 
 ### 测试规范
 

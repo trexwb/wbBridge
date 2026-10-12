@@ -95,7 +95,7 @@
 > 实现：`src-tauri/core/src/auto.rs`（纯函数选择器）+ `src-tauri/core/src/server.rs` 的两处拦截
 > （`/v1/models` 追加条目、`chat()` 在记账键首次取读前改写 `body["model"]`）
 > + `src-tauri/core/src/sync.rs` 的 `auto_entry`（写进插件配置的那一条）。
-> 设计与逐条取舍见 `docs/plans/2026-10-10-wb-auto-smart-router.md`（§10 是落地实录）。
+> 设计与逐条取舍的唯一正文见 `docs/wiki/核心概念与功能.md` 的 3.2b / 3.2c；发布链别名（`WB · auto` 条目 `id` 绕过 `client_model_id`）的强制约束见 `AGENTS.md`「编码规范 › 核心特例约束（发布链别名与备份清扫）」。
 > 🔴 **名字**：对外唯一字面量是 `WB · auto`（分隔符逐字节 = 空格 + U+00B7 + 空格，与 `OC · 名称` 同形）；
 > v1.1.14 之前写作 `WB.auto`，v1.1.15 全局改名后**旧名字不再被任何入口接受**（`1.1.11~1.1.14` 从未构建、从未打标签，v1.1.15 现已发布且只用新名，改名不伤及已交付二进制）。
 
