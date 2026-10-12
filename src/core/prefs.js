@@ -14,11 +14,16 @@ const PREFIX = 'wb.'
 
 // 侧栏导航的视图 id（与 SideBar.vue 的 groups 一一对应）。恢复偏好时用它做存在性校验，
 // 视图被改名或删除后，旧偏好会自然回落默认值而不是渲染一个不存在的视图。
-export const VIEW_IDS = ['models', 'providers', 'logs', 'usage', 'workbuddy', 'about']
+export const VIEW_IDS = ['models', 'providers', 'logs', 'usage', 'workbuddy', 'assistant', 'about']
 
 export const DEFAULTS = {
   view: 'models',
   update: { autoCheck: true, lastCheckedAt: 0 },
+  // AI 助手配置。🔴 只放**非凭据**字段：API Key 一律不进这里（也不进任何 WebView 存储），
+  // 由视图在会话内存中持有、每次请求随命令参数进壳，重启即失效。
+  // brain='self' 时大脑是本壳核心自己的免费模型（端点与令牌都由壳解析，无需任何 Key）；
+  // brain='external' 才走 baseUrl + apiKey 的外部 OpenAI 兼容端点。
+  ai: { brain: 'self', baseUrl: '', model: '', selfModel: '', tools: true },
 }
 
 // 上次静默检查距今超过这个间隔才再查一次；间隔内启动直接跳过，避免每次冷启动都打一次端点。
@@ -51,6 +56,20 @@ export function sanitizeUpdate(raw) {
 const SANITIZERS = {
   view: sanitizeView,
   update: sanitizeUpdate,
+  ai: sanitizeAi,
+}
+
+// AI 配置：只投影 brain / baseUrl / model / selfModel / tools 五个已知字段，其余
+// （包括任何看似 Key 的键）一律丢弃；空串表示「用 ai.js 的默认值」，不在这里落默认。
+export function sanitizeAi(raw) {
+  const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+  return {
+    brain: source.brain === 'external' ? 'external' : 'self',
+    baseUrl: asString(source.baseUrl, ''),
+    model: asString(source.model, ''),
+    selfModel: asString(source.selfModel, ''),
+    tools: source.tools !== false,
+  }
 }
 
 // 偏好 JSON 的上限：界面偏好本就是一两个字段，超限说明被塞了别的东西（例如整份配置）。
@@ -130,6 +149,16 @@ export function saveAutoCheck(enabled) {
 
 export function saveCheckedAt(timestamp) {
   return writePref('update', { ...loadUpdatePref(), lastCheckedAt: asFiniteNumber(timestamp, DEFAULTS.update.lastCheckedAt) })
+}
+
+// AI 配置（非凭据）：读出来直接可用，缺省即默认值。
+export function loadAiConfig() {
+  return readPref('ai')
+}
+
+// 保存 AI 配置。apiKey 不经过本模块——它没有白名单键，写不进来。
+export function saveAiConfig({ brain, baseUrl, model, selfModel, tools }) {
+  return writePref('ai', sanitizeAi({ brain, baseUrl, model, selfModel, tools }))
 }
 
 // 静默检查的节流判据：关掉自动检查、或距上次检查不足间隔，都不发请求。

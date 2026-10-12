@@ -674,6 +674,16 @@ fn attach_translator(started: &Started) {
 // 同步发布（syncPublished）
 // ---------------------------------------------------------------------------
 
+/// 🔴 空发布集闸门的判定，`sync_published` 与单测共用这一个真相。
+///
+/// 它是空集保护**唯一**生效的位置：写盘路径给 `sync_models` 传的是
+/// `SyncOptions { allow_empty: true }`（见下方分发处），所以 `merge_models` 自己的空集守卫
+/// 在这条链上永不触发。调用点参数弄反的代价是一轮全败就把插件配置里
+/// `OWNER=buddy-bridge-v1` 名下的既有条目全部删掉。
+fn rejects_empty_publication(models: &[Value], allow_empty: bool) -> bool {
+    models.is_empty() && !allow_empty
+}
+
 /// `syncPublished(published, allowEmpty)`：把发布集串行写入所有已检测到的插件配置 —— WorkBuddy 与
 /// CodeBuddy 的 `models.json`；未检测到的目标在 `sync.targets` 里报 `missing` 及原因。
 ///
@@ -699,10 +709,10 @@ fn sync_published(published: Option<Vec<Value>>, allow_empty: bool) {
         return;
     }
 
-    // 空发布集闸门：sync_models 的既有保护（mergeModels 的 allowEmpty=false）在聚合层
-    // 自然报错（每目标 Err("Empty model discovery; …") → aggregate_sync 顶层 error），
-    // 无需另造错误形状；这里的提前返回只是避免明知会全败还去动盘。
-    if models.is_empty() && !allow_empty {
+    // 空发布集闸门：见 rejects_empty_publication —— 写盘侧 allow_empty=true，所以这道闸门是
+    // 空集保护唯一生效点；提前返回同时避免明知全败还去动盘。错误形状与 aggregate_sync 的
+    // 顶层 error 同形，面板不必分叉。
+    if rejects_empty_publication(&models, allow_empty) {
         let message = "Empty model discovery; existing configuration preserved";
         chain_sync(async move {
             update_and_persist(json!({
@@ -3085,19 +3095,21 @@ mod tests {
         assert_eq!(usage["models"], json!({}), "无模型 ID 时不得创建模型条目");
     }
 
-    /// 空发布集闸门的可测内核：闸门语义 = 「发布集为空 + 不允许空集 → 拒绝」。
-    /// `sync_published` 本体依赖已装入的核心实例（global_app），这里把判定提成纯函数同款逻辑
-    /// 钉住：三处用户意图清空传 `true`，探测/导入路径传 `false`，参数弄反会让全败清空插件配置。
+    /// 空发布集闸门：直接调用 `sync_published` 实际使用的那份判定。
+    /// 三处用户意图清空传 `true`，探测/导入路径传 `false`，参数弄反会让全败清空插件配置。
     #[test]
     fn empty_publication_gate_rejects_only_when_disallowed() {
-        let gate = |empty: bool, allow_empty: bool| empty && !allow_empty;
         // 探测收尾 / 导入动作（allow_empty=false）：全败空集必须拒绝。
-        assert!(gate(true, false), "空集且不允许空 → 拒绝发布");
+        assert!(
+            rejects_empty_publication(&[], false),
+            "空集且不允许空 → 拒绝发布"
+        );
         // 关停 / 启动清旧 / 换文件（allow_empty=true）：空集是用户意图，必须放行。
-        assert!(!gate(true, true), "空集但显式允许 → 放行");
+        assert!(!rejects_empty_publication(&[], true), "空集但显式允许 → 放行");
         // 非空发布集与闸门无关。
-        assert!(!gate(false, false));
-        assert!(!gate(false, true));
+        let one = vec![json!({ "id": "opencode/free" })];
+        assert!(!rejects_empty_publication(&one, false));
+        assert!(!rejects_empty_publication(&one, true));
         // 闸门写进 status.json 的形状：与 aggregate_sync 顶层 error 同形，面板不用分叉。
         let message = "Empty model discovery; existing configuration preserved";
         let sync = json!({ "targets": {}, "count": 0, "changed": false, "error": message });
@@ -3105,9 +3117,10 @@ mod tests {
         assert_eq!(sync["count"], json!(0));
     }
 
-    /// 聚合发现的可测内核：free_models_in 对注册表平台的发现与包装一致（Stage 2 已钉），
-    /// 这里钉住「聚合顺序 = opencode 在前、注册表已配置平台按注册表序在后」，
-    /// 面板的分组展示依赖这个稳定顺序。
+    /// 聚合发现的顺序：`free_models_in` 对注册表平台的发现与包装一致（Stage 2 已钉），
+    /// 这里钉住「opencode 在前、其余按注入的已配置平台顺序在后」——`Backend::models()`
+    /// 的聚合就是这个顺序（已配置列表由 `providers_section_for` 按注册表序产生），
+    /// 客户端看到的模型列表顺序随之稳定。
     #[test]
     fn aggregated_discovery_keeps_opencode_first_then_registry_order() {
         // modelscope 用的是权威清单在册的 id（`providers::served_models`）；catalog 里那些

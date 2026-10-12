@@ -1,7 +1,9 @@
 <script setup>
 // 平台视图：多平台免费模型的 Key 管理入口（保存 / 清除 / 状态刷新）。
 // 凭据纪律：Key 只经 set-provider-key 的请求体进入核心，面板**不保存、不回显、不做掩码**；
-// provider-status 也只回「是否已配置」。Key 保存后需重启核心（隔离配置在启动时注入）才会生效。
+// provider-status 也只回「是否已配置」。保存 / 清除后自动触发**该平台的定向重新检测**
+// （`probe { providers: [id] }`）：隔离的 OpenCode 子进程重启时重读 providers.json 并重新注入
+// 声明段，所以无需重启整个应用，其余平台的条目与探测结果一概不动。
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { action, openExternal } from '../core/bridge.js'
 import { successMessage } from '../core/ops.js'

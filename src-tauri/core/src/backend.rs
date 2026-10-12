@@ -1111,9 +1111,11 @@ impl Backend {
     ///
     /// 多平台接入后的聚合发现：`opencode` 命名空间（判定与错误文案一字不动）+ 每个**已配置**
     /// 注册表平台的同名调用。单平台失败不丢其他平台：失败只记日志，聚合照常返回。
-    /// 已配置集合由编排层经 [`Backend::set_configured_providers`] 在启动时注入（读 providers.json，
-    /// 只有 id、不含 Key）；未配置平台即使出现在 `/provider` 的 catalog 里也不发现——避免对
-    /// 无 Key 平台探测 401。
+    /// 已配置集合由编排层经 [`Backend::set_configured_providers`] 注入（读 providers.json，
+    /// 只有 id、不含 Key），**只在子进程启动与 `/admin/refresh` 两个时点更新**：单独调
+    /// `clear-provider-key` 不会立刻改变它，要等下一次 refresh/重启。未配置平台即使出现在
+    /// `/provider` 的 catalog 里也不发现——避免对无 Key 平台探测 401。
+    /// 聚合顺序、单平台失败的容忍与空聚合的错误都由本模块的 `models_*` 三个测试直接钉住。
     pub async fn models(&self) -> Result<Vec<Value>, BackendError> {
         let providers = self.request("/provider", "GET", None, None, None).await?;
         let mut models = free_models(&providers)
@@ -2345,6 +2347,85 @@ mod tests {
         assert_eq!(error.status, Some(502));
     }
 
+    // -----------------------------------------------------------------------
+    // models()：多平台聚合发现（/provider 假服务，不联网）
+    // -----------------------------------------------------------------------
+
+    async fn provider_handler(State(catalog): State<Arc<Value>>) -> axum::Json<Value> {
+        axum::Json((*catalog).clone())
+    }
+
+    /// 只回 `/provider` 的假服务：catalog 由调用方给定，其余路径一律空 catalog。
+    async fn start_provider_mock(catalog: Value) -> (String, tokio::task::JoinHandle<()>) {
+        let app = axum::Router::new()
+            .fallback(axum::routing::any(provider_handler))
+            .with_state(Arc::new(catalog));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// 起 Backend 并把日志行收进 Vec（凭据纪律要求失败只记 id 与上游文案，所以要看得到日志）。
+    fn backend_logging_into(
+        base: &str,
+        lines: &Arc<Mutex<Vec<String>>>,
+    ) -> Backend {
+        let sink = Arc::clone(lines);
+        Backend::new(base, "pw", move |text| {
+            sink.lock().unwrap().push(text.to_string());
+        })
+    }
+
+    fn free_model(name: &str) -> Value {
+        json!({ "name": name, "cost": { "input": 0, "output": 0 } })
+    }
+
+    #[tokio::test]
+    async fn models_aggregates_configured_platforms_and_survives_one_failure() {
+        let catalog = json!({ "all": [
+            { "id": "opencode", "models": { "free": free_model("Free") } },
+            { "id": "zhipuai", "models": { "glm-4.5-flash": free_model("GLM-4.5 Flash") } },
+            { "id": "modelscope", "models": { "Qwen/Qwen3-8B": free_model("Qwen3 8B") } },
+            // 目录里有但用户没配 Key：不得进入发现（否则对无 Key 平台探测必然 401、白烧额度）。
+            { "id": "tencent-tokenhub", "models": { "hy3": free_model("Hy3") } },
+        ] });
+        let (base, server) = start_provider_mock(catalog).await;
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let backend = backend_logging_into(&base, &lines);
+        backend.set_configured_providers(vec![
+            "zhipuai".to_string(),
+            "modelscope".to_string(),
+            // catalog 里缺失：Err 只记日志，其余平台必须照常发布。
+            "siliconflow-cn".to_string(),
+        ]);
+
+        let models = backend.models().await.expect("单平台失败不得让整个聚合失败");
+        server.abort();
+
+        let ids: Vec<&str> = models
+            .iter()
+            .map(|model| model["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["opencode/free", "zhipuai/glm-4.5-flash", "modelscope/Qwen/Qwen3-8B"],
+            "opencode 在前，其余按注入的已配置顺序；未配置平台不出模型"
+        );
+
+        let logged = lines.lock().unwrap().join("\n");
+        assert!(
+            logged.contains("Provider siliconflow-cn discovery failed"),
+            "失败平台必须留下可诊断的日志行，实际是：{logged}"
+        );
+        assert!(
+            !logged.contains("tencent-tokenhub"),
+            "未配置平台是有意跳过，不该产生失败日志"
+        );
+    }
+
     /// handoff 路径的 reject 失败绝不能被吞：拒绝没送达时 OpenCode 侧动作仍「待批准」，
     /// 若照常返回 handoff，外部执行一次、审批放行又执行一次，动作双执行。必须上抛并走统一清理。
     #[tokio::test]
@@ -2396,6 +2477,48 @@ mod tests {
             meta.get("handoff").is_none(),
             "reject 失败时不得留下已经交接的痕迹"
         );
+    }
+
+    #[tokio::test]
+    async fn models_keeps_the_empty_error_when_no_platform_yields_anything() {
+        // 聚合仍为空时必须报原来的错误并保住既有清单——这道错误不能随多平台改造一起丢。
+        let catalog = json!({ "all": [
+            { "id": "opencode", "models": { "paid": { "name": "Paid", "cost": { "input": 1, "output": 1 } } } },
+        ] });
+        let (base, server) = start_provider_mock(catalog).await;
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let backend = backend_logging_into(&base, &lines);
+        backend.set_configured_providers(vec!["siliconflow-cn".to_string()]);
+
+        let error = backend.models().await.expect_err("空聚合必须报错");
+        server.abort();
+
+        assert_eq!(
+            error.message,
+            "No free text models found; existing list preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn models_without_configured_platforms_returns_only_opencode() {
+        // 没配任何平台 = 多平台接入之前的行为：只回 opencode 命名空间，且一条失败日志都不产生。
+        let catalog = json!({ "all": [
+            { "id": "opencode", "models": { "free": free_model("Free") } },
+            { "id": "zhipuai", "models": { "glm-4.5-flash": free_model("GLM-4.5 Flash") } },
+        ] });
+        let (base, server) = start_provider_mock(catalog).await;
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let backend = backend_logging_into(&base, &lines);
+
+        let models = backend.models().await.expect("opencode 有免费模型就应成功");
+        server.abort();
+
+        let ids: Vec<&str> = models
+            .iter()
+            .map(|model| model["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["opencode/free"]);
+        assert!(lines.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

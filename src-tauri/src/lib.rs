@@ -2,11 +2,12 @@
 // 核心（wbbridge_core::orchestration）跑在壳内的专用 tokio 运行时上，仍在 127.0.0.1:<port>
 // 提供同一套 HTTP 契约；本壳负责：装入 data_dir/port → 轮询 status.json 推送事件 → 退出时经
 // POST /admin/shutdown 优雅停止（等待核心完成 WorkBuddy 配置清理与串行写链落盘）。
+use std::collections::HashMap;
 use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -603,27 +604,63 @@ async fn core_clear_provider_key(
     .await
 }
 
-/// 用系统默认浏览器打开外部链接（申请 Key 的官方页等）。
+/// 面板可以请求打开的官方站点主机名（与 `src/views/ProvidersView.vue` 的 `PLATFORM_GUIDES`
+/// 一一对应；新增平台必须同步改这两处）。
 ///
-/// Tauri WebView 里 `target="_blank"` 默认不调起系统浏览器（点击静默失败），外链必须经壳转发。
-/// 安全边界：只允许 https 协议 + RFC 3986 合法字符白名单；URL 只以命令行参数传给系统打开器
-/// （macOS `open` / Windows `explorer` 直接传参不经 shell 解析 / Linux `xdg-open`），
-/// 白名单是最后一道防线，不依赖调用方的引号处理。应用自有命令，不经 capability 授权。
-#[tauri::command]
-fn open_external(url: String) -> Result<(), String> {
+/// 为什么不能只校验「https + 合法字符」：那样这条命令就是**任意 https 的外带通道**——面板
+/// 一旦出现注入面，攻击者可把本机状态拼进 query 让系统浏览器发往自己的域名，还能无提示拉起
+/// 浏览器。只认精确主机名（并禁掉 userinfo 与端口）后，`https://www.modelscope.cn@evil.tld/`
+/// 这类视觉伪装与后缀拼接（`modelscope.cn.evil.tld`）都不可能通过。
+const EXTERNAL_HOSTS: &[&str] = &[
+    "www.modelscope.cn",
+    "cloud.siliconflow.cn",
+    "console.cloud.tencent.com",
+    "open.bigmodel.cn",
+];
+
+/// `open_external` 的校验部分，返回 `None` 即放行。
+///
+/// 抽成纯函数是因为这层边界必须能被单测钉住（真调用会拉起系统浏览器，不可测也不该测）。
+fn external_url_rejection(url: &str) -> Option<String> {
     let lower = url.to_ascii_lowercase();
     if !lower.starts_with("https://") {
-        return Err(format!("不允许的链接协议（仅 https）：{url}"));
+        return Some(format!("不允许的链接协议（仅 https）：{url}"));
     }
-    if url.is_empty() || url.len() > 2048 {
-        return Err("链接长度非法".to_string());
+    if url.len() > 2048 {
+        return Some("链接长度非法".to_string());
     }
     const URL_SAFE: &[u8] = b":/?#[]@!$&'()*+,;=-._~%";
     if !url
         .bytes()
         .all(|c| c.is_ascii_alphanumeric() || URL_SAFE.contains(&c))
     {
-        return Err("链接包含非法字符".to_string());
+        return Some("链接包含非法字符".to_string());
+    }
+    // authority = `https://` 之后、第一个 `/`·`?`·`#` 之前的那一段（前面已确认是 ASCII）。
+    let authority = lower["https://".len()..]
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+    if authority.contains('@') || authority.contains(':') {
+        return Some("链接不允许携带用户信息或端口".to_string());
+    }
+    if EXTERNAL_HOSTS.contains(&authority) {
+        return None;
+    }
+    Some(format!("链接主机不在已登记的官方站点名单内：{authority}"))
+}
+
+/// 用系统默认浏览器打开外部链接（申请 Key 的官方页等）。
+///
+/// Tauri WebView 里 `target="_blank"` 默认不调起系统浏览器（点击静默失败），外链必须经壳转发。
+/// 安全边界：https + RFC 3986 字符白名单 + [`EXTERNAL_HOSTS`] 精确主机名（见其注释）。
+/// URL 只以命令行参数传给系统打开器（macOS `open` / Windows `explorer` 直接传参不经 shell
+/// 解析 / Linux `xdg-open`），名单是最后一道防线，不依赖调用方的引号处理。
+/// 应用自有命令，不经 capability 授权。
+#[tauri::command]
+fn open_external(url: String) -> Result<(), String> {
+    if let Some(error) = external_url_rejection(&url) {
+        return Err(error);
     }
 
     #[cfg(target_os = "macos")]
@@ -765,6 +802,421 @@ fn read_log_tail(path: &Path, max_bytes: u64, max_lines: usize) -> Result<Value,
     }))
 }
 
+// ── AI 助手：OpenAI 兼容端点的流式转发 ───────────────────────────────
+// 面板 CSP 是 default-src 'self'（connect-src 只放行 ipc:），前端 fetch 外部端点会被直接
+// 拦掉，因此 AI 对话统一走壳命令：壳用 ureq 发请求、按行解析 SSE，增量经事件推给面板。
+// 凭据纪律：apiKey 只经命令参数进入进程内存，不落盘、不进日志、不出现在任何事件 payload 里；
+// Base URL 白名单（https，或本机回环 http）在壳侧校验，前端传什么都绕不过它。
+
+/// AI 请求参数（与前端 `src/core/ai.js` 的调用约定一致）。
+///
+/// 两种来源共用这一条命令：
+/// - 外部端点：`baseUrl` + `apiKey`（https，或本机回环 http 的本地模型）；
+/// - 自托管（`selfHosted = true`）：大脑就是本壳正在运行的核心，端点与 Bearer 令牌
+///   都由壳自己解析（`core.port` + `core_key`），**面板既拿不到也不需要 api-key**，
+///   因此这条路径上 `baseUrl` / `apiKey` 一律忽略，前端无从指定任意回环地址。
+#[derive(serde::Deserialize)]
+struct AiChatRequest {
+    #[serde(rename = "chatId")]
+    chat_id: String,
+    #[serde(rename = "baseUrl", default)]
+    base_url: String,
+    #[serde(rename = "apiKey", default)]
+    api_key: String,
+    #[serde(rename = "selfHosted", default)]
+    self_hosted: bool,
+    model: String,
+    messages: Vec<Value>,
+    /// OpenAI function tools 声明。缺省空数组 = 本轮不启用工具（纯文本对话）。
+    #[serde(default)]
+    tools: Vec<Value>,
+    #[serde(rename = "toolChoice", default)]
+    tool_choice: Option<Value>,
+}
+
+/// 进行中的 AI 对话取消标志（chatId → flag）：`ai_abort` 置位，流式线程读到即停。
+static AI_CANCELS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
+
+fn ai_cancels() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
+    AI_CANCELS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cleanup_cancel(chat_id: &str) {
+    ai_cancels().lock().unwrap().remove(chat_id);
+}
+
+/// 入参体积闸门：对话历史与工具声明都由面板构造，长度失控时既拖慢上游也会把整段上下文
+/// 留在壳内存里。数值取「足够跑完一轮正常管理对话、又远小于 8MB IPC 上限」的一档。
+const AI_MAX_MESSAGES: usize = 40;
+const AI_MAX_MESSAGE_CHARS: usize = 30_000;
+const AI_MAX_TOOLS: usize = 40;
+
+/// 校验请求形态（纯函数，便于单测）。返回归一化后的 Base URL，自托管模式返回空串。
+fn validate_ai_request(request: &AiChatRequest) -> Result<String, String> {
+    if request.chat_id.trim().is_empty() {
+        return Err("AI 请求缺少 chatId".into());
+    }
+    if request.model.trim().is_empty() {
+        return Err("AI 请求缺少 model".into());
+    }
+    if request.messages.is_empty() {
+        return Err("AI 请求缺少 messages".into());
+    }
+    if request.messages.len() > AI_MAX_MESSAGES {
+        return Err(format!("对话最多保留 {AI_MAX_MESSAGES} 条消息，请清空历史后重试"));
+    }
+    for message in &request.messages {
+        let chars = message.to_string().chars().count();
+        if chars > AI_MAX_MESSAGE_CHARS {
+            return Err(format!("单条消息过长（{chars} 字符），请缩短后重试"));
+        }
+    }
+    if request.tools.len() > AI_MAX_TOOLS {
+        return Err(format!("工具声明最多 {AI_MAX_TOOLS} 个"));
+    }
+    if request.self_hosted {
+        return Ok(String::new());
+    }
+    normalize_ai_base_url(&request.base_url)
+}
+
+/// 组装上游请求体（纯函数，便于单测）。只声明工具时才带 `tools`/`tool_choice`，
+/// 免得把 `tools: []` 发给不认识该字段的老端点。
+fn build_ai_body(request: &AiChatRequest) -> Value {
+    let mut body = serde_json::json!({
+        "model": request.model,
+        "messages": request.messages,
+        "stream": true,
+    });
+    if !request.tools.is_empty() {
+        body["tools"] = Value::Array(request.tools.clone());
+        body["tool_choice"] = request
+            .tool_choice
+            .clone()
+            .unwrap_or_else(|| serde_json::json!("auto"));
+    }
+    body
+}
+
+/// 自托管端点：只指向本壳内核心的回环地址，端口来自壳自己持有的 `CoreHandle`。
+fn self_hosted_base_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}/v1")
+}
+
+/// 自托管模式的端点与令牌：端口取正在运行的核心，Bearer 用数据目录里的 `api-key`。
+/// 两者都不经面板流转 —— WebView 从来不知道本机密钥，「api-key 不出面板」这条红线因此
+/// 不被触碰，用户也不需要为本机模型再填一次 Key。
+fn resolve_self_hosted(app: &AppHandle) -> Result<(String, String), String> {
+    let state = app.state::<AppState>();
+    // 锁的作用域只到取出端口为止：core_key 最坏会轮询 15s 等核心写入 api-key 文件，
+    // 绝不能握着 core 锁去做（restart_core / core_running / 退出流程都会被它卡死）。
+    let port = {
+        let guard = state.core.lock().unwrap();
+        guard.as_ref().map(|core| core.port)
+    };
+    let Some(port) = port else {
+        return Err("核心服务未运行，本机模型不可用；请改用外部端点".into());
+    };
+    let key = core_key(&state)?;
+    Ok((
+        format!("{}/chat/completions", self_hosted_base_url(port)),
+        key,
+    ))
+}
+
+/// 校验 AI 端点 Base URL 并归一化（去掉尾部斜杠）。只允许 https，或本机回环 http
+/// （本地 Ollama / oMLX 一类）；其余一律拒绝——壳是面板出网的唯一出口，入口必须收窄。
+/// `http://127.0.0.1.evil.com` 这类前缀伪装按主机名精确比对挡掉。
+fn normalize_ai_base_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return Err(format!(
+            "AI 服务地址需以 http:// 或 https:// 开头（收到：{trimmed}）"
+        ));
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // 去掉 userinfo（http://user@host/ 形式），再取主机名（IPv6 按 [..] 字面量解析）。
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host_name = if let Some(inner) = host_port.strip_prefix('[') {
+        inner.split(']').next().unwrap_or("")
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    }
+    .to_ascii_lowercase();
+    if host_name.is_empty() {
+        return Err("AI 服务地址缺少主机名".into());
+    }
+    let local = matches!(host_name.as_str(), "127.0.0.1" | "localhost" | "::1");
+    let allowed = matches!(scheme.to_ascii_lowercase().as_str(), "https")
+        || (local && scheme.eq_ignore_ascii_case("http"));
+    if !allowed {
+        return Err(format!(
+            "仅支持 https:// 端点，或 http://127.0.0.1 / http://localhost 本地模型（收到：{trimmed}）"
+        ));
+    }
+    Ok(trimmed.trim_end_matches('/').to_string())
+}
+
+/// OpenAI 流式 chunk 的累积器：content 增量直接拼接；tool_calls 按 index 累积
+/// （id / name 通常只在首片出现，arguments 是字符串分片、必须拼接）。
+#[derive(Default)]
+struct AiStreamAcc {
+    content: String,
+    tool_calls: Vec<AiToolCallAcc>,
+    finish_reason: String,
+}
+
+#[derive(Default)]
+struct AiToolCallAcc {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl AiStreamAcc {
+    /// 吸收一个 SSE data 段的 JSON。返回本次的文本增量（调用方据此节流推送）。
+    fn absorb(&mut self, chunk: &Value) -> String {
+        let mut delta = String::new();
+        let Some(choice) = chunk
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+        else {
+            return delta;
+        };
+        if let Some(text) = choice
+            .get("delta")
+            .and_then(|d| d.get("content"))
+            .and_then(Value::as_str)
+        {
+            self.content.push_str(text);
+            delta.push_str(text);
+        }
+        if let Some(calls) = choice
+            .get("delta")
+            .and_then(|d| d.get("tool_calls"))
+            .and_then(Value::as_array)
+        {
+            for call in calls {
+                let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                while self.tool_calls.len() <= index {
+                    self.tool_calls.push(AiToolCallAcc::default());
+                }
+                let slot = &mut self.tool_calls[index];
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    if !id.is_empty() && slot.id.is_empty() {
+                        slot.id = id.to_string();
+                    }
+                }
+                if let Some(function) = call.get("function") {
+                    if let Some(name) = function.get("name").and_then(Value::as_str) {
+                        if !name.is_empty() && slot.name.is_empty() {
+                            slot.name = name.to_string();
+                        }
+                    }
+                    if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                        slot.arguments.push_str(arguments);
+                    }
+                }
+            }
+        }
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            if !reason.is_empty() {
+                self.finish_reason = reason.to_string();
+            }
+        }
+        delta
+    }
+
+    /// 收尾 payload：没有 name 的空槽（部分提供商只发 index 不带内容）不进最终数组。
+    fn finish(&self) -> Value {
+        serde_json::json!({
+            "content": self.content,
+            "toolCalls": self
+                .tool_calls
+                .iter()
+                .filter(|call| !call.name.is_empty())
+                .map(|call| serde_json::json!({
+                    "id": call.id,
+                    "name": call.name,
+                    "arguments": call.arguments,
+                }))
+                .collect::<Vec<_>>(),
+            "finishReason": self.finish_reason,
+        })
+    }
+}
+
+/// 错误响应体截断：压掉换行后取前 200 字符（端点错误页可能是一整页 HTML）。
+fn snippet_of(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let count = collapsed.chars().count();
+    let mut out: String = collapsed.chars().take(200).collect();
+    if count > 200 {
+        out.push('…');
+    }
+    out
+}
+
+/// AI 对话（流式）：壳代面板向 OpenAI 兼容端点发请求，SSE 增量经 `ai-chunk` 事件推送，
+/// 结束 / 失败 / 取消分别发 `ai-done` / `ai-error` / `ai-aborted`（payload 都带 chatId）。
+/// 同步返回、请求在独立线程里跑，命令本身不等待。
+#[tauri::command]
+fn ai_chat(app: AppHandle, payload: Value) -> Result<(), String> {
+    let request: AiChatRequest =
+        serde_json::from_value(payload).map_err(|error| format!("AI 请求参数无效：{error}"))?;
+    // 形态与端点白名单在起线程之前判完，错误能直接回到调用方（面板据此显示失败原因）。
+    let base_url = validate_ai_request(&request)?;
+    let url = if request.self_hosted {
+        // 自托管的端点与令牌在流式线程里解析：core_key 可能轮询 api-key 文件，
+        // 留在命令线程上会冻住 WebView（与 core_action 同一处坑）。
+        String::new()
+    } else {
+        format!("{base_url}/chat/completions")
+    };
+    let cancel = {
+        let mut guards = ai_cancels().lock().unwrap();
+        guards
+            .entry(request.chat_id.clone())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone()
+    };
+    let chat_id = request.chat_id.clone();
+    thread::spawn(move || {
+        stream_ai_chat(app, chat_id, url, request, cancel);
+    });
+    Ok(())
+}
+
+/// 中止进行中的 AI 对话：只置取消标志，真正的断连由流式线程在下一次读取检查时完成。
+#[tauri::command]
+fn ai_abort(chat_id: String) {
+    if let Some(flag) = ai_cancels().lock().unwrap().get(&chat_id) {
+        flag.store(true, Ordering::SeqCst);
+    }
+}
+
+/// 流式读取线程主体。任何出口都要发终态事件，否则前端的 Promise 永远悬挂
+/// （发送按钮会卡在「停止」态）。
+fn stream_ai_chat(
+    app: AppHandle,
+    chat_id: String,
+    url: String,
+    request: AiChatRequest,
+    cancel: Arc<AtomicBool>,
+) {
+    // 自托管：端点与 Bearer 令牌都取自壳自己持有的核心句柄。这段放在线程里而不是命令里，
+    // 因为 core_key 在最坏情况会轮询等待核心写入 api-key 文件（阻塞调用不得留在主线程）。
+    let (url, api_key) = if request.self_hosted {
+        match resolve_self_hosted(&app) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let _ = app.emit(
+                    "ai-error",
+                    serde_json::json!({ "chatId": chat_id, "error": error }),
+                );
+                cleanup_cancel(&chat_id);
+                return;
+            }
+        }
+    } else {
+        (url, request.api_key.clone())
+    };
+    let body = build_ai_body(&request);
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(15))
+        // 流式响应的「空闲超时」：距上一块数据超过 90s 视为断流（生成中的长停顿由
+        // 服务端 keep-alive 续命；整体时长不设上限）。
+        .timeout_read(Duration::from_secs(90))
+        .build();
+    let mut sent = agent
+        .post(&url)
+        .set("Content-Type", "application/json")
+        .set("Accept", "text/event-stream");
+    if !api_key.trim().is_empty() {
+        sent = sent.set("Authorization", &format!("Bearer {}", api_key.trim()));
+    }
+    let response = match sent.send_json(&body) {
+        Ok(response) => response,
+        Err(ureq::Error::Status(status, response)) => {
+            let detail = response.into_string().unwrap_or_default();
+            let hint = match status {
+                401 | 403 => "端点拒绝了 API Key（检查是否填写正确）".to_string(),
+                404 => "端点不存在（Base URL 是否以 /v1 结尾？）".to_string(),
+                429 => "端点限流（429），请稍后再试".to_string(),
+                _ => format!("HTTP {status}"),
+            };
+            let snippet = snippet_of(&detail);
+            let error = if snippet.is_empty() {
+                hint
+            } else {
+                format!("{hint}：{snippet}")
+            };
+            let _ = app.emit("ai-error", serde_json::json!({ "chatId": chat_id, "error": error }));
+            cleanup_cancel(&chat_id);
+            return;
+        }
+        Err(error) => {
+            let _ = app.emit(
+                "ai-error",
+                serde_json::json!({ "chatId": chat_id, "error": format!("请求 AI 端点失败：{error}") }),
+            );
+            cleanup_cancel(&chat_id);
+            return;
+        }
+    };
+    let reader = std::io::BufReader::new(response.into_reader());
+    let mut acc = AiStreamAcc::default();
+    let mut aborted = false;
+    let mut failed: Option<String> = None;
+    for line in std::io::BufRead::lines(reader) {
+        if cancel.load(Ordering::SeqCst) {
+            aborted = true;
+            break;
+        }
+        let line = match line {
+            Ok(line) => line,
+            // 读超时 / 连接中断：已收到的部分随错误一起交给前端（气泡内容不丢）。
+            Err(error) => {
+                failed = Some(format!("读取 AI 响应中断：{error}"));
+                break;
+            }
+        };
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() {
+            continue;
+        }
+        if data == "[DONE]" {
+            break;
+        }
+        // 单行解析失败不影响整条流（部分提供商会夹带注释行 / keep-alive）。
+        if let Ok(chunk) = serde_json::from_str::<Value>(data) {
+            let delta = acc.absorb(&chunk);
+            if !delta.is_empty() {
+                let _ = app.emit("ai-chunk", serde_json::json!({ "chatId": chat_id, "text": delta }));
+            }
+        }
+    }
+    if aborted {
+        let _ = app.emit("ai-aborted", serde_json::json!({ "chatId": chat_id }));
+    } else if let Some(error) = failed {
+        let _ = app.emit(
+            "ai-error",
+            serde_json::json!({ "chatId": chat_id, "error": error, "partial": acc.content }),
+        );
+    } else {
+        let mut payload = acc.finish();
+        if let Some(map) = payload.as_object_mut() {
+            map.insert("chatId".to_string(), serde_json::json!(chat_id));
+        }
+        let _ = app.emit("ai-done", payload);
+    }
+    cleanup_cancel(&chat_id);
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -848,7 +1300,9 @@ pub fn run() {
             core_running,
             data_dir_path,
             read_log,
-            open_external
+            open_external,
+            ai_chat,
+            ai_abort
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -873,6 +1327,38 @@ pub fn run() {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// 外链命令是 WebView 之外唯一的「拉起系统浏览器」通道，只放行登记过的官方申请页：
+    /// 任意 https、userinfo 视觉伪装、后缀拼接、带端口、非 https 都必须被拒绝，
+    /// 否则被污染的面板可以把它当成任意 URL 外带通道。
+    #[test]
+    fn open_external_accepts_only_the_registered_official_hosts() {
+        for url in [
+            "https://www.modelscope.cn/my/access/token",
+            "https://cloud.siliconflow.cn/account/ak",
+            "https://console.cloud.tencent.com/tokenhub/apikey",
+            "https://open.bigmodel.cn/usercenter/apikeys",
+        ] {
+            assert_eq!(external_url_rejection(url), None, "{url} 是名单内的官方页，必须放行");
+        }
+        for url in [
+            "https://evil.tld/",
+            "http://www.modelscope.cn/my/access/token",
+            "https://www.modelscope.cn@evil.tld/",
+            "https://www.modelscope.cn.evil.tld/token",
+            "https://www.modelscope.cn:8443/my/access/token",
+            "https://www.modelscope.cn\\@evil.tld/",
+            "https://open.bigmodel.cn/usercenter/apikeys\nhttps://evil.tld",
+            "https://",
+            "",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                external_url_rejection(url).is_some(),
+                "{url} 不得被当作官方申请页打开"
+            );
+        }
+    }
 
     /// 临时日志文件；Drop 时清理，避免测试往磁盘留垃圾。
     struct TempLog(PathBuf);
@@ -947,6 +1433,218 @@ mod tests {
         shell.sort_unstable();
         core.sort_unstable();
         assert_eq!(shell, core);
+    }
+
+    /// AI 端点白名单：https 一律放行，http 只认本机回环；前缀伪装（127.0.0.1.evil.com）
+    /// 与非 http(s) 协议一律拒绝。
+    #[test]
+    fn ai_base_url_allows_https_and_loopback_http_only() {
+        assert_eq!(
+            normalize_ai_base_url(" https://api.deepseek.com/v1/ ").unwrap(),
+            "https://api.deepseek.com/v1"
+        );
+        assert_eq!(
+            normalize_ai_base_url("http://127.0.0.1:11434/v1").unwrap(),
+            "http://127.0.0.1:11434/v1"
+        );
+        assert_eq!(
+            normalize_ai_base_url("http://localhost:8000/v1").unwrap(),
+            "http://localhost:8000/v1"
+        );
+        assert_eq!(
+            normalize_ai_base_url("http://[::1]:8080/v1").unwrap(),
+            "http://[::1]:8080/v1"
+        );
+        assert!(normalize_ai_base_url("http://api.deepseek.com/v1").is_err(), "非本机 http 拒绝");
+        assert!(normalize_ai_base_url("http://127.0.0.1.evil.com/v1").is_err(), "前缀伪装拒绝");
+        assert!(normalize_ai_base_url("http://localhost.evil.com/v1").is_err(), "前缀伪装拒绝");
+        assert!(normalize_ai_base_url("ftp://api.deepseek.com").is_err());
+        assert!(normalize_ai_base_url("api.deepseek.com/v1").is_err());
+        assert!(normalize_ai_base_url("").is_err());
+        assert!(normalize_ai_base_url("https://").is_err(), "缺主机名");
+    }
+
+    /// SSE 累积：content 增量拼接、tool_calls 的 id/name 只取首片、arguments 按分片拼接，
+    /// finish_reason 以最后一个非空值为准；返回值是本次的文本增量（供节流推送）。
+    #[test]
+    fn ai_stream_acc_absorbs_content_and_tool_calls() {
+        let mut acc = AiStreamAcc::default();
+        assert_eq!(acc.absorb(&serde_json::json!({ "choices": [] })), "");
+        let delta = acc.absorb(&serde_json::json!({
+            "choices": [{ "delta": { "content": "你好" } }]
+        }));
+        assert_eq!(delta, "你好");
+        let delta = acc.absorb(&serde_json::json!({
+            "choices": [{ "delta": { "content": "，世界" } }]
+        }));
+        assert_eq!(delta, "，世界");
+        // 首片带 id/name，arguments 分两片到达。
+        acc.absorb(&serde_json::json!({
+            "choices": [{ "index": 0, "delta": { "tool_calls": [{ "index": 0, "id": "call_1", "function": { "name": "get_status", "arguments": "{\"a\"" } }] } }]
+        }));
+        acc.absorb(&serde_json::json!({
+            "choices": [{ "index": 0, "delta": { "tool_calls": [{ "index": 0, "function": { "arguments": ":1}" } }] } }]
+        }));
+        // 第二个工具 + finish_reason。
+        acc.absorb(&serde_json::json!({
+            "choices": [{ "index": 0, "finish_reason": "tool_calls", "delta": { "tool_calls": [{ "index": 1, "id": "call_2", "function": { "name": "read_log", "arguments": "{}" } }] } }]
+        }));
+        let finished = acc.finish();
+        assert_eq!(finished["content"], "你好，世界");
+        assert_eq!(finished["finishReason"], "tool_calls");
+        let calls = finished["toolCalls"].as_array().expect("toolCalls 应为数组");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["id"], "call_1");
+        assert_eq!(calls[0]["name"], "get_status");
+        assert_eq!(calls[0]["arguments"], "{\"a\":1}");
+        assert_eq!(calls[1]["name"], "read_log");
+    }
+
+    /// usage-only chunk（无 choices）不产出增量；只有 index 没有 name 的空槽不进最终数组。
+    #[test]
+    fn ai_stream_acc_ignores_usage_only_and_nameless_slots() {
+        let mut acc = AiStreamAcc::default();
+        assert_eq!(
+            acc.absorb(&serde_json::json!({ "usage": { "total_tokens": 42 } })),
+            ""
+        );
+        acc.absorb(&serde_json::json!({
+            "choices": [{ "delta": { "tool_calls": [{ "index": 0, "function": { "arguments": "{}" } }] } }]
+        }));
+        let finished = acc.finish();
+        assert_eq!(finished["content"], "");
+        assert_eq!(finished["toolCalls"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// 错误响应体截断：压掉换行、封顶 200 字符，超长加省略号。
+    #[test]
+    fn ai_error_snippet_collapses_and_caps() {
+        assert_eq!(snippet_of("  line one\nline two  "), "line one line two");
+        assert_eq!(snippet_of(""), "");
+        let long = snippet_of(&"x".repeat(500));
+        assert_eq!(long.chars().count(), 201);
+        assert!(long.ends_with('…'));
+    }
+
+    /// 请求形态：camelCase 入参可反解，缺省项（selfHosted / tools / toolChoice）回落空值。
+    /// 这条同时钉住前端 `src/core/ai.js` 与壳的字段拼写 —— 改名必须两侧同步。
+    #[test]
+    fn ai_request_accepts_the_panel_shape_and_defaults() {
+        let request: AiChatRequest = serde_json::from_value(serde_json::json!({
+            "chatId": "ai-1",
+            "baseUrl": "https://api.deepseek.com/v1",
+            "apiKey": "sk-x",
+            "model": "deepseek-v4-flash",
+            "messages": [{ "role": "user", "content": "现在有几个模型可用" }],
+        }))
+        .expect("面板形态的请求体必须可解");
+        assert!(!request.self_hosted);
+        assert!(request.tools.is_empty());
+        assert_eq!(request.tool_choice, None);
+        assert_eq!(
+            validate_ai_request(&request).unwrap(),
+            "https://api.deepseek.com/v1"
+        );
+    }
+
+    /// 体积与形态闸门：空 messages / 超长单条 / 超量历史 / 超量工具都要在起线程之前挡下；
+    /// 自托管模式跳过 Base URL 校验（端点由壳自己解析，面板无权指定）。
+    #[test]
+    fn ai_request_guards_shape_sizes_and_self_hosted_skips_base_url() {
+        let base = |extra: serde_json::Value| {
+            let mut request = serde_json::json!({
+                "chatId": "ai-1",
+                "baseUrl": "https://api.deepseek.com/v1",
+                "model": "m",
+                "messages": [{ "role": "user", "content": "hi" }],
+            });
+            if let (Some(map), Some(given)) = (request.as_object_mut(), extra.as_object()) {
+                for (key, value) in given {
+                    map.insert(key.clone(), value.clone());
+                }
+            }
+            serde_json::from_value::<AiChatRequest>(request).expect("形态合法")
+        };
+        assert!(validate_ai_request(&base(serde_json::json!({ "messages": [] }))).is_err());
+        let too_long = "x".repeat(AI_MAX_MESSAGE_CHARS + 1);
+        assert!(validate_ai_request(&base(serde_json::json!({
+            "messages": [{ "role": "user", "content": too_long }]
+        })))
+        .is_err());
+        let many: Vec<Value> = (0..=AI_MAX_MESSAGES)
+            .map(|_| serde_json::json!({ "role": "user", "content": "hi" }))
+            .collect();
+        assert!(validate_ai_request(&base(serde_json::json!({ "messages": many }))).is_err());
+        let tools: Vec<Value> = (0..=AI_MAX_TOOLS)
+            .map(|index| serde_json::json!({ "type": "function", "index": index }))
+            .collect();
+        assert!(validate_ai_request(&base(serde_json::json!({ "tools": tools }))).is_err());
+        // 非法端点：非自托管必须被白名单拒绝。
+        assert!(validate_ai_request(&base(serde_json::json!({ "baseUrl": "http://evil.test/v1" }))).is_err());
+        // 自托管：baseUrl 完全忽略，缺省即通过。
+        let self_hosted = base(serde_json::json!({
+            "selfHosted": true,
+            "baseUrl": "http://evil.test/v1",
+        }));
+        assert_eq!(validate_ai_request(&self_hosted).unwrap(), "");
+    }
+
+    /// 请求体：不带 tools 时保持旧形态（老端点不认识 tools 字段）；带 tools 才补 tool_choice，
+    /// 面板显式给的 tool_choice（例如 "required"）不被覆盖成 auto。
+    #[test]
+    fn ai_body_declares_tools_only_when_present() {
+        let plain: AiChatRequest = serde_json::from_value(serde_json::json!({
+            "chatId": "c", "baseUrl": "https://x.test/v1", "model": "m",
+            "messages": [{ "role": "user", "content": "hi" }],
+        }))
+        .unwrap();
+        let body = build_ai_body(&plain);
+        assert_eq!(body["stream"], true);
+        assert!(body.get("tools").is_none(), "无工具时不得发送 tools 键");
+        assert!(body.get("tool_choice").is_none());
+
+        let with_tools: AiChatRequest = serde_json::from_value(serde_json::json!({
+            "chatId": "c", "baseUrl": "https://x.test/v1", "model": "m",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "type": "function", "function": { "name": "get_service_status" } }],
+        }))
+        .unwrap();
+        let body = build_ai_body(&with_tools);
+        assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["tool_choice"], "auto");
+
+        let forced: AiChatRequest = serde_json::from_value(serde_json::json!({
+            "chatId": "c", "baseUrl": "https://x.test/v1", "model": "m",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "type": "function", "function": { "name": "probe_models" } }],
+            "toolChoice": "required",
+        }))
+        .unwrap();
+        assert_eq!(build_ai_body(&forced)["tool_choice"], "required");
+    }
+
+    /// 自托管端点只指向回环地址（端口由壳自己给出，面板不参与拼接）。
+    #[test]
+    fn self_hosted_base_url_is_loopback_only() {
+        assert_eq!(self_hosted_base_url(41980), "http://127.0.0.1:41980/v1");
+        assert_eq!(
+            resolve_self_hosted_without_core_is_refused(),
+            "核心服务未运行，本机模型不可用；请改用外部端点"
+        );
+    }
+
+    /// 没有运行中的核心时自托管必须失败，不得退化成「猜一个端口」或任意本机地址。
+    /// 没有 AppHandle 就调不到 resolve_self_hosted，这里复现它的前半段判据并钉住文案。
+    fn resolve_self_hosted_without_core_is_refused() -> String {
+        let state = idle_state();
+        let port = {
+            let guard = state.core.lock().unwrap();
+            guard.as_ref().map(|core| core.port)
+        };
+        match port {
+            Some(port) => format!("{}/chat/completions", self_hosted_base_url(port)),
+            None => "核心服务未运行，本机模型不可用；请改用外部端点".to_string(),
+        }
     }
 
     fn idle_state() -> AppState {

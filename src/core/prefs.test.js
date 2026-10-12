@@ -8,9 +8,12 @@ import {
   SILENT_CHECK_MIN_INTERVAL_MS,
   VIEW_IDS,
   isAllowedKey,
+  loadAiConfig,
   readPref,
+  sanitizeAi,
   sanitizeUpdate,
   sanitizeView,
+  saveAiConfig,
   saveAutoCheck,
   saveCheckedAt,
   saveView,
@@ -70,6 +73,75 @@ test('凭据类字段即使在值里也进不了存储', () => {
     assert.equal(JSON.stringify(stored).includes('leak'), false)
     assert.equal(JSON.stringify(stored).includes('/x'), false)
   })
+})
+
+test('ai：只投影已知字段，API Key 连白名单键都拿不到', () => {
+  assert.equal(isAllowedKey('ai'), true)
+  assert.equal(isAllowedKey('aiKey'), false)
+  assert.equal(isAllowedKey('apiKey'), false)
+
+  // 值里夹带 Key / 路径一样被投影掉：落盘的只有五个已知字段。
+  withStorage(fakeStorage(), () => {
+    assert.equal(
+      writePref('ai', {
+        brain: 'external',
+        baseUrl: 'https://api.deepseek.com/v1',
+        model: 'deepseek-chat',
+        selfModel: 'opencode/big-pickle',
+        tools: false,
+        apiKey: 'sk-leak',
+        key: 'sk-leak',
+        token: 'leak',
+      }),
+      true,
+    )
+    const stored = JSON.parse(globalThis.localStorage.getItem('wb.ai'))
+    assert.deepEqual(Object.keys(stored).sort(), ['baseUrl', 'brain', 'model', 'selfModel', 'tools'])
+    assert.equal(JSON.stringify(stored).includes('leak'), false)
+    assert.deepEqual(readPref('ai'), {
+      brain: 'external',
+      baseUrl: 'https://api.deepseek.com/v1',
+      model: 'deepseek-chat',
+      selfModel: 'opencode/big-pickle',
+      tools: false,
+    })
+  })
+
+  // 类型不符 / 空值回落默认（空串 = 用 ai.js 的默认值；brain 只认 self/external）。
+  assert.deepEqual(sanitizeAi(undefined), DEFAULTS.ai)
+  assert.deepEqual(sanitizeAi(null), DEFAULTS.ai)
+  assert.deepEqual(sanitizeAi({ baseUrl: 42, model: {}, brain: 'cloud', tools: 'no' }), {
+    brain: 'self',
+    baseUrl: '',
+    model: '',
+    selfModel: '',
+    tools: true,
+  })
+  assert.deepEqual(sanitizeAi({ baseUrl: '', model: 'gpt-4o-mini' }).model, 'gpt-4o-mini')
+
+  // 存取入口：读-改-写只动自己这一份；只给部分字段时其余回落默认（不继承上一次的值）。
+  withStorage(fakeStorage(), () => {
+    assert.equal(saveAiConfig({ brain: 'external', baseUrl: 'http://127.0.0.1:11434/v1', model: 'qwen2.5' }), true)
+    assert.deepEqual(loadAiConfig(), {
+      brain: 'external',
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      model: 'qwen2.5',
+      selfModel: '',
+      tools: true,
+    })
+    assert.equal(saveAiConfig({ brain: 'self', selfModel: 'opencode/big-pickle' }), true)
+    assert.deepEqual(loadAiConfig(), {
+      brain: 'self',
+      baseUrl: '',
+      model: '',
+      selfModel: 'opencode/big-pickle',
+      tools: true,
+    })
+  })
+
+  // assistant 是合法视图 id（恢复偏好时不至于渲染一个不存在的视图）。
+  assert.equal(VIEW_IDS.includes('assistant'), true)
+  assert.equal(sanitizeView('assistant'), 'assistant')
 })
 
 test('view：合法值往返，非法值回落默认', () => {

@@ -792,8 +792,9 @@ pub async fn find_runtime(
 /// `providers_section` 是多平台接入的注入位：调用方从 `providers.json` 读出**已配置**的
 /// 注册表平台，构造 `{ "<id>": { npm, options: { baseURL, apiKey } } }` 传入；未配置的平台
 /// 整段不出现（不是注入空 Key）。空段时输出与多平台接入之前逐字节一致。
-/// 🔴 Key 只经这条配置内容通道交给 OpenCode（2026-10-09 沙箱实测 `/provider` 响应不回显）；
-/// 绝不进 `ENV_ALLOW`、不进独立环境变量、不写日志。
+/// 🔴 Key 只经这条配置内容通道交给 OpenCode（2026-10-09 沙箱实测 `/provider` 响应不回显，
+/// 见 `docs/validation.md`）；除 `OPENCODE_CONFIG_CONTENT` 之外，Key 不得出现在任何
+/// 透传给子进程的变量里（`ENV_ALLOW` 白名单本身也不含凭据类变量名），也不得写日志。
 pub fn isolated_config(providers_section: Value) -> Value {
     // 非对象（含 Null）一律按空段处理：防御异常输入把整个隔离配置带偏。
     let section = match providers_section {
@@ -834,7 +835,11 @@ pub const ANCHOR_MODEL_KEY: &str = "wbbridge-provider-anchor";
 /// 返回 `(声明段, 已配置平台 id 列表)`：前者经 `isolated_config` 进 `OPENCODE_CONFIG_CONTENT`，
 /// 后者供编排层把模型发现收敛到「已配置平台」（未配置平台不出模型，避免对无 Key 平台探测 401）。
 /// 读盘失败（文件不存在/坏 JSON）与 `providers.json` 的容错语义一致：按「没有任何平台配置」处理。
-/// 🔴 返回的声明段内含 Key，只在内存中传给 `isolated_config`，不得落日志、不得进任何返回值。
+/// 🔴 返回的声明段内含 Key，只在内存里交给 `isolated_config`：不得写日志、不得进任何
+/// HTTP 响应体或 `status.json`。唯一合法的出口是子进程的 `OPENCODE_CONFIG_CONTENT`
+/// （它确实是环境变量，但是红线 7 指定的那一条通道，不是「独立环境变量」）。
+/// 由 `tests/red_lines.rs` 的 `injected_provider_key_only_reaches_the_config_content_channel`
+/// 钉住「除该通道外没有任何变量含 Key」。
 pub fn providers_section_for(data_dir: &str) -> (Value, Vec<String>) {
     let keys = crate::providers::read_keys(data_dir);
     let mut section = serde_json::Map::new();
@@ -1098,9 +1103,12 @@ pub async fn start_backend(
         }
     }
     let password = generate_password();
-    // 多平台接入：启动时读一次已配置的平台 Key 并构造声明段。Key 只经
-    // OPENCODE_CONFIG_CONTENT 进子进程（见 isolated_config 的凭据纪律）；
-    // Key 变更后需重启核心才会重新读取（最小改动，不做热重载）。
+    // 多平台接入：每次启动子进程都重读一次 providers.json 构造声明段——这条通道同时是
+    // 面板保存/清除 Key 后的热生效路径（`/admin/refresh` → run_refresh → 这里重新装入）。
+    // Key 只经 OPENCODE_CONFIG_CONTENT 进子进程（见 isolated_config 的凭据纪律）；
+    // 编排层为发现闸门另取一次 id（orchestration.rs::configured_provider_ids）。
+    // ⚠ 两次读取之间若恰好改了 Key，会出现「发现该平台但未注入它」的窗口：面板的保存流程是
+    // 先写盘再 refresh，正常操作不会命中，但这一偏差尚未由测试钉住。
     let (providers_section, _configured) = providers_section_for(data_dir);
     let env = isolated_environment(&root, proxy_env, &password, &host_env, providers_section);
     let project = join_host(&[&root, "project"]);

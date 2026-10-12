@@ -24,6 +24,7 @@ import UsageView from './views/UsageView.vue'
 import IntegrationView from './views/IntegrationView.vue'
 import AboutView from './views/AboutView.vue'
 import ProvidersView from './views/ProvidersView.vue'
+import AssistantView from './views/AssistantView.vue'
 
 const state = ref({})
 const selected = ref(null)
@@ -388,6 +389,9 @@ onUnmounted(() => {
         @import="run('import')"
       />
       <AboutView v-if="view === 'about'" :state="state" />
+      <!-- AI 助手：自然语言管理 WB Bridge。写入类操作由视图内的提案确认弹窗把关，
+           端点 / 模型名走 prefs，API Key 只在视图会话内存里（不落盘） -->
+      <AssistantView v-if="view === 'assistant'" :state="state" :busy="!!busyAction" />
     </main>
   </div>
 </template>
