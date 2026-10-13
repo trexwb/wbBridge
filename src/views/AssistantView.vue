@@ -5,8 +5,27 @@
 //   • 只读工具立即执行；写入类工具只是**提案**，必须经用户逐条勾选确认后才执行；
 //   • API Key 只在会话内存里（设置弹窗填写，不落盘、不回显、不进历史），请求时随命令
 //     参数进壳；壳侧另有端点白名单复核；
-//   • 对话内容不持久化：刷新或重启即清空，避免把用户输入（可能含敏感信息）写进 WebView 存储。
+//   • 对话内容默认记在本机 IndexedDB（src/core/chatSession.js），重开与切换视图都不丢；
+//     落盘前丢弃工具入参（可能含平台 Key 明文），可在「设置」整项关掉。
+//
+// 🔴 会话状态（messages / chatting / confirming / draft）全部取自 chatSession 的模块级单例：
+// 面板用 v-if 切视图，切走即卸载本组件。状态若放在组件里，一轮生成还没回来就被一起销毁；
+// 放在模块里则可以「生成中切走、回来续上」，包括正等着用户勾选的提案确认框。
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import {
+  chatting,
+  clearConversation,
+  confirming,
+  coreSnapshot,
+  draft,
+  ensureHydrated,
+  lastTurn,
+  messages,
+  persistEnabled,
+  schedulePersist,
+  setPersist,
+} from '../core/chatSession.js'
+import MarkdownBlock from '../components/MarkdownBlock.vue'
 import {
   AI_PRESETS,
   AI_TOOLS,
@@ -19,7 +38,6 @@ import {
   currentConfig,
   persistConfig,
   phaseLabel,
-  renderMarkdownLite,
   runTool,
   summarizeToolCall,
   toolCallPreview,
@@ -38,6 +56,9 @@ const props = defineProps({
   busy: { type: Boolean, default: false },
 })
 
+// 视图跳转（「去设置 / 去『模型与服务』」这类出路），由 App.vue 换成实际的 view 名。
+const emit = defineEmits(['navigate'])
+
 const QUICK_PROMPTS = [
   '现在服务状态怎么样？有哪些模型可用？',
   '哪些模型不可用？帮我看最近日志找原因。',
@@ -47,15 +68,11 @@ const QUICK_PROMPTS = [
   '现在有新版本可以更新吗？',
 ]
 
-// ── 会话状态（全部只在内存） ────────────────────────────────────────
-const messages = ref([]) // { id, role, content, pending, failed, error, partial, stopped, trimmed, tools: [] }
-const draft = ref('')
-const chatting = ref(false)
+// ── 本地界面状态（会话状态已上移到 chatSession） ────────────────────
 const config = reactive({ ...currentConfig(), apiKey: '' })
 const showSettings = ref(false)
-const settingsForm = reactive({ brain: 'self', baseUrl: '', model: '', selfModel: AUTO_MODEL_ID, apiKey: '', tools: true })
+const settingsForm = reactive({ brain: 'self', baseUrl: '', model: '', selfModel: AUTO_MODEL_ID, apiKey: '', tools: true, persist: true })
 const settingsError = ref('')
-const confirming = ref(null) // { calls, resolve }
 const notice = ref('') // 输入框上方的一次性说明（拦下一次发送时给原因，不进对话历史）
 let noticeTimer = null
 const chatBox = ref(null) // 对话区容器：滚动到底要用它，而不是 document.querySelector
@@ -71,9 +88,6 @@ let settingsTrigger = null
 // 用户往上翻看历史时不再强行拽回底部，但必须给一条明确的路回到底部（见 .assistant-jump）。
 const atBottom = ref(true)
 const pendingBelow = ref(false)
-// 最近一轮的入参，供失败后的「重试」原样重发（不重新读输入框，避免用户已改过文案）。
-let lastTurn = null
-
 // 核心就绪才谈得上「本机大脑」与工具：phase 不是 ready 时先给一条明确说明，
 // 而不是让用户对着一个必然 401/连接失败的报错猜原因。
 const coreReady = computed(() => props.state.phase === 'ready')
@@ -131,6 +145,69 @@ const selfChatOnly = computed(() => {
 
 // 本轮是否声明工具：开关关闭、或本机大脑选中「仅对话」模型时不声明。
 const toolsEnabled = computed(() => config.tools !== false && !selfChatOnly.value)
+
+// ── 使用门槛：模型就位才可用 ────────────────────────────────────────
+// 「就位」= 这一轮真发得出去。外部端点要求地址 / 模型 / Key 齐备；本机大脑要求核心**就绪**
+// 且至少有一个探测通过的模型 —— 池空时连 `WB · auto` 都没有可转发的落点，请求必然失败，
+// 让用户对着一个注定失败的输入框打字没有意义。
+// 门槛只拦输入（输入框与发送一起禁用），不动「设置」：改大脑来源始终是可走的那条出路。
+const gate = computed(() => {
+  if (config.brain === 'external') {
+    const error = validateConfig({ baseUrl: config.baseUrl, model: config.model })
+    if (error) return { blocked: true, title: '外部端点还没配好', reason: error, fix: 'settings' }
+    if (needsKey.value && !config.apiKey) {
+      return {
+        blocked: true,
+        title: '还缺这个端点的 API Key',
+        reason: '在「设置」填写即可开始（只留在本会话内存，不落盘）；本地 Ollama 一类端点可把地址改成本机后留空。',
+        fix: 'settings',
+      }
+    }
+    return { blocked: false }
+  }
+  if (!coreReady.value) {
+    return {
+      blocked: true,
+      title: `核心${phaseLabel(props.state.phase)}，本机大脑还不能用`,
+      reason: '本机大脑要用正在运行的核心作为模型服务。先到「模型与服务」把服务起起来，或在「设置」改用外部端点。',
+      fix: 'models',
+    }
+  }
+  const total = modelIds.value.length
+  const available = (Array.isArray(props.state.availableModels) ? props.state.availableModels : []).length
+  if (!total) {
+    return {
+      blocked: true,
+      title: '还没读取到免费模型',
+      reason: '先到「模型与服务」点「读取免费模型」，名单到位后助手才有模型可用。',
+      fix: 'models',
+    }
+  }
+  if (!available) {
+    const probe = props.state.probe
+    const pending = Array.isArray(probe?.pending) ? probe.pending.length : null
+    const progress = probe?.running && Number.isFinite(pending)
+      ? `（${Math.max(0, Math.min(total, total - pending))}/${total}）`
+      : ''
+    return {
+      blocked: true,
+      title: probe?.running ? '模型正在检测，还没有可用的' : '没有探测通过的模型',
+      reason: probe?.running
+        ? `已发现 ${total} 个模型，正在检测${progress}。检测通过后助手才用得上本机大脑，稍等即可。`
+        : `已发现 ${total} 个模型，但当前 0 个探测通过。到「模型与服务」点「检测全部」，或在「设置」改用外部端点。`,
+      fix: 'models',
+    }
+  }
+  return { blocked: false }
+})
+
+const blocked = computed(() => gate.value.blocked === true)
+
+const composerPlaceholder = computed(() =>
+  blocked.value
+    ? `${gate.value.title}：模型就位后可在这里提问`
+    : '例如：现在服务正常吗？哪些模型不可用？（Enter 发送，Shift + Enter 换行）',
+)
 
 // 粘底滚动：只有用户本来就贴在底部时才跟着新内容走。
 // 助手在读日志 / 逐模型列表时一次推很长一段，无条件滚到底会把用户往上翻的位置强行拽走，
@@ -201,6 +278,7 @@ function openSettings(event) {
   settingsForm.selfModel = config.selfModel
   settingsForm.apiKey = config.apiKey
   settingsForm.tools = config.tools !== false
+  settingsForm.persist = persistEnabled.value
   settingsError.value = ''
   revealKey.value = false
   showSettings.value = true
@@ -231,6 +309,7 @@ const settingsDirty = computed(() => {
     settingsForm.model.trim() === config.model &&
     settingsForm.selfModel.trim() === config.selfModel &&
     (settingsForm.tools !== false) === (config.tools !== false) &&
+    settingsForm.persist === persistEnabled.value &&
     settingsForm.apiKey === config.apiKey
   return !same
 })
@@ -277,6 +356,8 @@ function saveSettings() {
     selfModel: config.selfModel,
     tools: config.tools,
   })
+  // 记忆开关即时生效（关掉会顺带删掉已存的记录），不跟着「保存」之外的路径改。
+  setPersist(settingsForm.persist)
   closeSettings()
 }
 
@@ -354,6 +435,11 @@ function parseArgs(raw) {
 async function send() {
   const text = draft.value.trim()
   if (!text || chatting.value) return
+  // 模型还没就位（输入框此时本是禁用态；这里兜住快捷提问等程序化入口，并给出去路）。
+  if (blocked.value) {
+    showNotice(`${gate.value.title}：${gate.value.reason}`)
+    return
+  }
   // 其他视图的动作在飞时不发起请求：核心的 /admin/* 会拒绝并发的读取与探测，
   // 助手这时起草的工具只会得到一条失败卡片，拦在前面比事后解释更符合预期。
   if (props.busy) {
@@ -395,16 +481,16 @@ async function send() {
 
 // 重发最近一轮：失败的那条气泡原地替换成新的尝试，历史沿用出错前的那份（不把失败回复教给模型）。
 async function retry() {
-  if (chatting.value || !lastTurn) return
+  if (chatting.value || !lastTurn.value) return
   const last = messages.value[messages.value.length - 1]
   if (last && last.role === 'assistant' && last.failed) messages.value.pop()
-  await runTurn(lastTurn.text, lastTurn.history)
+  await runTurn(lastTurn.value.text, lastTurn.value.history)
 }
 
 async function runTurn(userText, history) {
   chatting.value = true
   notice.value = ''
-  lastTurn = { text: userText, history }
+  lastTurn.value = { text: userText, history }
   // error / stopped 独立于 content：失败原因不能拼进气泡正文，否则 apiHistory 会把
   // 「⚠ 连接失败」当成模型自己说过的话回灌给下一轮，模型会照着道歉或复读这句错误。
   messages.value.push({
@@ -440,10 +526,12 @@ async function runTurn(userText, history) {
   }
 
   try {
+    // 快照取 chatSession 里由 App.vue 持续喂新的那份：这一轮可能在「视图已卸载」的时段里
+    // 跑工具，此时 props.state 早已停更，读它会把一份过期的状态讲给模型听。
     const request = buildRequestMessages({
       history,
       message: userText,
-      snapshot: buildSnapshot(props.state),
+      snapshot: buildSnapshot(coreSnapshot.value),
     })
     for (let round = 0; round < 6; round++) {
       // 工具开关关闭、或本机大脑选中「仅对话」模型时不声明 tools（壳侧同样只在非空时才带
@@ -520,7 +608,7 @@ async function runTurn(userText, history) {
         }
         if (!entry.write) {
           entry.status = 'running'
-          entry.result = await runTool(entry.name, entry.args, { state: props.state })
+          entry.result = await runTool(entry.name, entry.args, { state: coreSnapshot.value })
           entry.status = 'done'
           scrollBottom()
           continue
@@ -531,7 +619,7 @@ async function runTurn(userText, history) {
           continue
         }
         entry.status = 'running'
-        entry.result = await runTool(entry.name, entry.args, { state: props.state })
+        entry.result = await runTool(entry.name, entry.args, { state: coreSnapshot.value })
         entry.status = 'done'
         scrollBottom()
       }
@@ -550,6 +638,9 @@ async function runTurn(userText, history) {
     if (flushTimer) clearTimeout(flushTimer)
     live.pending = false
     chatting.value = false
+    // 一轮结束（正常 / 失败 / 被停止）就落一次盘：流式期间的正文增量不走 watch，
+    // 这里补上，保证新内容不会因为一直没触发条数变化而丢。
+    schedulePersist()
     scrollBottom()
     // 生成期间 textarea 是禁用态，浏览器会把它从焦点链上摘掉、焦点落到 body：
     // 不主动还回去，连续对话的人每轮都要重新点一次输入框（Enter 发送也就此失效）。
@@ -612,28 +703,39 @@ function onWindowKeydown(event) {
   if (showSettings.value) closeSettings()
 }
 
-onMounted(() => window.addEventListener('keydown', onWindowKeydown))
+onMounted(() => {
+  window.addEventListener('keydown', onWindowKeydown)
+  // 输入框高度由 autoGrow() 写在内联 style 上：切走再回来（或上次留下的草稿）不会有
+  // draft 变化事件，高度会退回一行、把多行草稿藏进滚动条里。
+  autoGrow()
+  // 把上次会话读回来（首次进入才有作用；在飞的那一轮不会被覆盖）。读完后贴到底部，
+  // 让「回来续上」落在最新一条上。
+  void ensureHydrated().then(() => {
+    nextTick(() => {
+      const box = chatBox.value
+      if (box) box.scrollTop = box.scrollHeight
+      // 切走时正等着勾选的提案确认框：回来后要重新拿到焦点，否则 Tab / Esc 都落在页面别处。
+      if (confirming.value && confirmPanel.value) confirmPanel.value.focus()
+    })
+  })
+})
 
 function clearHistory() {
   if (chatting.value) return
-  messages.value = []
-  lastTurn = null
+  // 内存与本机记录一起清：只清内存的话，下次打开又把旧对话读回来。
+  clearConversation()
   dismissNotice()
 }
 
 function quick(text) {
-  if (chatting.value) return
+  if (chatting.value || blocked.value) return
   draft.value = text
   send()
 }
 
-function render(content) {
-  return renderMarkdownLite(content)
-}
-
 // 失败气泡上的「重试」只给最新一轮：更早的失败已被后续对话取代，重发会把话题拉回过去。
 function canRetry(message) {
-  return !chatting.value && message.failed && lastTurn !== null && messages.value[messages.value.length - 1] === message
+  return !chatting.value && message.failed && lastTurn.value !== null && messages.value[messages.value.length - 1] === message
 }
 
 function toolStatusText(entry) {
@@ -642,30 +744,43 @@ function toolStatusText(entry) {
   return entry.result?.ok ? '已完成' : '失败'
 }
 
+// 工具结果一旦写入就不再变，但模板里每次重渲染都要它**两次**（`v-else-if` 的判据 +
+// `<pre>` 的正文）。流式期间父视图每秒重渲染十几次，等于每秒把最多 8KB 的 JSON 重新
+// stringify 二十遍。按 result 的对象身份缓存一次即可——它不会被就地改写，键也随对象一起回收。
+const RESULT_TEXT_CACHE = new WeakMap()
+
 // 工具结果折叠区的正文：默认收起（模型已经拿到并转述过，展开是给人核对用的）。
 // 上限与 ai.js 里 read_log 的截断同口径，避免把 8KB 日志一次性铺进 DOM。
 function resultText(entry) {
   const result = entry.result
-  if (!result) return ''
-  if (result.ok === false) return String(result.error ?? '执行失败')
+  if (!result || typeof result !== 'object') return ''
+  const cached = RESULT_TEXT_CACHE.get(result)
+  if (cached !== undefined) return cached
   let text
-  try {
-    text = JSON.stringify(result.result ?? result, null, 1)
-  } catch {
-    text = String(result.result ?? '')
+  if (result.ok === false) {
+    text = String(result.error ?? '执行失败')
+  } else {
+    try {
+      text = JSON.stringify(result.result ?? result, null, 1)
+    } catch {
+      text = String(result.result ?? '')
+    }
+    if (entry.name === 'read_log') {
+      // 日志正文单独成形：整段 JSON 化会把换行变成 \n，读起来比原始日志更难。
+      const log = result.result || {}
+      text = `${log.truncated ? '（已截断，原始 ' + log.bytes + ' 字节）\n' : ''}${String(log.text ?? '')}`
+    }
+    if (text.length > 8000) text = `${text.slice(0, 8000)}\n…（其余省略）`
   }
-  if (entry.name === 'read_log') {
-    // 日志正文单独成形：整段 JSON 化会把换行变成 \n，读起来比原始日志更难。
-    const log = result.result || {}
-    text = `${log.truncated ? '（已截断，原始 ' + log.bytes + ' 字节）\n' : ''}${String(log.text ?? '')}`
-  }
-  return text.length > 8000 ? `${text.slice(0, 8000)}\n…（其余省略）` : text
+  RESULT_TEXT_CACHE.set(result, text)
+  return text
 }
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onWindowKeydown)
   if (noticeTimer) clearTimeout(noticeTimer)
-  if (chatting.value) abortChat()
+  // 🔴 刻意不调 abortChat()：切走视图不该掐断正在生成的那一轮。会话状态在 chatSession
+  // 的模块级单例里，回来时按最新内容续上；真要中止由视图里的「停止」按钮决定。
 })
 </script>
 
@@ -686,13 +801,31 @@ onBeforeUnmount(() => {
           type="button"
           class="ghost"
           :disabled="chatting || !messages.length"
-          title="清空当前对话（内容本来也不落盘）"
+          title="清空当前对话（同时删除本机保存的记录）"
           @click="clearHistory"
         >清空</button>
       </div>
     </header>
 
-    <p v-if="!coreReady" class="assistant-warn" role="status">
+    <!-- 门槛横幅：模型没就位时输入框就是禁用态，这里必须同时说清「为什么不能用」与「往哪走」，
+         否则一个点不动的输入框看起来就是坏的。 -->
+    <p v-if="blocked" class="assistant-warn" role="status">
+      <svg class="assistant-warn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="8.4" />
+        <path d="M12 7.6v5.6M12 16.4v.4" />
+      </svg>
+      <span>
+        <strong>{{ gate.title }}。</strong>{{ gate.reason }}
+      </span>
+      <button
+        type="button"
+        class="assistant-gate-fix"
+        @click="gate.fix === 'settings' ? openSettings($event) : emit('navigate', gate.fix)"
+      >{{ gate.fix === 'settings' ? '去设置' : '去「模型与服务」' }}</button>
+    </p>
+
+    <!-- 外部端点不依赖核心：未就绪只是一条「代管不了本应用」的说明，不拦使用。 -->
+    <p v-else-if="!coreReady" class="assistant-warn" role="status">
       <svg class="assistant-warn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
         <circle cx="12" cy="12" r="8.4" />
         <path d="M12 7.6v5.6M12 16.4v.4" />
@@ -718,12 +851,15 @@ onBeforeUnmount(() => {
             :key="prompt"
             type="button"
             class="assistant-chip"
-            :disabled="chatting"
+            :disabled="chatting || blocked"
+            :title="blocked ? gate.title : undefined"
             @click="quick(prompt)"
           >{{ prompt }}</button>
         </div>
         <p class="assistant-privacy">
-          对话内容只保存在本窗口内存中，关闭或重启即清空；API Key 不写入磁盘，重启后需在「设置」重新填写。
+          对话记录保存在本机 IndexedDB：重开应用、切换栏目都不会丢（生成中切走回来也会接着显示），
+          点「清空」才会删除；也能在「设置」关掉「记住对话」。落盘前会丢掉工具入参（其中可能有平台 Key 明文），
+          API Key 本身始终只在会话内存里、不写磁盘，重启后需在「设置」重新填写。
           本机大脑使用 WB Bridge 自己的免费模型（默认 <code>{{ AUTO_MODEL_ID }}</code>：按每次请求内容自动挑选），
           无需任何 Key，但会消耗少量免费额度。
         </p>
@@ -736,8 +872,10 @@ onBeforeUnmount(() => {
           <button v-else-if="canRetry(m)" type="button" class="assistant-retry" @click="retry">重试</button>
         </div>
         <div class="assistant-bubble">
-          <!-- renderMarkdownLite 先整段转义再解析，原始 HTML 不会成为标签 -->
-          <div class="assistant-text" v-html="render(m.content)" />
+          <!-- 受控 Markdown 渲染收进子组件：父视图每 ~80ms 因流式增量重渲染一次，
+               v-html 留在父模板会让**每条**历史气泡的 innerHTML 被重新赋值（Vue 对
+               innerHTML 不做新旧比对），整段对话反复重解析。收进去后只有正在生成的那条更新。 -->
+          <MarkdownBlock class="assistant-text" :content="m.content" />
           <!-- 光标由 CSS 画出：▍ 这类字符的字宽与基线随系统字体变化，也对不齐行尾 -->
           <span v-if="m.pending" class="assistant-cursor" aria-hidden="true" />
         </div>
@@ -820,8 +958,8 @@ onBeforeUnmount(() => {
         ref="composer"
         v-model="draft"
         rows="1"
-        :disabled="chatting"
-        placeholder="例如：现在服务正常吗？哪些模型不可用？（Enter 发送，Shift + Enter 换行）"
+        :disabled="chatting || blocked"
+        :placeholder="composerPlaceholder"
         aria-label="向 AI 助手提问"
         @keydown="onComposerKeydown"
       />
@@ -838,8 +976,8 @@ onBeforeUnmount(() => {
           v-else
           type="submit"
           class="primary"
-          :disabled="!draft.trim() || props.busy"
-          :title="props.busy ? '其他操作正在进行中，等它结束后可用' : undefined"
+          :disabled="!draft.trim() || props.busy || blocked"
+          :title="props.busy ? '其他操作正在进行中，等它结束后可用' : blocked ? gate.title : undefined"
         >
           <span v-if="props.busy" class="spinner" />发送
         </button>
@@ -960,6 +1098,14 @@ onBeforeUnmount(() => {
             <span>允许 AI 调用管理工具（查状态 / 读日志 / 读取与检测模型 / 导入插件 / 保存平台 Key…）</span>
           </label>
           <p class="note">关闭后 AI 只能问答与给建议，不能执行任何操作。写入类工具无论如何都会先弹确认框，勾选后才执行。</p>
+        </div>
+
+        <div class="field">
+          <label class="assistant-opt">
+            <input v-model="settingsForm.persist" type="checkbox">
+            <span>记住对话（存到本机 IndexedDB，重开应用与切换栏目都不丢）</span>
+          </label>
+          <p class="note">只存对话内容：工具入参（其中可能有平台 Key 明文）在落盘前丢弃，API Key 从不落盘。关掉会立刻删除已存的记录；「清空」随时可手动清一遍。</p>
         </div>
 
         <p v-if="settingsError" ref="settingsErrorBox" class="assistant-dialog-error" role="alert">
@@ -1134,18 +1280,8 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
 .assistant-msg.user .assistant-bubble { background: var(--green-bg); border-color: color-mix(in srgb, var(--green) 30%, transparent); }
 .assistant-msg.assistant .assistant-bubble { background: var(--surface-raised); }
 .assistant-msg.failed .assistant-bubble { border-color: color-mix(in srgb, var(--danger) 45%, var(--line)); }
-.assistant-text :deep(p) { margin: 0 0 6px; }
-.assistant-text :deep(p:last-child) { margin-bottom: 0; }
-.assistant-text :deep(code) { font-family: ui-monospace, monospace; font-size: var(--fs-xs); background: var(--panel); padding: 1px 5px; border-radius: 4px; }
-.assistant-text :deep(pre.ai-code) {
-  margin: 6px 0;
-  padding: 8px 10px;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-s);
-  overflow-x: auto;
-}
-.assistant-text :deep(pre.ai-code code) { background: none; padding: 0; }
+/* 气泡正文内部的 p / code / pre.ai-code 四条规则随 v-html 一起搬进了
+   `src/components/MarkdownBlock.vue`（那里的 :deep() 直接命中本组件自己的作用域）。 */
 /* 生成光标由 CSS 画出（不用 ▍ 字符：字宽与基线随系统字体变化，也贴不齐行尾）。
    要求减少动态效果时全站循环动画被 base.css 收敛成静态一帧，这里正好留一个常亮光标。 */
 .assistant-cursor {
@@ -1259,6 +1395,18 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
 }
 .assistant-keyhint > span,
 .assistant-warn > span { min-width: 0; flex: 1; }
+.assistant-warn > span > strong { color: var(--text); }
+/* 门槛横幅里的出路按钮（去设置 / 去「模型与服务」）：横幅是 flex 行，
+   按钮不能被正文挤扁，也不能在窄窗口里被拉成整行宽 */
+.assistant-gate-fix {
+  flex-shrink: 0;
+  align-self: flex-start;
+  font-size: var(--fs-xs);
+  padding: 5px 10px;
+  background: var(--surface-raised);
+  border-color: color-mix(in srgb, var(--orange) 45%, var(--line));
+  color: var(--text);
+}
 .assistant-keyhint > svg,
 .assistant-warn > svg { width: 15px; height: 15px; flex-shrink: 0; margin-top: 2px; }
 /* 拦下这次发送的一次性提示：带关闭按钮，8s 后自动消隐 */

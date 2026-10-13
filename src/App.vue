@@ -5,6 +5,9 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { action, onState, onDismiss } from './core/bridge.js'
 import { loadView, saveView } from './core/prefs.js'
+// AI 助手的会话状态活在模块级单例里（切视图不卸载），核心快照也得有一份同源的副本：
+// 一轮生成可能整段跑在「助手视图已卸载」的时段，那时组件的 props 早已停更。
+import { setCoreSnapshot } from './core/chatSession.js'
 import {
   ACTION_COOLDOWN_MS,
   COOLDOWN_ACTIONS,
@@ -112,6 +115,10 @@ watch(state, (snapshot) => {
 function apply(next) {
   state.value = next || {}
 }
+
+// 每帧快照同步给 AI 助手会话：由根组件喂，而不是由助手视图自己的 watch 喂 ——
+// 视图卸载后 watch 就停了，工具那一轮会读到卸载瞬间的旧快照。
+watch(state, next => setCoreSnapshot(next), { immediate: true })
 
 async function run(name, value) {
   // 已有动作在跑 / 终态动作刚完成：拒绝必须留下可见痕迹（文案由 ops.js 节流约定，
@@ -391,7 +398,7 @@ onUnmounted(() => {
       <AboutView v-if="view === 'about'" :state="state" />
       <!-- AI 助手：自然语言管理 WB Bridge。写入类操作由视图内的提案确认弹窗把关，
            端点 / 模型名走 prefs，API Key 只在视图会话内存里（不落盘） -->
-      <AssistantView v-if="view === 'assistant'" :state="state" :busy="!!busyAction" />
+      <AssistantView v-if="view === 'assistant'" :state="state" :busy="!!busyAction" @navigate="view = $event" />
     </main>
   </div>
 </template>
@@ -414,11 +421,20 @@ main > .view {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  /* 🔴 焦点环的两侧不能被裁掉：块级滚动容器把内容裁在**内边距盒**上（overflow-y:auto 会让
+     overflow-x 计算成 auto），贴着左右边缘的控件（AI 助手的输入框、平台页的 Key 输入框）
+     focus 时 2px 描边 + 2px 外扩正好落在盒外，看起来就是「两侧被削平了」。
+     这里给 4px 内边距把描边让进来，再用等量负外边距把视觉位置还回去 —— main 有 32px
+     横向内距，负外边距吃的是它，不会顶出 .shell 造成横向滚动。 */
+  padding-inline: 4px;
+  margin-inline: -4px;
   display: flex;
   flex-direction: column;
   gap: var(--sp-4);
-  width: 100%;
-  max-width: var(--content-max);
+  /* 宽度把内边距吃掉的那 8px 补回来：`box-sizing: border-box` 下 padding 会从 width 里扣，
+     只写 100% 会让内容比改之前窄 8px（与 .content 的对齐也就跟着错开）。 */
+  width: calc(100% + 8px);
+  max-width: calc(var(--content-max) + 8px);
 }
 .content {
   flex: 1;

@@ -1,12 +1,25 @@
 <script setup>
 // 运行日志：只读展示数据目录下核心日志的尾部。
 // 面板不读文件也不拼路径：壳侧 read_log 自己定位数据目录下的日志文件，只回尾部内容。
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { readLog } from '../core/bridge.js'
 
 const log = ref(null) // { text, truncated, bytes }
 const error = ref(null)
 const loading = ref(false)
+const expanded = ref(false)
+
+// 壳侧 read_log 的尾部上限是 256KB / 1200 行（见 docs/contract.md）。把这整块塞进一个
+// `<pre>`（pre-wrap + 逐字符断行）是一次性上千行的重排，切到本视图会明显顿一下。
+// 日志的价值在末尾，默认只把最后这些行进 DOM，要看全文再点「显示全部」。
+const PREVIEW_LINES = 400
+
+const lines = computed(() => String(log.value?.text ?? '').split('\n'))
+// 行数不到上限时不做任何裁剪：既不显示按钮，也不改变呈现。
+const hiddenCount = computed(() => (expanded.value ? 0 : Math.max(0, lines.value.length - PREVIEW_LINES)))
+const shownText = computed(() =>
+  hiddenCount.value ? lines.value.slice(-PREVIEW_LINES).join('\n') : String(log.value?.text ?? ''),
+)
 
 // 只做单位换算，不改变原始数值口径（bytes 是日志文件总字节数）。
 function formatBytes(bytes) {
@@ -60,9 +73,14 @@ onMounted(load)
       </div>
       <template v-else>
         <p v-if="log?.text" class="meta">
-          日志文件共 {{ formatBytes(log.bytes) }}，{{ log.truncated ? '内容超出上限，仅显示末尾一段' : '已显示全部内容' }}。
+          <span>
+            日志文件共 {{ formatBytes(log.bytes) }} / {{ lines.length }} 行，{{ log.truncated ? '内容超出上限，仅显示末尾一段' : '已显示全部内容' }}<template v-if="hiddenCount">；为避免一次铺进上千行拖慢界面，此处只渲染末尾 {{ PREVIEW_LINES }} 行</template>。
+          </span>
+          <button v-if="hiddenCount" type="button" class="ghost" @click="expanded = true">
+            显示全部 {{ lines.length }} 行
+          </button>
         </p>
-        <pre v-if="log?.text" class="log">{{ log.text }}</pre>
+        <pre v-if="log?.text" class="log">{{ shownText }}</pre>
         <p v-else-if="log" class="notice">
           日志为空：核心尚未写入任何内容（日志文件由核心启动时创建）。
         </p>
@@ -76,7 +94,16 @@ onMounted(load)
 <style scoped>
 header { display: flex; justify-content: space-between; gap: var(--sp-3); align-items: center; }
 .subtitle { margin: 0; color: var(--muted-strong); font-size: var(--fs-sm); }
-.meta { margin: 0; font-size: var(--fs-xs); color: var(--muted-strong); }
+.meta {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-xs);
+  color: var(--muted-strong);
+}
+.meta > span { min-width: 0; flex: 1; }
+.meta .ghost { flex-shrink: 0; font-size: var(--fs-xs); padding: 3px 8px; }
 .log {
   margin: 0;
   padding: var(--sp-3);
@@ -88,7 +115,9 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
   line-height: var(--lh-base);
   color: var(--text);
   white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  /* `anywhere` 会参与最小内容尺寸（min-content）计算，在可能上千行的文本块上是一条明显更贵的
+     路径；`break-word` 只在实际换行时才生效——两者在定宽容器里的观感一致，这里取后者。 */
+  overflow-wrap: break-word;
   tab-size: 2;
   user-select: text;
 }

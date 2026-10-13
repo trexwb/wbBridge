@@ -12,6 +12,7 @@
     "test:prefs": "node --test src/core/prefs.test.js",
     "test:ops": "node --test src/core/ops.test.js",
     "test:ai": "node --test src/core/ai.test.js",
+    "test:chat": "node --test src/core/chatSession.test.js",
     "test:manifest": "node --test scripts/gen-latest-json.test.mjs",
     "test:updater-key": "node --test scripts/with-updater-key.test.mjs",
     "rust:check": "cargo check --manifest-path src-tauri/core/Cargo.toml",

@@ -90,7 +90,7 @@ curl -H "Authorization: Bearer $(cat "$HOME/Library/Application Support/Buddy Br
 - Windows ARM64 与 Linux 包由 CI 构建，尚未实机验证。
 - 仅 PAC / SOCKS 代理暂不支持。
 - 面板以只读展示为主：运行日志、用量与额度、插件集成、关于与更新四个视图自身不写文件、不访问 OpenCode。**联网入口只有两处**：自动更新与 AI 助手的对话请求，两者的请求都由 **Rust 侧**（Tauri updater 插件 / 壳的 `ai_chat` 命令）发起，不经面板 `fetch`，因此 CSP 的 `default-src 'self'` 不需要放宽。
-- 浅色主题下仍有 3 处次要文字（副标题、页脚说明、耗时行）沿用 `--muted`，对比度低于 WCAG AA 的 4.5:1。
+- 浅色主题的小字号次要文字（副标题、页脚说明、耗时行）已统一为 `--muted-strong`（实测 5.36–5.87:1，达 WCAG AA）。仅指标条里的「0」（22/24px + `font-weight: 600`）沿用 `--muted` 做降权，实测 3.73:1：按 WCAG AA **大字**门槛（≥18.66px 且 bold，3:1）合规，正文一律不使用它。
 - 「检查 → 下载 → 安装 → 重启生效」的自动更新完整链路尚未端到端走过；该链路对 v1.0.1 及更早版本不生效（那一版没接更新器，需手动下载一次安装包）。
 - `cargo fmt --check` 未作为门禁，代码风格以 clippy 0 warning 为准。
 
