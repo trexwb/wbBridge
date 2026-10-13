@@ -27,14 +27,15 @@ let lastState = {}
 const pendingOps = []
 let flushScheduled = false
 
-const scheduleFlush = typeof window.requestAnimationFrame === 'function'
-  ? window.requestAnimationFrame.bind(window)
-  : (cb) => setTimeout(cb, 16)
-
 // rAF 在窗口不可见时会被暂停（本项在 WKWebView 里的真实停摆行为**未实测**）。
 // 因此替换型 op 入队前先清空队列：它的 payload 整体替换状态，前面排队的 op 的产出必然被丢弃，
 // 清空与逐条折叠严格等价，却让队列长度天然封顶（否则最小化期间每 ~0.5s 堆两个持有整份
 // payload 的闭包，恢复显示时一帧内全部折叠）。
+// typeof 只保护基引用：node 单测环境没有 window，`typeof window.x` 仍会抛，必须分开判。
+const scheduleFlush = typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function'
+  ? window.requestAnimationFrame.bind(window)
+  : (cb) => setTimeout(cb, 16)
+
 function enqueue(op, replaces = false) {
   if (replaces) pendingOps.length = 0
   pendingOps.push(op)
@@ -155,7 +156,8 @@ export async function readLog() {
 }
 
 // 用系统浏览器打开外部链接（申请 Key 的官方页）。WebView 里 target=_blank 默认点不开，
-// 必须经壳的 open_external 命令转发（壳侧有 https + 字符白名单校验）。只收 URL、不做任何 IO。
+// 必须经壳的 open_external 命令转发（壳侧有 https + 字符白名单 + 精确主机名名单 EXTERNAL_HOSTS
+// 三重校验，名单外的域名一律拒绝）。只收 URL、不做任何 IO。
 export async function openExternal(url) {
   ensureBridge()
   try {
@@ -163,6 +165,92 @@ export async function openExternal(url) {
     return { ok: true, result: {} }
   } catch (error) {
     return { ok: false, error: String(error) }
+  }
+}
+
+// ── AI 助手：流式对话经壳命令转发 ───────────────────────────────────
+// 面板 CSP 是 default-src 'self'（connect-src 只放行 ipc:），前端 fetch 外部 AI 端点会被
+// 直接拦掉；因此一律走壳的 ai_chat 命令（壳侧 ureq 发请求、按行解析 SSE，增量经
+// ai-chunk / ai-done / ai-error / ai-aborted 四个事件推回来）。apiKey 只随请求参数进入
+// 壳进程内存：不落盘、不进 prefs、不进日志，刷新或重启后需重新输入。
+// 四个事件都带 chatId，按它过滤，避免多个请求（或上一轮迟到的事件）互相串台。
+
+let aiSeq = 0
+let activeChatId = null
+
+function aiEvents(listen, chatId, handlers) {
+  return Promise.all(
+    Object.entries(handlers).map(([event, handler]) =>
+      listen(event, payload => {
+        if (payload?.chatId !== chatId) return
+        handler(payload)
+      }),
+    ),
+  )
+}
+
+// 发起一轮流式对话。request：{ baseUrl, apiKey, model, messages, selfHosted?, tools?, toolChoice? }。
+//   • selfHosted=true：大脑就是本壳正在运行的核心（127.0.0.1:<port>/v1），端点与 Bearer 令牌
+//     都由壳自己解析——面板既拿不到也不需要 api-key，此时 baseUrl / apiKey 被壳忽略；
+//   • tools 非空时才随请求声明（壳侧 build_ai_body 同样只在非空时带上，免得老端点报错）。
+// onDelta(text) 收增量；返回值：
+//   { ok: true, content, toolCalls, finishReason }  正常结束（toolCalls 可能为空数组）
+//   { ok: false, aborted: true, content }           用户点了「停止」
+//   { ok: false, error, partial }                   请求失败（partial 是已生成部分）
+export async function aiChat(request, onDelta) {
+  ensureBridge()
+  const chatId = `ai-${++aiSeq}-${Date.now().toString(36)}`
+  activeChatId = chatId
+  const tools = Array.isArray(request.tools) && request.tools.length ? request.tools : null
+  const payload = {
+    chatId,
+    baseUrl: String(request.baseUrl ?? ''),
+    apiKey: String(request.apiKey ?? ''),
+    selfHosted: request.selfHosted === true,
+    model: String(request.model ?? ''),
+    messages: Array.isArray(request.messages) ? request.messages : [],
+    ...(tools ? { tools, toolChoice: request.toolChoice ?? 'auto' } : {}),
+  }
+  activeChatId = chatId
+  let settle
+  const done = new Promise((resolve, reject) => { settle = { resolve, reject } })
+  const unsubs = await aiEvents(listen, chatId, {
+    'ai-chunk': payload => onDelta && onDelta(String(payload.text ?? '')),
+    'ai-done': payload =>
+      settle.resolve({
+        ok: true,
+        content: String(payload.content ?? ''),
+        toolCalls: Array.isArray(payload.toolCalls) ? payload.toolCalls : [],
+        finishReason: String(payload.finishReason ?? ''),
+      }),
+    'ai-error': payload =>
+      settle.resolve({ ok: false, error: String(payload.error ?? '请求失败'), partial: String(payload.partial ?? '') }),
+    'ai-aborted': payload =>
+      settle.resolve({ ok: false, aborted: true, content: String(payload.partial ?? '') }),
+  })
+  try {
+    // 壳侧命令签名是 `ai_chat(app, payload: Value)`，Tauri 按**参数名**从入参对象取值，
+    // 所以整份请求必须挂在 `payload` 键下；平铺传（invoke('ai_chat', {...})）会让
+    // 壳报「missing required key payload」，命令在起线程之前就失败。
+    await invoke('ai_chat', { payload })
+    return await done
+  } catch (error) {
+    return { ok: false, error: String(error) }
+  } finally {
+    unsubs.forEach(off => off && off())
+    if (activeChatId === chatId) activeChatId = null
+  }
+}
+
+// 停止当前这轮对话（幂等）：壳只置取消标志，断连由流式线程完成，
+// 前端随即收到 ai-aborted，不必再等 HTTP 层关闭。
+export async function aiAbort() {
+  ensureBridge()
+  if (!activeChatId) return
+  try {
+    await invoke('ai_abort', { chatId: activeChatId })
+  } catch {
+    // 取消失败（壳重启一类的极端情况）不抛：发送按钮的恢复由 ai-aborted 或 ai-error 兜底。
   }
 }
 

@@ -273,6 +273,77 @@ fn subprocess_environment_only_passes_the_allow_list() {
 }
 
 #[test]
+fn injected_provider_key_only_reaches_the_config_content_channel() {
+    // 红线 7 的唯一允许位（2026-10-09 多平台接入）：用户自持的平台 Key 从 `providers.json`
+    // 到子进程只有 `OPENCODE_CONFIG_CONTENT` 这一条通道。这里跑**真实生产者 → 真实消费者**
+    // （providers::set_key → runtime::providers_section_for → isolated_environment），
+    // 任何其它环境变量名或值里出现这段 Key，都等于把凭据摊进子进程可见面 / 可能的回显日志。
+    const SECRET: &str = "sk-redline-provider-secret";
+    let dir = std::env::temp_dir().join(format!(
+        "wbbridge-redline-key-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("临时数据目录");
+    let data_dir = dir.to_string_lossy().to_string();
+
+    providers::set_key(&data_dir, "zhipuai", SECRET).expect("写入平台 Key");
+    let (section, configured) = runtime::providers_section_for(&data_dir);
+    assert_eq!(
+        configured,
+        vec!["zhipuai".to_string()],
+        "发现闸门的输入只能是平台 id，不含 Key"
+    );
+
+    let mut host = HashMap::new();
+    host.insert("PATH".to_string(), "/usr/bin".to_string());
+    host.insert("ZHIPUAI_API_KEY".to_string(), SECRET.to_string());
+    let env = runtime::isolated_environment(
+        "/tmp/wbbridge-red-line",
+        &HashMap::new(),
+        "generated-password",
+        &host,
+        section,
+    );
+
+    let content = env
+        .get("OPENCODE_CONFIG_CONTENT")
+        .expect("注入通道必须存在，否则平台永不生效");
+    assert!(
+        content.contains(SECRET),
+        "声明段必须真的带上 Key（否则热生效无从谈起）"
+    );
+    let config: Value = serde_json::from_str(content).expect("配置内容必须是合法 JSON");
+    assert_eq!(
+        config["permission"]["*"],
+        json!("ask"),
+        "注入 provider 段不得改动权限表"
+    );
+    assert_eq!(config["autoupdate"], json!(false), "autoupdate 红线不得被改动");
+    assert_eq!(
+        config["provider"]["zhipuai"]["options"]["apiKey"],
+        json!(SECRET),
+        "Key 必须挂在注册表平台的 options 下"
+    );
+
+    let mut leaked: Vec<&str> = Vec::new();
+    for (name, value) in &env {
+        if name != "OPENCODE_CONFIG_CONTENT" && value.contains(SECRET) {
+            leaked.push(name);
+        }
+    }
+    assert!(leaked.is_empty(), "平台 Key 泄漏进子进程变量 {leaked:?}");
+    assert!(
+        !env.contains_key("ZHIPUAI_API_KEY"),
+        "宿主同名凭据变量不得被透传（ENV_ALLOW 白名单之外一律拒绝）"
+    );
+
+    // 断言中途 panic 会跳过这一步，但入口处的 remove_dir_all 会在下一次运行回收，
+    // 目录里只有本用例自己写入的合成 Key，不含任何真实凭据。
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn version_probe_child_environment_only_passes_the_allow_list() {
     // `--version` 探测跑的是「尚未取得信任的外部二进制」（托管下载的运行时、本机各处候选）。
     // 这一类一次性 spawn 曾走过 `env: None` 分支，等于把宿主的 provider Key 整体交给它。

@@ -31,6 +31,7 @@ const ICONS = {
   providers: 'M12 3.6l7.2 4.2v8.4L12 20.4l-7.2-4.2V7.8Z M12 12.2l7-4.1M12 12.2v8M12 12.2L5 8.1',
   logs: 'M5 6.5h14M5 12h14M5 17.5h8',
   usage: 'M12 4a8 8 0 1 0 8 8h-8V4Z',
+  assistant: 'M4.5 5.5h15a1.5 1.5 0 0 1 1.5 1.5v7a1.5 1.5 0 0 1-1.5 1.5H10l-4.5 3.5V15.5H4.5A1.5 1.5 0 0 1 3 14V7a1.5 1.5 0 0 1 1.5-1.5Z',
   workbuddy: 'M8 8.5h10.5l-3-3M16 15.5H5.5l3 3',
   about: 'M12 4a8 8 0 1 0 0 16 8 8 0 0 0 0-16ZM12 11.2v5M12 8.2v.4',
   proxy: 'M12 4.5v7M7.6 6.8a7 7 0 1 0 8.8 0',
@@ -58,7 +59,10 @@ const groups = [
   },
   {
     title: '其他',
-    items: [{ id: 'about', icon: 'about', label: '关于与更新' }],
+    items: [
+      { id: 'assistant', icon: 'assistant', label: 'AI 助手' },
+      { id: 'about', icon: 'about', label: '关于与更新' },
+    ],
   },
 ]
 </script>
