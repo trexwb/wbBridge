@@ -4966,7 +4966,7 @@ dependencies = [
 
 [[package]]
 name = "wbbridge"
-version = "1.4.1"
+version = "1.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4983,7 +4983,7 @@ dependencies = [
 
 [[package]]
 name = "wbbridge-core"
-version = "1.4.1"
+version = "1.2.0"
 dependencies = [
  "axum",
  "base64 0.22.1",

@@ -1,6 +1,6 @@
 # WB Bridge
 
-基于 Tauri 2 的跨平台托盘应用，通过隔离的 OpenCode 运行时为 [WorkBuddy](https://www.workbuddy.cn) 提供免费模型（CodeBuddy 同样支持）。当前版本 **1.4.1**。
+基于 Tauri 2 的跨平台托盘应用，通过隔离的 OpenCode 运行时为 [WorkBuddy](https://www.workbuddy.cn) 提供免费模型（CodeBuddy 同样支持）。当前版本 **1.2.0**。
 
 ## 简介
 

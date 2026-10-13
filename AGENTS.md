@@ -367,8 +367,9 @@ start_backend
 - **面板偏好只走 `src/core/prefs.js`**：视图不得直接碰 `localStorage`。新增一项偏好 = 在 `SANITIZERS` 里加一个键 + 加一个**只做字段投影**的 `sanitize*` 函数 + 补对应单测；**严禁**把 `api-key`、`OPENCODE_SERVER_PASSWORD`、WorkBuddy models 文件路径、完整 `status.json`、完整配置对象放进 `localStorage`（白名单是唯一的守卫点，值投影负责丢弃调用方多塞的字段）。存储不可用（WebView 禁用、配额满、抛错）时一律**静默回落默认值**，不得抛到界面。**当前范围**：持久化「当前视图」「启动后自动检查更新」开关（+ 上次成功检查时间戳，12 小时节流）与 **AI 助手的非凭据配置**（`ai` = `brain`/`baseUrl`/`model`/`selfModel`/`tools`；助手端点的 API Key **没有白名单键**，结构上落不进 `localStorage`，只存在于 `AssistantView` 的会话内存）。
 - **交互反馈分层**：等待用 `spinner` / `.skeleton` / `.busy-bar`，结果用 `FeedbackBar`（pending / error / success 三态；pending 态**不给关闭按钮**，防误判操作已结束）。**进度只许来自壳推送的真实数据**：`probe` 可显示「已完成/总数」（由 `probe.pending` 队列长度与当前模型数推算，只反映当帧快照，缺任一项即不显示），其余动作前端拿不到真实进度，一律只给文字、**不写数字**。
 - **操作守卫（实现唯一在 `src/core/ops.js`）**：每一个触发后台动作的入口都必须让用户知道「点了之后发生了什么」——① **成功反馈**：refresh / restart / system-proxy / probe / import 成功后由 `App.vue::run()` 统一落成功文案（文案唯一来源 `ops.js::successMessage`），5 秒（`FEEDBACK_VISIBLE_MS`）自动消隐，失败文案不消隐；② **在飞互斥（防抖）**：同一动作在飞时重复触发拒绝并提示（`rejectionOf`），文案逐字稳定使连点不闪烁反馈条；只有渲染层 `disabled` 的入口（打开申请页、刷新日志/状态）必须另加同步在飞标记，双击在重渲染前会穿透模板 disabled；③ **完成冷却（节流）**：终态动作（`COOLDOWN_ACTIONS` = refresh / restart / system-proxy / import）成功后 5 秒（`ACTION_COOLDOWN_MS`）内重复触发拒绝并提示「刚完成」，失败不进冷却；④ 受控开关（侧栏系统代理）被拒绝时必须回弹 DOM 视觉状态，不得停留在假位置。改动守卫判定或文案必须同步 `ops.test.js`。
-- **图标一律内联 SVG**（`stroke="currentColor"`）：禁止字符符号（▦▤◔⇄ⓘ 之类随系统字体变化、基线不齐、无法统一线宽），也禁止外部图标资源或图标字体（CSP `default-src 'self'`）。
-- **样式硬约束**：颜色 / 时长 / 阴影一律取 `src/styles/variables.css` 的 token（交互层含 `--dur-*`、`--ease-*`、`--focus-ring`、`--on-primary`、`--shadow-s/m`、`--nav-hover-bg` / `--nav-active-bg` / `--nav-active-ring`），组件内不得写死数值；`prefers-reduced-motion` 下位移与淡入必须取消，但 `spinner` / `.skeleton` / `.busy-bar` 的循环**必须保留**（否则「正在加载」失去唯一载体）；所有可点元素必须有 hover、`focus-visible` 焦点环与 `disabled` 态。
+- **图标一律内联 SVG**（`stroke="currentColor"`）：禁止字符符号（▦▤◔⇄ⓘ 之类随系统字体变化、基线不齐、无法统一线宽），也禁止外部图标资源或图标字体（CSP `default-src 'self'`）；**每个 `<svg>` 都必须有显式宽高**（由宿主类的 `> svg` 规则给，或自带属性）——HTML 里不带宽高的 inline SVG 默认按 300×150 渲染，会把整行布局顶坏，而这种破损在 `vite build` 与 eslint 上都不留痕迹。
+- **样式硬约束**：颜色 / 时长 / 阴影一律取 `src/styles/variables.css` 的 token（交互层含 `--dur-*`、`--ease-*`、`--focus-ring`、`--on-primary`、`--shadow-s/m`、`--nav-hover-bg` / `--nav-active-bg` / `--nav-active-ring`；语义色含 **`--danger` / `--danger-bg`——那是「高危写入」专用，与普通「写入」用的 `--orange` 必须分属两个色相，同系看着分不出等级），组件内不得写死数值；**小字号说明文字一律取 `--muted-strong`**（`--muted` 只可用于 ≥3:1 的非文本用途，实测 12–13px 正文用它只有 3.66–4.01:1，不达标）；`prefers-reduced-motion` 下位移与淡入必须取消，但 `spinner` / `.skeleton` / `.busy-bar` 的循环**必须保留**（否则「正在加载」失去唯一载体）；所有可点元素必须有 hover、`focus-visible` 焦点环与 `disabled` 态。
+- **弹窗与助手的三条界面不变量**（`src/views/AssistantView.vue`，改这里不得回退）：① 设置与提案确认两个弹窗都要有 **Tab 焦点陷阱**（首尾环回，可聚焦集合用 `getClientRects().length > 0` 过滤——弹窗整块在 `position: fixed` 遮罩里，`offsetParent` 在这条链上各引擎取值不一致）+ 关闭后**焦点归还**给打开它的控件（程序化打开没有触发元素，回落输入框）；`role="dialog"` 必须挂 `aria-labelledby` 指向 `<h3>`；`Esc` 收口顺序固定为「先关提案确认（等同全部取消），再关设置」。② **失败原因不得拼进气泡正文**——正文会被 `apiHistory()` 回灌给下一轮，模型会把「⚠ 请求失败」当成自己说过的话复读或道歉；失败/停止各占独立元素与 `role="alert"` / `role="status"`。③ 粘底滚动只在用户本来贴底时跟随，**上翻时必须给出「回到最新」入口**，且该入口放在滚动容器**之外**的视图流内（纵向 flex 滚动容器里的 sticky 表现不可靠）。
 
 #### 布局与窗口
 
@@ -476,9 +477,9 @@ start_backend
 
 | 项 | 值 | 来源 |
 |---|---|---|
-| 版本单一来源 | **1.4.1** | 根 `package.json` 的 `version` |
-| 壳工程同步落点 | **1.4.1** | `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `[package] version` |
-| 核心 crate 版本 | **1.4.1** | `src-tauri/core/Cargo.toml`（`wbbridge-core --version` 输出；随产品版本同步，`version:set`/`version:check` 均覆盖） |
+| 版本单一来源 | **1.2.0** | 根 `package.json` 的 `version` |
+| 壳工程同步落点 | **1.2.0** | `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `[package] version` |
+| 核心 crate 版本 | **1.2.0** | `src-tauri/core/Cargo.toml`（`wbbridge-core --version` 输出；随产品版本同步，`version:set`/`version:check` 均覆盖） |
 
 > `status.json` 内写入的 `version` 是历史沿革值 `0.2.0`，**不属版本落点**，不得在无用户指令的情况下静默改动（见「关键常量」）。
 
@@ -494,7 +495,7 @@ start_backend
   3. 纯文案、注释、日志措辞、去抖等不引入新逻辑分支的打磨——同上；
   4. 移植/迁移过程中的等价实现（行为未变即版本未变），除非用户对该次改动明确指示递增。
 - 用户要求"回退到 X.Y.Z"时，所有落点必须一致改写为用户指定值，本回合内不得再以"我刚改了代码所以 +1"为由推进。
-- `1.2.x~1.3.x` **从未构建、从未打标签，不得再占用**。
+- **`1.2.x ~ 1.3.x` 段位：2026-10-13 由维护者本人改判，此前的「作废、不得再占用」不再适用**。改判依据是可核对的事实：该段位从未构建、从未打标签（`git tag` 最高只到 `v1.1.15`，`v1.2.0` 不存在），所以把基准版本取到 **1.2.0** 不与任何已发布产物或已推送标签冲突。版本号从此按上面的强制递增规则在 1.2.x 起继续推进；曾写到的 `1.4.x` / `1.5.x` 属同一批从未构建、从未打标签的值，随本次改判一并弃用，**不得**再回到那两个段位。
 
 ## 变更与交付约定（面向 Agent）
 

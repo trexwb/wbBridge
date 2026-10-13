@@ -48,7 +48,7 @@ const QUICK_PROMPTS = [
 ]
 
 // ── 会话状态（全部只在内存） ────────────────────────────────────────
-const messages = ref([]) // { id, role, content, pending, failed, trimmed, tools: [] }
+const messages = ref([]) // { id, role, content, pending, failed, error, partial, stopped, trimmed, tools: [] }
 const draft = ref('')
 const chatting = ref(false)
 const config = reactive({ ...currentConfig(), apiKey: '' })
@@ -61,7 +61,16 @@ let noticeTimer = null
 const chatBox = ref(null) // 对话区容器：滚动到底要用它，而不是 document.querySelector
 const composer = ref(null) // 输入框：自动增高 + 发送后重新聚焦
 const settingsPanel = ref(null)
+const settingsErrorBox = ref(null)
 const confirmPanel = ref(null)
+// Key 明文的临时显示（与「平台」视图的眼睛按钮同一套交互），每次打开设置都回到隐藏态。
+const revealKey = ref(false)
+// 弹窗关闭后焦点要回到打开它的控件：否则键盘用户按完 Tab 就从页面开头重新找位置。
+// 程序化打开（校验失败自动弹设置）没有触发元素，回落输入框。
+let settingsTrigger = null
+// 用户往上翻看历史时不再强行拽回底部，但必须给一条明确的路回到底部（见 .assistant-jump）。
+const atBottom = ref(true)
+const pendingBelow = ref(false)
 // 最近一轮的入参，供失败后的「重试」原样重发（不重新读输入框，避免用户已改过文案）。
 let lastTurn = null
 
@@ -125,17 +134,29 @@ const toolsEnabled = computed(() => config.tools !== false && !selfChatOnly.valu
 
 // 粘底滚动：只有用户本来就贴在底部时才跟着新内容走。
 // 助手在读日志 / 逐模型列表时一次推很长一段，无条件滚到底会把用户往上翻的位置强行拽走，
-// 而「悄悄不滚」比「强行滚动」更符合预期。
-const stickToBottom = ref(true)
-
+// 而「悄悄不滚」比「强行滚动」更符合预期——但「悄悄不滚」必须补一个回去的入口，
+// 否则用户不知道回复已经结束了（见模板里的 .assistant-jump）。
 function onChatScroll() {
   const box = chatBox.value
   if (!box) return
-  stickToBottom.value = box.scrollHeight - box.scrollTop - box.clientHeight < 48
+  atBottom.value = box.scrollHeight - box.scrollTop - box.clientHeight < 48
+  if (atBottom.value) pendingBelow.value = false
 }
 
 function scrollBottom() {
-  if (!stickToBottom.value) return
+  if (!atBottom.value) {
+    pendingBelow.value = true
+    return
+  }
+  nextTick(() => {
+    const box = chatBox.value
+    if (box) box.scrollTop = box.scrollHeight
+  })
+}
+
+function jumpToBottom() {
+  atBottom.value = true
+  pendingBelow.value = false
   nextTick(() => {
     const box = chatBox.value
     if (box) box.scrollTop = box.scrollHeight
@@ -171,7 +192,9 @@ function dismissNotice() {
 }
 
 // ── 设置弹窗 ────────────────────────────────────────────────────────
-function openSettings() {
+function openSettings(event) {
+  // 记住触发元素（程序化调用没有事件：校验失败自动弹设置时回落到输入框）。
+  settingsTrigger = event && event.currentTarget ? event.currentTarget : null
   settingsForm.brain = config.brain
   settingsForm.baseUrl = config.baseUrl
   settingsForm.model = config.model
@@ -179,11 +202,38 @@ function openSettings() {
   settingsForm.apiKey = config.apiKey
   settingsForm.tools = config.tools !== false
   settingsError.value = ''
+  revealKey.value = false
   showSettings.value = true
   // 弹窗是可聚焦容器（tabindex=-1）：打开即取焦点，Tab 才从内容开始走，
   // Esc 也才有明确的收起目标（这里的 Esc 仍由 window 级监听兜住）。
   nextTick(() => settingsPanel.value && settingsPanel.value.focus())
 }
+
+// 所有关闭路径（保存 / 取消 / ✕ / 点遮罩 / Esc）都走这一处：收起后把焦点还给打开它的控件，
+// 否则键盘用户每关一次弹窗都要从页面开头重新找位置。
+function closeSettings() {
+  showSettings.value = false
+  revealKey.value = false
+  const back = settingsTrigger
+  settingsTrigger = null
+  nextTick(() => {
+    const target = back && back.isConnected ? back : composer.value
+    if (target && !target.disabled) target.focus()
+  })
+}
+
+// 表单与当前生效配置的差异：改动未保存时明确标出来，让「点遮罩 / 按 Esc 就丢弃」这件事看得见。
+// 刻意不弹二次确认——这是几个端点字段，不是不可逆动作，确认框反而更挡路。
+const settingsDirty = computed(() => {
+  const same =
+    settingsForm.brain === config.brain &&
+    settingsForm.baseUrl.trim().replace(/\/+$/, '') === config.baseUrl &&
+    settingsForm.model.trim() === config.model &&
+    settingsForm.selfModel.trim() === config.selfModel &&
+    (settingsForm.tools !== false) === (config.tools !== false) &&
+    settingsForm.apiKey === config.apiKey
+  return !same
+})
 
 function applyPreset(preset) {
   settingsForm.brain = 'external'
@@ -191,17 +241,25 @@ function applyPreset(preset) {
   settingsForm.model = preset.model
 }
 
+// 报错落到弹窗正文末尾，而正文是可滚动的：用户在顶部点「保存」时，
+// 地址栏那一类的错误会出现在看不见的地方（role="alert" 会念给读屏，但眼睛找不到）。
+// 所以每次落错误都把它滚进视野。
+function showSettingsError(message) {
+  settingsError.value = message
+  nextTick(() => settingsErrorBox.value && settingsErrorBox.value.scrollIntoView({ block: 'nearest' }))
+}
+
 function saveSettings() {
   if (settingsForm.brain === 'external') {
     const error = validateConfig({ baseUrl: settingsForm.baseUrl, model: settingsForm.model })
     if (error) {
-      settingsError.value = error
+      showSettingsError(error)
       return
     }
   } else {
     const error = validateSelfConfig({ selfModel: settingsForm.selfModel, modelIds: modelIds.value })
     if (error) {
-      settingsError.value = error
+      showSettingsError(error)
       return
     }
   }
@@ -219,7 +277,7 @@ function saveSettings() {
     selfModel: config.selfModel,
     tools: config.tools,
   })
-  showSettings.value = false
+  closeSettings()
 }
 
 // ── 工具确认弹窗 ────────────────────────────────────────────────────
@@ -235,10 +293,24 @@ function confirmToolCalls(calls) {
   })
 }
 
-function allChecked() {
-  const list = confirming.value?.calls || []
-  return list.length > 0 && list.every(call => call.checked)
+// 「全选」只统计可执行的条目：参数校验没过的那些本来就是禁用项，
+// 把它们算进分母会让复选框永远勾不上（看起来像坏了）。
+function checkableCalls() {
+  return (confirming.value?.calls || []).filter(call => call.validation.ok)
 }
+
+const allChecked = computed(() => {
+  const list = checkableCalls()
+  return list.length > 0 && list.every(call => call.checked)
+})
+
+const someChecked = computed(() => checkableCalls().some(call => call.checked))
+
+// 勾选里含高危条目时，主按钮转危险色并换文案：一键下去会停服务 / 装版本重启，
+// 按钮不该长得像「确定」。
+const runIsDanger = computed(() =>
+  checkableCalls().some(call => call.checked && call.danger),
+)
 
 function toggleAll(event) {
   const checked = event.target.checked
@@ -294,13 +366,15 @@ async function send() {
       : validateSelfConfig({ selfModel: config.selfModel, modelIds: modelIds.value })
   if (error) {
     openSettings()
-    settingsError.value = error
+    showSettingsError(error)
     return
   }
   // 外部端点缺 Key：请求只会被端点判 401，先把用户带到填写处，别发一条注定失败的请求。
   if (needsKey.value && !config.apiKey) {
     openSettings()
-    settingsError.value = '当前端点需要 API Key：填写后点「保存」（只留在本会话内存，不落盘）。本地 Ollama 一类端点可在「设置」改成本机地址后留空。'
+    showSettingsError(
+      '当前端点需要 API Key：填写后点「保存」（只留在本会话内存，不落盘）。本地 Ollama 一类端点可在「设置」改成本机地址后留空。',
+    )
     return
   }
   // 本机大脑依赖正在运行的核心（端点与令牌由壳解析），未就绪时请求只会变成「连不上回环地址」。
@@ -313,7 +387,8 @@ async function send() {
   const history = apiHistory()
   messages.value.push({ id: `m${Date.now()}`, role: 'user', content: text })
   draft.value = ''
-  stickToBottom.value = true
+  atBottom.value = true
+  pendingBelow.value = false
   scrollBottom()
   await runTurn(text, history)
 }
@@ -330,7 +405,19 @@ async function runTurn(userText, history) {
   chatting.value = true
   notice.value = ''
   lastTurn = { text: userText, history }
-  messages.value.push({ id: `m${Date.now()}a`, role: 'assistant', content: '', pending: true, tools: [] })
+  // error / stopped 独立于 content：失败原因不能拼进气泡正文，否则 apiHistory 会把
+  // 「⚠ 连接失败」当成模型自己说过的话回灌给下一轮，模型会照着道歉或复读这句错误。
+  messages.value.push({
+    id: `m${Date.now()}a`,
+    role: 'assistant',
+    content: '',
+    pending: true,
+    tools: [],
+    failed: false,
+    error: '',
+    partial: false,
+    stopped: false,
+  })
   // 取回数组里的响应式代理再持有：直接改原始对象不会触发重渲染，
   // 流式增量会看起来「冻住」，直到别的状态变化才一次性显出来。
   const live = messages.value[messages.value.length - 1]
@@ -371,11 +458,11 @@ async function runTurn(userText, history) {
       flush()
       if (!response.ok) {
         if (response.aborted) {
-          live.content = (live.content ? live.content + '\n\n' : '') + '（已停止生成，以上为已生成部分）'
+          live.stopped = true
         } else {
           live.failed = true
-          live.content = (live.content ? live.content + '\n\n' : '') + `⚠ ${response.error || '请求失败'}`
-          if (response.partial) live.content += '\n（以上为已生成部分）'
+          live.error = String(response.error || '请求失败')
+          live.partial = response.partial === true
         }
         break
       }
@@ -458,12 +545,15 @@ async function runTurn(userText, history) {
     }
   } catch (error) {
     live.failed = true
-    live.content = (live.content ? live.content + '\n\n' : '') + `⚠ ${error?.message || error}`
+    live.error = String(error?.message || error)
   } finally {
     if (flushTimer) clearTimeout(flushTimer)
     live.pending = false
     chatting.value = false
     scrollBottom()
+    // 生成期间 textarea 是禁用态，浏览器会把它从焦点链上摘掉、焦点落到 body：
+    // 不主动还回去，连续对话的人每轮都要重新点一次输入框（Enter 发送也就此失效）。
+    nextTick(() => composer.value && composer.value.focus())
   }
 }
 
@@ -480,14 +570,46 @@ function onComposerKeydown(event) {
   }
 }
 
+// 弹窗内可聚焦元素（原生 details 的 summary 可聚焦；收起时不在 tab 序里的靠可见性过滤掉）
+const FOCUSABLE = 'button, input, select, textarea, summary, [tabindex]:not([tabindex="-1"])'
+
+// 焦点陷阱：弹窗打开时 Tab 不能跑出去。侧栏在本组件之外、不受这里的 aria-hidden 影响，
+// 键盘用户按几下 Tab 就「掉进遮罩后面」——看不见焦点在哪，也关不掉弹窗。
+function trapTab(event, panel) {
+  // 可见性用 getClientRects() 判定：弹窗整块在 position:fixed 的遮罩里，
+  // offsetParent 在这条链上的取值各引擎历史上不一致，拿它当「有没有渲染」会误判。
+  const nodes = [...panel.querySelectorAll(FOCUSABLE)].filter(el => !el.disabled && el.getClientRects().length > 0)
+  if (!nodes.length) return
+  const first = nodes[0]
+  const last = nodes[nodes.length - 1]
+  const active = document.activeElement
+  if (!panel.contains(active)) {
+    event.preventDefault()
+    ;(event.shiftKey ? last : first).focus()
+    return
+  }
+  if (event.shiftKey && active === first) {
+    event.preventDefault()
+    last.focus()
+  } else if (!event.shiftKey && active === last) {
+    event.preventDefault()
+    first.focus()
+  }
+}
+
 // Esc 统一收口：先关提案确认（等同全部取消），再关设置。弹窗内任意焦点都能触发。
 function onWindowKeydown(event) {
+  const panel = confirming.value ? confirmPanel.value : showSettings.value ? settingsPanel.value : null
+  if (event.key === 'Tab' && panel) {
+    trapTab(event, panel)
+    return
+  }
   if (event.key !== 'Escape') return
   if (confirming.value) {
     settleConfirm([])
     return
   }
-  if (showSettings.value) showSettings.value = false
+  if (showSettings.value) closeSettings()
 }
 
 onMounted(() => window.addEventListener('keydown', onWindowKeydown))
@@ -558,16 +680,29 @@ onBeforeUnmount(() => {
         </p>
       </div>
       <div class="actions">
-        <button type="button" @click="openSettings">设置</button>
-        <button type="button" class="ghost" :disabled="chatting" title="清空当前对话（内容本来也不落盘）" @click="clearHistory">清空</button>
+        <button type="button" @click="openSettings($event)">设置</button>
+        <!-- 没有对话时按钮就是不可用态，而不是点下去毫无反应的假入口（禁用的 opacity 已够说明） -->
+        <button
+          type="button"
+          class="ghost"
+          :disabled="chatting || !messages.length"
+          title="清空当前对话（内容本来也不落盘）"
+          @click="clearHistory"
+        >清空</button>
       </div>
     </header>
 
     <p v-if="!coreReady" class="assistant-warn" role="status">
-      核心当前{{ phaseLabel(state.phase) }}{{ state.message ? `（${state.message}）` : '' }}：
-      {{ config.brain === 'self'
-        ? '本机大脑要用正在运行的核心作为模型服务，未就绪时发不出去。可回「模型与服务」启动服务，或在「设置」改用外部端点。'
-        : '外部端点仍可正常问答，但助手代管不了本应用的服务。' }}
+      <svg class="assistant-warn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="8.4" />
+        <path d="M12 7.6v5.6M12 16.4v.4" />
+      </svg>
+      <span>
+        核心当前{{ phaseLabel(state.phase) }}{{ state.message ? `（${state.message}）` : '' }}：
+        {{ config.brain === 'self'
+          ? '本机大脑要用正在运行的核心作为模型服务，未就绪时发不出去。可回「模型与服务」启动服务，或在「设置」改用外部端点。'
+          : '外部端点仍可正常问答，但助手代管不了本应用的服务。' }}
+      </span>
     </p>
 
     <div ref="chatBox" class="assistant-chat" role="log" aria-label="对话记录" @scroll.passive="onChatScroll">
@@ -603,8 +738,18 @@ onBeforeUnmount(() => {
         <div class="assistant-bubble">
           <!-- renderMarkdownLite 先整段转义再解析，原始 HTML 不会成为标签 -->
           <div class="assistant-text" v-html="render(m.content)" />
-          <span v-if="m.pending" class="assistant-cursor">▍</span>
+          <!-- 光标由 CSS 画出：▍ 这类字符的字宽与基线随系统字体变化，也对不齐行尾 -->
+          <span v-if="m.pending" class="assistant-cursor" aria-hidden="true" />
         </div>
+        <!-- 失败原因独立成行：拼进正文会被 apiHistory 当成模型自己说过的话回灌下一轮 -->
+        <p v-if="m.error" class="assistant-msg-error" role="alert">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="8.4" />
+            <path d="M12 7.6v5.6M12 16.4v.4" />
+          </svg>
+          <span>{{ m.error }}{{ m.partial ? '（以上为已生成部分）' : '' }}</span>
+        </p>
+        <p v-else-if="m.stopped" class="assistant-msg-stopped" role="status">已停止生成，以上是已经生成的部分。</p>
         <p v-if="m.trimmed" class="assistant-trimmed">（为控制上下文长度，已丢弃最早的 {{ m.trimmed }} 条消息）</p>
         <ul v-if="m.tools && m.tools.length" class="assistant-tools">
           <li v-for="entry in m.tools" :key="entry.id" class="assistant-tool" :class="[entry.write ? 'write' : 'read', entry.danger ? 'danger' : '', entry.status]">
@@ -629,9 +774,35 @@ onBeforeUnmount(() => {
       </article>
     </div>
 
+    <!-- 用户往上翻时新内容照样到达，只是不再强行滚动：给一条明确的路回到底部，
+         否则「悄悄不滚」会让人误以为助手停住了。
+         放在滚动容器**之外**（视图自身的流内）：sticky 浮条要靠滚动容器的约束矩形生效，
+         而纵向 flex 滚动容器里的 sticky 在各引擎表现不一致，与其赌一个看不出来的差异，
+         不如用一条确定会出现、也确定点得着的横条。 -->
+    <button
+      v-if="pendingBelow"
+      type="button"
+      class="assistant-jump"
+      aria-label="回到对话底部"
+      @click="jumpToBottom"
+    >
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M12 5.5v13M6.5 13.2l5.5 5.3 5.5-5.3" />
+      </svg>
+      回到最新
+    </button>
+
     <p v-if="notice" class="assistant-keyhint assistant-notice" role="status">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="8.4" />
+        <path d="M12 7.6v5.6M12 16.4v.4" />
+      </svg>
       <span>{{ notice }}</span>
-      <button type="button" class="ghost" aria-label="关闭提示" @click="dismissNotice">✕</button>
+      <button type="button" class="assistant-close ghost" aria-label="关闭提示" @click="dismissNotice">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true">
+          <path d="M7 7l10 10M17 7L7 17" />
+        </svg>
+      </button>
     </p>
     <p v-else-if="needsKey && !config.apiKey" class="assistant-keyhint" role="status">
       当前端点需要 API Key：点右上角「设置」填写（仅本会话内存，不落盘；本地 Ollama 一类端点可留空）。
@@ -663,7 +834,13 @@ onBeforeUnmount(() => {
           <em v-if="!toolsEnabled && config.tools !== false">（模型为仅对话）</em>
         </span>
         <button v-if="chatting" type="button" class="ghost" @click="stop">停止</button>
-        <button v-else type="submit" class="primary" :disabled="!draft.trim() || props.busy">
+        <button
+          v-else
+          type="submit"
+          class="primary"
+          :disabled="!draft.trim() || props.busy"
+          :title="props.busy ? '其他操作正在进行中，等它结束后可用' : undefined"
+        >
           <span v-if="props.busy" class="spinner" />发送
         </button>
       </div>
@@ -671,25 +848,36 @@ onBeforeUnmount(() => {
   </section>
 
   <!-- 设置弹窗 -->
-  <div v-if="showSettings" class="assistant-mask" @click.self="showSettings = false">
-    <div ref="settingsPanel" class="assistant-dialog" role="dialog" aria-modal="true" aria-label="AI 设置" tabindex="-1">
+  <div v-if="showSettings" class="assistant-mask" @click.self="closeSettings">
+    <div
+      ref="settingsPanel"
+      class="assistant-dialog"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="aiSettingsTitle"
+      tabindex="-1"
+    >
       <header class="assistant-dialog-head">
-        <strong>AI 设置</strong>
-        <button type="button" class="ghost" aria-label="关闭设置" @click="showSettings = false">✕</button>
+        <h3 id="aiSettingsTitle">AI 设置</h3>
+        <button type="button" class="assistant-close ghost" aria-label="关闭设置" @click="closeSettings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true">
+            <path d="M7 7l10 10M17 7L7 17" />
+          </svg>
+        </button>
       </header>
       <div class="assistant-dialog-body">
         <div class="field">
-          <label class="f">大脑（谁来回答问题）</label>
-          <div class="assistant-brains">
+          <span class="f" id="aiBrainLabel">大脑（谁来回答问题）</span>
+          <div class="assistant-brains" role="radiogroup" aria-labelledby="aiBrainLabel">
             <label class="assistant-brain" :class="{ active: settingsForm.brain === 'self' }">
-              <input v-model="settingsForm.brain" type="radio" value="self">
+              <input v-model="settingsForm.brain" type="radio" value="self" name="aiBrain">
               <span>
                 <strong>本机免费模型</strong>
                 <em>用 WB Bridge 自己的桥接服务（OpenCode 免费模型）。无需任何 Key，端点与令牌由本应用自己持有；会消耗少量免费额度。</em>
               </span>
             </label>
             <label class="assistant-brain" :class="{ active: settingsForm.brain === 'external' }">
-              <input v-model="settingsForm.brain" type="radio" value="external">
+              <input v-model="settingsForm.brain" type="radio" value="external" name="aiBrain">
               <span>
                 <strong>外部端点</strong>
                 <em>任意 OpenAI 兼容服务（DeepSeek / 智谱 / 通义千问 / 本地 Ollama…）。需要该服务的 API Key（仅本会话内存）。</em>
@@ -710,9 +898,16 @@ onBeforeUnmount(() => {
 
         <template v-else>
           <div class="field">
-            <label class="f">快捷预设</label>
-            <div class="assistant-presets">
-              <button v-for="preset in AI_PRESETS" :key="preset.baseUrl" type="button" class="assistant-chip" @click="applyPreset(preset)">{{ preset.label }}</button>
+            <span class="f" id="aiPresetLabel">快捷预设</span>
+            <div class="assistant-presets" role="group" aria-labelledby="aiPresetLabel">
+              <button
+                v-for="preset in AI_PRESETS"
+                :key="preset.baseUrl"
+                type="button"
+                class="assistant-chip"
+                :aria-pressed="settingsForm.baseUrl === preset.baseUrl && settingsForm.model === preset.model"
+                @click="applyPreset(preset)"
+              >{{ preset.label }}</button>
             </div>
             <p class="note">点击自动填入地址与模型名，也可手填任意 OpenAI 兼容端点。</p>
           </div>
@@ -726,7 +921,36 @@ onBeforeUnmount(() => {
           </div>
           <div class="field">
             <label class="f" for="aiApiKey">API Key</label>
-            <input id="aiApiKey" v-model="settingsForm.apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="仅本会话内存，不落盘；本地端点可留空">
+            <div class="assistant-key-wrap">
+              <input
+                id="aiApiKey"
+                v-model="settingsForm.apiKey"
+                :type="revealKey ? 'text' : 'password'"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="仅本会话内存，不落盘；本地端点可留空"
+              >
+              <!-- 眼睛按钮与「平台」视图同一套交互：粘贴完能立刻核对有没有多带空格 / 少带字符，
+                   比让请求 401 之后再猜原因省一轮。默认隐藏，关弹窗即回到隐藏态。 -->
+              <button
+                type="button"
+                class="reveal-btn"
+                :aria-pressed="revealKey"
+                :aria-label="revealKey ? '隐藏 API Key 明文' : '显示 API Key 明文'"
+                :title="revealKey ? '隐藏明文' : '显示明文'"
+                @click="revealKey = !revealKey"
+              >
+                <svg v-if="!revealKey" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z" />
+                  <circle cx="12" cy="12" r="3.2" />
+                </svg>
+                <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z" />
+                  <circle cx="12" cy="12" r="3.2" />
+                  <path d="M4 4l16 16" />
+                </svg>
+              </button>
+            </div>
           </div>
         </template>
 
@@ -738,11 +962,20 @@ onBeforeUnmount(() => {
           <p class="note">关闭后 AI 只能问答与给建议，不能执行任何操作。写入类工具无论如何都会先弹确认框，勾选后才执行。</p>
         </div>
 
-        <p v-if="settingsError" class="assistant-dialog-error" role="alert">{{ settingsError }}</p>
+        <p v-if="settingsError" ref="settingsErrorBox" class="assistant-dialog-error" role="alert">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="8.4" />
+            <path d="M12 7.6v5.6M12 16.4v.4" />
+          </svg>
+          <span>{{ settingsError }}</span>
+        </p>
         <p class="note">请求由本应用代理发出（壳侧仅允许 https 或本机 http 端点，本机大脑只走回环）；Key 随请求参数进入进程内存，不进日志、不进存储、不出现在任何界面。端点、大脑与模型名会记住，Key 不会。</p>
       </div>
       <footer class="assistant-dialog-foot">
-        <button type="button" class="ghost" @click="showSettings = false">取消</button>
+        <!-- 未保存标记：关掉弹窗表单就回到已生效的值，所以这里必须说清「改了但还没生效」，
+             靠按钮禁用或二次确认都更挡路 -->
+        <p v-if="settingsDirty" class="assistant-unsaved" role="status">有未保存的修改</p>
+        <button type="button" class="ghost" @click="closeSettings">取消</button>
         <button type="button" class="primary" @click="saveSettings">保存</button>
       </footer>
     </div>
@@ -750,10 +983,21 @@ onBeforeUnmount(() => {
 
   <!-- 工具提案确认弹窗 -->
   <div v-if="confirming" class="assistant-mask" @click.self="settleConfirm([])">
-    <div ref="confirmPanel" class="assistant-dialog" role="dialog" aria-modal="true" aria-label="确认 AI 操作提案" tabindex="-1">
+    <div
+      ref="confirmPanel"
+      class="assistant-dialog"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="aiConfirmTitle"
+      tabindex="-1"
+    >
       <header class="assistant-dialog-head">
-        <strong>确认 AI 操作提案</strong>
-        <button type="button" class="ghost" aria-label="取消全部" @click="settleConfirm([])">✕</button>
+        <h3 id="aiConfirmTitle">确认 AI 操作提案</h3>
+        <button type="button" class="assistant-close ghost" aria-label="取消全部" @click="settleConfirm([])">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true">
+            <path d="M7 7l10 10M17 7L7 17" />
+          </svg>
+        </button>
       </header>
       <div class="assistant-dialog-body">
         <p class="note">以下是 AI 起草的操作。勾选后点「执行选中操作」；取消则一条都不执行（AI 会收到「用户未批准」的反馈）。</p>
@@ -761,29 +1005,43 @@ onBeforeUnmount(() => {
           标了「高危写入」的条目会停止服务或装新版本并重启应用，执行后本窗口可能随之关闭；不勾选即可安全跳过。
         </p>
         <ul class="assistant-ops">
-          <li v-for="call in confirming.calls" :key="call.id" class="assistant-op" :class="{ invalid: !call.validation.ok }">
-            <label class="assistant-op-check">
-              <input v-model="call.checked" type="checkbox" :disabled="!call.validation.ok">
+          <li v-for="call in confirming.calls" :key="call.id" :class="{ invalid: !call.validation.ok }">
+            <!-- 整行都是 label：命中区从 16px 的方框变成整条提案，
+                 勾选这一列本来就是一整列一列对着点的动作 -->
+            <label class="assistant-op">
+              <span class="assistant-op-check">
+                <input v-model="call.checked" type="checkbox" :disabled="!call.validation.ok">
+              </span>
+              <span class="assistant-op-main">
+                <span class="assistant-op-title">
+                  <span class="assistant-tool-tag" :class="call.danger ? 'danger' : 'write'">{{ call.danger ? '高危写入' : '写入' }}</span>
+                  {{ call.summary }}
+                </span>
+                <span v-if="call.validation.ok && Object.keys(call.preview).length" class="assistant-tool-preview">
+                  <span v-for="(value, key) in call.preview" :key="key">{{ key }}：{{ value }}</span>
+                </span>
+                <span v-else-if="!call.validation.ok" class="assistant-tool-error">参数校验未通过：{{ call.validation.error }}</span>
+              </span>
             </label>
-            <div class="assistant-op-main">
-              <div class="assistant-op-title">
-                <span class="assistant-tool-tag" :class="call.danger ? 'danger' : 'write'">{{ call.danger ? '高危写入' : '写入' }}</span>
-                {{ call.summary }}
-              </div>
-              <div v-if="call.validation.ok && Object.keys(call.preview).length" class="assistant-tool-preview">
-                <span v-for="(value, key) in call.preview" :key="key">{{ key }}：{{ value }}</span>
-              </div>
-              <div v-else-if="!call.validation.ok" class="assistant-tool-error">参数校验未通过：{{ call.validation.error }}</div>
-            </div>
           </li>
         </ul>
         <label class="assistant-op-all">
-          <input type="checkbox" :checked="allChecked()" @change="toggleAll"> 全选
+          <!-- 半选态（indeterminate）必须显出来：只勾了一部分时复选框看着像「没全选、点一下补满」，
+               但点它实际是把全部取消，行为与视觉不符。禁用项不计入分母（见 checkableCalls）。 -->
+          <input type="checkbox" :checked="allChecked" :indeterminate="someChecked && !allChecked" @change="toggleAll"> 全选
         </label>
       </div>
       <footer class="assistant-dialog-foot">
         <button type="button" class="ghost" @click="settleConfirm([])">全部取消</button>
-        <button type="button" class="primary" :disabled="!confirming.calls.some(c => c.checked && c.validation.ok)" @click="runApproved">执行选中操作</button>
+        <!-- 勾选里含高危条目时按钮转危险色并改名：这一键下去会停服务 / 装版本重启，
+             不能和「执行选中操作」长得一模一样 -->
+        <button
+          type="button"
+          class="primary"
+          :class="{ danger: runIsDanger }"
+          :disabled="!someChecked"
+          @click="runApproved"
+        >{{ runIsDanger ? '执行选中的高危操作' : '执行选中操作' }}</button>
       </footer>
     </div>
   </div>
@@ -816,11 +1074,12 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
 }
 .assistant-empty strong { font-size: var(--fs-lg); color: var(--text); }
 .assistant-empty p { margin: 0; font-size: var(--fs-sm); line-height: var(--lh-loose); }
-.assistant-empty code { font-family: ui-monospace, monospace; font-size: 11px; background: var(--row); padding: 1px 5px; border-radius: 4px; }
+.assistant-empty code { font-family: ui-monospace, monospace; font-size: var(--fs-xs); background: var(--row); padding: 1px 5px; border-radius: 4px; }
 .assistant-quick { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
 .assistant-chip {
   font-size: var(--fs-xs);
-  padding: 6px 12px;
+  /* 8px 纵向内距：6px 时整颗 chip 只有 ~30px 高，指针在密集横排里容易误点到邻颗 */
+  padding: 8px 12px;
   border-radius: 999px;
   border: 1px solid var(--line);
   background: var(--row);
@@ -828,21 +1087,32 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
   cursor: pointer;
   white-space: normal;
   text-align: left;
+  transition: background var(--dur-1) var(--ease-standard), border-color var(--dur-1) var(--ease-standard), color var(--dur-1) var(--ease-standard);
 }
 .assistant-chip:hover:not(:disabled) { border-color: color-mix(in srgb, var(--green) 40%, var(--line)); background: var(--green-bg); color: var(--text); }
 .assistant-chip:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-offset); }
 .assistant-chip:disabled { opacity: .6; cursor: not-allowed; }
-.assistant-privacy { font-size: 11px; color: var(--muted-strong); }
+/* 预设的「已应用」态：chip 平时是中性底，命中当前端点时要落主色，
+   否则用户看不出点了哪一颗生效（aria-pressed 给读屏，这层给眼睛） */
+.assistant-presets .assistant-chip[aria-pressed="true"] {
+  background: var(--green-bg);
+  border-color: color-mix(in srgb, var(--green) 45%, var(--line));
+  color: var(--text);
+  font-weight: 600;
+}
+.assistant-privacy { font-size: var(--fs-xs); color: var(--muted-strong); }
 
 .assistant-msg { display: flex; flex-direction: column; gap: 4px; max-width: 86%; }
 .assistant-msg.user { align-self: flex-end; align-items: flex-end; }
 .assistant-msg.assistant { align-self: flex-start; }
-.assistant-msg-meta { font-size: 11px; color: var(--muted-strong); display: flex; align-items: center; gap: 8px; }
+.assistant-msg-meta { font-size: var(--fs-xs); color: var(--muted-strong); display: flex; align-items: center; gap: 8px; }
 /* 「正在生成…」与「重试」是元信息行的两种终态：前者只在 pending 时出现，后者只在失败且可重发时出现 */
 .assistant-thinking { color: var(--green); }
 .assistant-retry {
-  font-size: 11px;
-  padding: 0;
+  font-size: var(--fs-xs);
+  /* 负 margin 保住原有视觉位置，只把命中区扩到 26px 高（padding 会撑坏行内对齐，故用这招） */
+  padding: 4px 6px;
+  margin: -4px -6px;
   border: none;
   background: none;
   color: var(--orange);
@@ -850,7 +1120,7 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
   text-underline-offset: 2px;
   cursor: pointer;
 }
-.assistant-retry:hover { color: var(--text); }
+.assistant-retry:hover { color: var(--text); background: var(--row); border-radius: var(--radius-s); }
 .assistant-retry:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-offset); border-radius: var(--radius-s); }
 .assistant-bubble {
   border: 1px solid var(--line);
@@ -863,10 +1133,10 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
 }
 .assistant-msg.user .assistant-bubble { background: var(--green-bg); border-color: color-mix(in srgb, var(--green) 30%, transparent); }
 .assistant-msg.assistant .assistant-bubble { background: var(--surface-raised); }
-.assistant-msg.failed .assistant-bubble { border-color: color-mix(in srgb, var(--badge-unavailable-fg) 45%, var(--line)); }
+.assistant-msg.failed .assistant-bubble { border-color: color-mix(in srgb, var(--danger) 45%, var(--line)); }
 .assistant-text :deep(p) { margin: 0 0 6px; }
 .assistant-text :deep(p:last-child) { margin-bottom: 0; }
-.assistant-text :deep(code) { font-family: ui-monospace, monospace; font-size: 12px; background: var(--panel); padding: 1px 5px; border-radius: 4px; }
+.assistant-text :deep(code) { font-family: ui-monospace, monospace; font-size: var(--fs-xs); background: var(--panel); padding: 1px 5px; border-radius: 4px; }
 .assistant-text :deep(pre.ai-code) {
   margin: 6px 0;
   padding: 8px 10px;
@@ -876,8 +1146,32 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
   overflow-x: auto;
 }
 .assistant-text :deep(pre.ai-code code) { background: none; padding: 0; }
-.assistant-cursor { color: var(--green); animation: assistant-blink 1s steps(2) infinite; }
+/* 生成光标由 CSS 画出（不用 ▍ 字符：字宽与基线随系统字体变化，也贴不齐行尾）。
+   要求减少动态效果时全站循环动画被 base.css 收敛成静态一帧，这里正好留一个常亮光标。 */
+.assistant-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: -0.15em;
+  background: var(--green);
+  animation: assistant-blink 1s steps(2) infinite;
+}
 @keyframes assistant-blink { 50% { opacity: 0; } }
+
+/* 失败 / 停止：正文与原因分行，原因带图标（不只靠红色，红色在色弱下与「写入」难分） */
+.assistant-msg-error,
+.assistant-msg-stopped {
+  margin: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: var(--fs-xs);
+  line-height: var(--lh-loose);
+}
+.assistant-msg-error { color: var(--danger); }
+.assistant-msg-stopped { color: var(--muted-strong); }
+.assistant-msg-error > svg { width: 14px; height: 14px; flex-shrink: 0; margin-top: 2px; }
 
 /* 工具执行卡片 */
 .assistant-tools { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; width: 100%; }
@@ -889,30 +1183,32 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
   padding: 8px 10px;
   font-size: var(--fs-xs);
 }
+/* 三级语义（只读 / 写入 / 高危）各占一个色相：写入用橙、高危用红，
+   两者此前同系（#a4581a 与 #965e23）扫一眼分不出等级，而这一列正是决定要不要放行 */
 .assistant-tool.write { border-left-color: var(--orange); }
-.assistant-tool.danger { border-left-color: var(--badge-unavailable-fg); }
-.assistant-tool-head { display: flex; align-items: center; gap: 8px; }
+.assistant-tool.danger { border-left-color: var(--danger); }
+.assistant-tool-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .assistant-tool-tag {
-  font-size: 10px; font-weight: 600; white-space: nowrap;
+  font-size: var(--fs-xs); font-weight: 600; white-space: nowrap;
   padding: 2px 7px; border-radius: 999px;
   background: var(--row); color: var(--muted-strong);
 }
 .assistant-tool-tag.write { background: var(--orange-bg); color: var(--orange); }
-.assistant-tool-tag.danger { background: color-mix(in srgb, var(--badge-unavailable-fg) 16%, transparent); color: var(--badge-unavailable-fg); }
+.assistant-tool-tag.danger { background: var(--danger-bg); color: var(--danger); }
 .assistant-tool-label { font-weight: 600; color: var(--text); }
-.assistant-tool-status { margin-left: auto; color: var(--muted); }
+.assistant-tool-status { margin-left: auto; color: var(--muted-strong); }
 .assistant-tool-status.done { color: var(--green); }
-.assistant-tool-status.skipped { color: var(--muted); }
+.assistant-tool-status.skipped { color: var(--muted-strong); }
 .assistant-tool-status.running { color: var(--orange); }
 .assistant-tool-summary { margin-top: 4px; color: var(--muted-strong); }
 .assistant-tool-preview { margin-top: 4px; display: flex; flex-wrap: wrap; gap: 10px; color: var(--muted-strong); font-family: ui-monospace, monospace; }
-.assistant-tool-error { margin-top: 4px; color: var(--badge-unavailable-fg); }
+.assistant-tool-error { margin-top: 4px; color: var(--danger); }
 /* 原始返回默认收起：模型已读过并转述过，展开是给人逐条核对用的 */
 .assistant-tool-result { margin-top: 4px; }
 .assistant-tool-result > summary {
   cursor: pointer;
-  color: var(--muted);
-  font-size: 11px;
+  color: var(--muted-strong);
+  font-size: var(--fs-xs);
 }
 .assistant-tool-result > summary:hover { color: var(--text); }
 .assistant-tool-result > summary:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-offset); border-radius: var(--radius-s); }
@@ -925,12 +1221,12 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
   border: 1px solid var(--line);
   border-radius: var(--radius-s);
   font-family: ui-monospace, monospace;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   line-height: var(--lh-loose);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
-.assistant-trimmed { margin: 2px 0 0; font-size: 11px; color: var(--muted-strong); }
+.assistant-trimmed { margin: 2px 0 0; font-size: var(--fs-xs); color: var(--muted-strong); }
 
 /* 设置弹窗：大脑二选一 + 工具开关 */
 .assistant-brains { display: flex; flex-direction: column; gap: 8px; }
@@ -943,15 +1239,17 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
 .assistant-brain input { margin-top: 3px; }
 .assistant-brain span { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .assistant-brain strong { font-size: var(--fs-sm); }
-.assistant-brain em { font-style: normal; font-size: 11px; line-height: var(--lh-loose); color: var(--muted-strong); }
+.assistant-brain em { font-style: normal; font-size: var(--fs-xs); line-height: var(--lh-loose); color: var(--muted-strong); }
 .assistant-opt { display: flex; gap: 8px; align-items: flex-start; font-size: var(--fs-sm); cursor: pointer; }
 .assistant-opt input { margin-top: 3px; }
 
 /* 三条说明横幅共用一套视觉：未就绪（.assistant-warn）、需要 Key / 工具状态（.assistant-keyhint）、
-   这一轮被拦下（.assistant-notice）。差异只由模板上的类组合决定，不再复制一遍样式。 */
+   这一轮被拦下（.assistant-notice）。差异只由模板上的类组合决定，不再复制一遍样式。
+   统一 flex：图标与正文同基线，读起来比「一行纯橙字」更像一条状态说明而非装饰底色。 */
 .assistant-keyhint,
 .assistant-warn {
   margin: 0; flex-shrink: 0;
+  display: flex; align-items: flex-start; gap: 8px;
   font-size: var(--fs-xs); line-height: var(--lh-loose);
   color: var(--orange);
   background: var(--orange-bg);
@@ -959,9 +1257,12 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
   border-radius: var(--radius-s);
   padding: 8px 10px;
 }
+.assistant-keyhint > span,
+.assistant-warn > span { min-width: 0; flex: 1; }
+.assistant-keyhint > svg,
+.assistant-warn > svg { width: 15px; height: 15px; flex-shrink: 0; margin-top: 2px; }
 /* 拦下这次发送的一次性提示：带关闭按钮，8s 后自动消隐 */
-.assistant-notice { display: flex; align-items: flex-start; gap: 8px; }
-.assistant-notice > button { flex-shrink: 0; padding: 0 4px; line-height: 1.4; }
+.assistant-notice > .assistant-close { flex-shrink: 0; }
 
 /* 输入区 */
 .assistant-composer { flex-shrink: 0; display: flex; flex-direction: column; gap: 8px; }
@@ -978,23 +1279,47 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
   min-height: 42px;
   max-height: 180px;
   overflow-y: auto;
+  transition: border-color var(--dur-1) var(--ease-standard);
 }
 .assistant-composer textarea:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-offset); }
 .assistant-composer textarea:disabled { opacity: .6; }
 .assistant-composer-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.assistant-context { font-size: 11px; color: var(--muted-strong); display: flex; align-items: center; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
-.assistant-context em { font-style: normal; color: var(--muted); }
-/* 服务就绪与否用颜色点直接标在输入区上方：助手能不能代管操作，取决于这一个状态 */
-.assistant-dot { flex-shrink: 0; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.assistant-context { font-size: var(--fs-xs); color: var(--muted-strong); display: flex; align-items: center; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
+.assistant-context em { font-style: normal; color: var(--muted-strong); }
+/* 服务就绪与否用颜色点直接标在输入区上方：助手能不能代管操作，取决于这一个状态。
+   旁边始终跟着 brainLabel 文字，点只是加速器，不构成「只靠颜色传达信息」。 */
+.assistant-dot { flex-shrink: 0; width: 8px; height: 8px; border-radius: 50%; background: var(--muted-strong); }
 .assistant-dot.ok { background: var(--green); }
 .assistant-dot.warn { background: var(--orange); }
+
+/* 回到最新：贴在对话区下方的横条（见模板注释，不走 sticky），
+   只在上翻且下面还有新内容时出现 */
+.assistant-jump {
+  align-self: center;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--green) 38%, var(--line));
+  background: var(--surface-raised);
+  color: var(--green);
+  font-size: var(--fs-xs);
+  box-shadow: var(--shadow-s);
+}
+.assistant-jump > svg { width: 14px; height: 14px; }
+.assistant-jump:hover { background: var(--green-bg); }
 
 /* 弹窗（设置 / 提案确认共用） */
 .assistant-mask {
   position: fixed; inset: 0; z-index: 20;
-  background: rgb(0 0 0 / 32%);
+  /* 45% 黑：32% 时面板底色与弹窗内容还在抢视线，弹窗里的密集复选框读不清 */
+  background: rgb(0 0 0 / 45%);
   display: flex; align-items: center; justify-content: center;
   padding: var(--sp-5);
+  animation: assistant-fade var(--dur-2) var(--ease-standard);
 }
 .assistant-dialog {
   width: min(560px, 100%);
@@ -1005,17 +1330,40 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
   border-radius: var(--radius-l);
   box-shadow: var(--shadow-m);
   overflow: hidden;
+  /* 入场只动 transform / opacity：弹窗从触发位置上方 8px 落下来，
+     说明「这块是刚弹出来的」；0ms 直接出现会让人以为是面板自己变了 */
+  animation: assistant-dialog-in var(--dur-3) var(--ease-enter);
+}
+@keyframes assistant-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes assistant-dialog-in {
+  from { opacity: 0; transform: translateY(-8px) scale(.985); }
+  to { opacity: 1; transform: none; }
 }
 .assistant-dialog-head {
   display: flex; align-items: center; justify-content: space-between;
+  gap: var(--sp-3);
   padding: var(--sp-3) var(--sp-4);
   border-bottom: 1px solid var(--line);
 }
+/* 弹窗标题用 h3 并挂 aria-labelledby：role=dialog 的名字由标题元素提供，
+   读屏进弹窗时会念出标题，而不是只念一个 label 字符串 */
+.assistant-dialog-head h3 { margin: 0; font-size: var(--fs-base); font-weight: 600; }
+.assistant-close {
+  width: 30px; height: 30px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  padding: 0;
+}
+.assistant-close > svg { width: 15px; height: 15px; }
 .assistant-dialog-body { padding: var(--sp-4); overflow-y: auto; display: flex; flex-direction: column; gap: var(--sp-3); }
 .assistant-dialog-foot {
-  display: flex; justify-content: flex-end; gap: 8px;
+  display: flex; justify-content: flex-end; align-items: center; gap: 8px;
   padding: var(--sp-3) var(--sp-4);
   border-top: 1px solid var(--line);
+}
+/* 未保存标记靠右推到按钮前：关掉弹窗即丢弃这些改动，必须让人看见再决定 */
+.assistant-unsaved {
+  margin: 0; margin-right: auto;
+  font-size: var(--fs-xs); color: var(--orange);
 }
 .field { display: flex; flex-direction: column; gap: 6px; }
 .field .f { font-size: var(--fs-sm); font-weight: 600; }
@@ -1023,38 +1371,74 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
 .field input:not([type=checkbox]):not([type=radio]),
 .field select {
   font: inherit; font-size: var(--fs-sm);
+  min-height: 34px;
   padding: 8px 10px;
   border: 1px solid var(--line); border-radius: var(--radius-s);
   background: var(--surface-raised); color: var(--text);
+  transition: border-color var(--dur-1) var(--ease-standard);
 }
+.field input:not([type=checkbox]):not([type=radio]):hover,
+.field select:hover { border-color: color-mix(in srgb, var(--green) 30%, var(--line)); }
 .field input:not([type=checkbox]):not([type=radio]):focus-visible,
 .field select:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-offset); }
+/* Key 输入位：右侧留出眼睛按钮（与「平台」视图同构） */
+.assistant-key-wrap { position: relative; display: flex; }
+.assistant-key-wrap input { flex: 1; min-width: 0; padding-right: 42px; }
+.reveal-btn {
+  position: absolute; right: 3px; top: 50%; transform: translateY(-50%);
+  width: 34px; height: 34px;
+  display: flex; align-items: center; justify-content: center;
+  border: none; background: transparent; border-radius: var(--radius-s);
+  color: var(--muted-strong); cursor: pointer;
+  transition: color var(--dur-1) var(--ease-standard), background var(--dur-1) var(--ease-standard);
+}
+.reveal-btn:hover { color: var(--text); background: var(--nav-hover-bg); }
+.reveal-btn:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-offset); }
+.reveal-btn[aria-pressed="true"] { color: var(--green); }
+.reveal-btn svg { width: 22px; height: 22px; }
 /* 原生 checkbox/radio 也必须有可见焦点环（键盘用户在弹窗里靠 Tab 走） */
 .assistant-brain input:focus-visible,
 .assistant-opt input:focus-visible,
 .assistant-op-check input:focus-visible,
 .assistant-op-all input:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-offset); }
 .assistant-presets { display: flex; flex-wrap: wrap; gap: 8px; }
-.note { margin: 0; font-size: 11px; color: var(--muted-strong); line-height: var(--lh-loose); }
-.assistant-dialog-error { margin: 0; font-size: var(--fs-xs); color: var(--badge-unavailable-fg); }
+.note { margin: 0; font-size: var(--fs-xs); color: var(--muted-strong); line-height: var(--lh-loose); }
+.assistant-dialog-error {
+  margin: 0; display: flex; align-items: flex-start; gap: 6px;
+  font-size: var(--fs-xs); line-height: var(--lh-loose); color: var(--danger);
+}
+.assistant-dialog-error > svg { width: 15px; height: 15px; flex-shrink: 0; margin-top: 2px; }
 .assistant-danger-hint {
   margin: 0; font-size: var(--fs-xs); line-height: var(--lh-loose);
-  color: var(--badge-unavailable-fg);
-  background: color-mix(in srgb, var(--badge-unavailable-fg) 12%, transparent);
-  border: 1px solid color-mix(in srgb, var(--badge-unavailable-fg) 35%, transparent);
+  color: var(--danger);
+  background: var(--danger-bg);
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
   border-radius: var(--radius-s);
   padding: 8px 10px;
 }
 
+/* 实色危险按钮（勾了高危条目时的「执行」）：文字色沿用 --on-primary，
+   暗色下它是深色，正好压得住浅玫红底；hover 方向与 .primary 一致（往 --text 靠） */
+.primary.danger { background: var(--danger); border-color: var(--danger); color: var(--on-primary); }
+.primary.danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 86%, var(--text));
+  border-color: color-mix(in srgb, var(--danger) 86%, var(--text));
+}
+
 .assistant-ops { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 .assistant-op {
-  display: flex; gap: 10px;
+  display: flex; gap: 10px; width: 100%; text-align: left;
   border: 1px solid var(--line); border-radius: var(--radius-s);
-  background: var(--row); padding: 10px 12px;
+  background: var(--row); padding: 10px 12px; cursor: pointer;
+  transition: border-color var(--dur-1) var(--ease-standard), background var(--dur-1) var(--ease-standard);
 }
-.assistant-op.invalid { opacity: .6; }
+.assistant-op:hover { border-color: color-mix(in srgb, var(--green) 32%, var(--line)); background: var(--surface-raised); }
+/* 参数校验没过的条目整行不可执行：读出来像可点、点下去没反应是最容易被当成 bug 的形态 */
+.assistant-ops li.invalid .assistant-op { opacity: .6; cursor: not-allowed; }
+/* hover 高亮也要一起收掉：勾不上却还在变绿边，等于用样式承诺了一个点不动的东西 */
+.assistant-ops li.invalid .assistant-op:hover { border-color: var(--line); background: var(--row); }
 .assistant-op-check { display: flex; align-items: flex-start; padding-top: 2px; }
-.assistant-op-main { min-width: 0; }
+.assistant-op-main { min-width: 0; display: block; }
 .assistant-op-title { font-size: var(--fs-sm); font-weight: 600; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.assistant-op-all { font-size: var(--fs-xs); color: var(--muted-strong); display: flex; align-items: center; gap: 6px; }
+.assistant-op-all { font-size: var(--fs-xs); color: var(--muted-strong); display: flex; align-items: center; gap: 6px; cursor: pointer; }
 </style>
