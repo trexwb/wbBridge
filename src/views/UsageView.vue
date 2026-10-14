@@ -35,16 +35,18 @@ function ms(value) {
       </div>
     </header>
 
-    <div class="metrics">
-      <div><b>{{ total.requests }}</b><span>真实请求</span></div>
-      <div><b class="ok">{{ total.ok }}</b><span>成功</span></div>
-      <div><b :class="{ bad: total.failed > 0 }">{{ total.failed }}</b><span>失败</span></div>
-      <div><b :class="{ idle: !total.requests }">{{ percent(total.ok, total.requests) }}</b><span>成功率</span></div>
-    </div>
+    <div class="metrics-block">
+      <div class="metrics">
+        <div><b>{{ total.requests }}</b><span>真实请求</span></div>
+        <div><b class="ok">{{ total.ok }}</b><span>成功</span></div>
+        <div><b :class="{ bad: total.failed > 0 }">{{ total.failed }}</b><span>失败</span></div>
+        <div><b :class="{ idle: !total.requests }">{{ percent(total.ok, total.requests) }}</b><span>成功率</span></div>
+      </div>
 
-    <p class="meta">
-      统计起始：{{ usage?.since ? new Date(usage.since).toLocaleString() : '未知' }}（计数随核心重启延续）
-    </p>
+      <p class="meta">
+        统计起始：{{ usage?.since ? new Date(usage.since).toLocaleString() : '未知' }}（计数随核心重启延续）
+      </p>
+    </div>
 
     <table v-if="rows.length" class="usage">
       <thead>
@@ -80,7 +82,10 @@ function ms(value) {
 <style scoped>
 header { display: flex; justify-content: space-between; gap: var(--sp-3); align-items: center; }
 .subtitle { margin: 0; color: var(--muted-strong); font-size: var(--fs-sm); }
-/* 指标条：一格一数，格间用极淡竖线分组 */
+/* 统计块：卡片与「统计起始」脚注是同一份信息，内部间距收紧一档，
+   与下方表格之间由 .view 的 16px 段距拉开层级，不再三块等距糊成一片 */
+.metrics-block { display: flex; flex-direction: column; gap: var(--sp-2); }
+/* 指标条：一格一数，格间用极淡竖线分组（与 MetricsBar 同一套刻度） */
 .metrics {
   display: flex;
   align-items: stretch;
@@ -89,9 +94,9 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
   border-radius: var(--radius-m);
   overflow: hidden;
 }
-.metrics div { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: var(--sp-1); padding: 10px var(--sp-4); }
+.metrics div { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: var(--sp-1); padding: var(--sp-2) var(--sp-4); }
 .metrics div + div { border-left: 1px solid var(--line); }
-.metrics b { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.15; }
+.metrics b { font-size: var(--fs-2xl); font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.15; }
 .metrics b.ok { color: var(--green); }
 .metrics b.bad { color: var(--orange); }
 .metrics b.idle { color: var(--muted); }
@@ -99,12 +104,15 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
 .meta { margin: 0; font-size: var(--fs-xs); color: var(--muted-strong); }
 .usage {
   width: 100%;
-  border-collapse: collapse;
+  /* 不得用 collapse + overflow:hidden 裁圆角：那会把滚动容器裁在表格自身，
+     表头 sticky 永远不生效（吸顶注释形同虚设）。separate + 0 间距外观一致，
+     圆角改由四角单元格自己裁。 */
+  border-collapse: separate;
+  border-spacing: 0;
   font-size: var(--fs-sm);
   background: var(--row);
   border: 1px solid var(--line);
   border-radius: var(--radius-m);
-  overflow: hidden;
 }
 .usage th, .usage td { padding: var(--sp-2) var(--sp-3); text-align: left; border-bottom: 1px solid var(--line); }
 /* 表头吸顶：行数多时滚动仍能对上列名 */
@@ -117,6 +125,10 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
   color: var(--muted-strong);
   background: var(--row);
 }
+.usage thead th:first-child { border-top-left-radius: var(--radius-s); }
+.usage thead th:last-child { border-top-right-radius: var(--radius-s); }
+.usage tbody tr:last-child td:first-child { border-bottom-left-radius: var(--radius-s); }
+.usage tbody tr:last-child td:last-child { border-bottom-right-radius: var(--radius-s); }
 .usage tbody tr { transition: background var(--dur-1) var(--ease-standard); }
 .usage tbody tr:hover { background: color-mix(in srgb, var(--row) 88%, var(--green) 12%); }
 .usage tr:last-child td { border-bottom: none; }
@@ -125,7 +137,7 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
 /* 无数据：虚线框居中，与列表空态同一套语言 */
 .notice {
   margin: 0;
-  padding: 14px;
+  padding: var(--sp-3) var(--sp-4);
   border: 1px dashed var(--line);
   border-radius: var(--radius-m);
   font-size: var(--fs-sm);

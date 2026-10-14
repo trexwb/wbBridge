@@ -330,22 +330,30 @@ export function buildSystemPrompt(snapshot = '') {
 
 // ── 请求组装 ────────────────────────────────────────────────────────
 // history：[{ role: 'user' | 'assistant' | 'tool', content }]（tool 消息由调用方追加）。
-// 超长时从最早开始丢，保留最近上下文，并显式标注省略条数——不让模型看到无声断裂的对话。
+// 最小上下文：只带最近 historyLimit 条（默认 6，约 3 轮问答），单条超过 messageChars
+// 字符就地截断并标注；仍超总预算时再从最早开始丢。省略条数按**完整历史**计数并显式
+// 标注——窗口截断与预算丢弃都不能是无声断裂（免费模型窗口小，请求越小首字越快）。
 export function buildRequestMessages({
   history = [],
   message = '',
   snapshot = '',
-  historyLimit = 20,
+  historyLimit = 6,
   maxChars = 24000,
+  messageChars = 4000,
 } = {}) {
   const recent = history.slice(-historyLimit)
-  const picked = recent.slice()
+  const picked = recent.map(m => {
+    const content = String(m.content ?? '')
+    return content.length > messageChars
+      ? { ...m, content: content.slice(0, messageChars) + '…（已截断）' }
+      : m
+  })
   let total = picked.reduce((sum, m) => sum + String(m.content ?? '').length, 0)
   while (picked.length > 1 && total > maxChars) {
     const dropped = picked.shift()
     total -= String(dropped.content ?? '').length
   }
-  const omitted = recent.length - picked.length
+  const omitted = history.length - picked.length
   const body = []
   if (omitted > 0) {
     body.push({ role: 'user', content: `（为节省上下文，较早的 ${omitted} 条对话历史已省略）` })

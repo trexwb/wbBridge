@@ -121,7 +121,7 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
   border-radius: var(--radius-m);
 }
 /* 行间极淡分隔线：键值对读起来像表格，而不是一叠段落 */
-.facts div { display: flex; gap: var(--sp-3); align-items: baseline; padding: 7px 0; }
+.facts div { display: flex; gap: var(--sp-3); align-items: baseline; padding: var(--sp-2) 0; }
 .facts div + div { border-top: 1px solid color-mix(in srgb, var(--line) 70%, transparent); }
 .facts div:first-child { padding-top: 0; }
 .facts div:last-child { padding-bottom: 0; }

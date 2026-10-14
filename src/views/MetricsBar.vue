@@ -28,7 +28,8 @@ const pending = computed(() => props.models.filter((m) => {
 
 <style scoped>
 .toolbar { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3); }
-/* 统计条：一格一数，格间用极淡竖线分组，数字按语义着色，不靠颜色单独表意 */
+/* 统计条：一格一数，格间用极淡竖线分组，数字按语义着色，不靠颜色单独表意。
+   刻度与 UsageView 的指标条同源（同一组件族只允许一套尺寸）。 */
 .metrics {
   display: flex;
   align-items: stretch;
@@ -37,10 +38,10 @@ const pending = computed(() => props.models.filter((m) => {
   border-radius: var(--radius-m);
   overflow: hidden;
 }
-.metrics div { display: flex; flex-direction: column; gap: 2px; padding: 8px 16px; }
+.metrics div { display: flex; flex-direction: column; gap: var(--sp-1); padding: var(--sp-2) var(--sp-4); }
 .metrics div + div { border-left: 1px solid var(--line); }
-.metrics b { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.15; }
+.metrics b { font-size: var(--fs-2xl); font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.15; }
 .metrics b.ok { color: var(--green); }
 .metrics b.idle { color: var(--muted); }
-.metrics span { font-size: 12px; color: var(--muted-strong); }
+.metrics span { font-size: var(--fs-xs); color: var(--muted-strong); }
 </style>
