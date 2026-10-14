@@ -18,7 +18,9 @@
 #   • Windows 产物未签名，SmartScreen 会提示"更多信息 → 仍要运行"。
 #   • 所有产物先上传为 Actions Artifact，再汇总到 Draft Release，
 #     人工确认后点"Publish release"正式发布。
-#   • test 作业里有一道「触发标签 ↔ src-tauri/tauri.conf.json 版本」闸门：标签名与源码版本
+#   • 发布不再被测试卡住（2026-10-14 用户裁定）：test 作业照常跑、结果照常展示，
+#     但三个 build 作业的前置改成了轻量的 release-gate 作业，test 失败不阻塞发布。
+#   • release-gate 作业里有那道「触发标签 ↔ src-tauri/tauri.conf.json 版本」闸门：标签名与源码版本
 #     不一致时直接失败。v1.0.1 曾把标签打在不含版本推进的提交上，于是安静地产出了
 #     WB Bridge_1.0.0_* 且功能落后 4 个提交的安装包；check-version.mjs 只校验同一提交内
 #     各处落点互相一致，抓不到这类错，所以必须单独设闸。
@@ -116,7 +118,46 @@ permissions:
   contents: write
 
 jobs:
+  # ── 发布闸门（轻量、必须通过）：版本一致性 + 标签↔源码版本对账 ────────
+  # 2026-10-14 用户裁定「发布可以不用 test」：这两步不是测试，是 v1.0.1 事故
+  # （标签打在不含版本推进的提交上 → 安静产出错名错内容的安装包）后唯一的防线，
+  # 因此从 test 作业拆出、单独成闸，三个 build 作业 needs 它而不是 needs test。
+  release-gate:
+    name: 发布闸门（版本与标签）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Node.js 24
+        # 与根 package.json 的 engines.node >= 24 对齐（此前是 22，低于本仓声明的下限）。
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: 校验版本号一致性
+        # package.json / tauri.conf.json / Cargo.toml / AGENTS.md 必须同一版本。
+        run: node scripts/check-version.mjs
+
+      - name: 校验触发标签与源码版本一致
+        # 上一项只比对「同一提交内 5 处落点互相一致」，因此标签指向一份全体为旧版本的
+        # 提交时它照样通过 —— v1.0.1 就是这样产出了 WB Bridge_1.0.0_aarch64.dmg，而且那个
+        # 安装包不含最近 4 个提交。这里补上唯一能抓住该错误的闸门。
+        # 版本还决定各作业上传 Release 时用的标签名（v<conf 版本>），不一致就会开出两个 Release。
+        # workflow_dispatch 时 GITHUB_REF_NAME 是分支名，不参与比较，故只在推标签时运行。
+        if: github.event_name == 'push'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          conf="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          echo "触发标签 = ${GITHUB_REF_NAME}，src-tauri/tauri.conf.json 版本 = ${conf}"
+          if [ "${tag}" != "${conf}" ]; then
+            echo "::error::标签 ${GITHUB_REF_NAME} 与源码版本 ${conf} 不一致：产物会被命名为 ${conf}，且该标签提交很可能不含本次版本推进。请先提交版本推进，再在那一个提交上重新打标签。"
+            exit 1
+          fi
+          echo "标签与源码版本一致，可继续构建。"
+
   # ── 核心测试（Rust：187 单测 + 11 组 JS↔Rust 对拍快照 + 9 条红线）────
+  # ⚠ 本作业是【告警展示】，不再是发布前置（2026-10-14 用户裁定）：失败不阻塞 build 作业，
+  #   结果仍会红给维护者看。测试挂了照样发版是明确接受的风险，红线由 release-gate 兜底。
   test:
     name: 核心测试
     runs-on: ubuntu-latest
@@ -141,12 +182,18 @@ jobs:
         # 对拍测试比较的是 tests/fixtures/*.json 里冻结的 JS 真相快照，无需 Node。
         run: cargo test --manifest-path src-tauri/core/Cargo.toml
 
-      - name: 校验版本号一致性
-        # package.json / tauri.conf.json / Cargo.toml / AGENTS.md 必须同一版本。
-        run: node scripts/check-version.mjs
+      - name: 安装前端依赖
+        # ⚠ 2026-10-14 实测教训（tag 那次 CI 的 ai.test.js 整文件 1:1 崩、无任何断言输出）：
+        # 「只用 node 内置模块、无需 npm ci」的说法只对 prefs/ops/manifest/updater-key 成立——
+        # ai.test.js 经 ai.js→bridge.js 静态 import @tauri-apps/*，chatSession.test.js 经
+        # chatSession.js import 'vue'，bridge.test.js 同样走 bridge.js。checkout 里没有
+        # node_modules 时这些套件在**加载阶段**就 ERR_MODULE_NOT_FOUND，整个文件按一条失败计。
+        # 本机 node_modules 常在，所以只有 CI 能暴露它。
+        run: npm ci
 
       - name: 运行面板偏好、操作守卫、AI 引擎、对话记录、桥接事件、更新清单与签名注入单测
-        # 七组都是 node --test、只用 node 内置模块（不引测试框架、不需要 npm ci，也不碰真实私钥）：
+        # 七组都是 node --test（不引测试框架、不联网、不起 Tauri、不碰真实私钥）；
+        # 其中 ai / chat / bridge 三组依赖上一步 npm ci 装好的 @tauri-apps/* 与 vue：
         #   • src/core/prefs.test.js —— 凭据字段进不了 localStorage、坏数据回落默认值；
         #   • src/core/ops.test.js —— 操作守卫：成功反馈文案、在飞互斥、完成冷却、拒绝节流；
         #   • src/core/ai.test.js —— AI 助手的工具表/参数校验/Key 掩码/请求裁剪不越界，
@@ -171,27 +218,10 @@ jobs:
           node --test scripts/gen-latest-json.test.mjs
           node --test scripts/with-updater-key.test.mjs
 
-      - name: 校验触发标签与源码版本一致
-        # 上一项只比对「同一提交内 5 处落点互相一致」，因此标签指向一份全体为旧版本的
-        # 提交时它照样通过 —— v1.0.1 就是这样产出了 WB Bridge_1.0.0_aarch64.dmg，而且那个
-        # 安装包不含最近 4 个提交。这里补上唯一能抓住该错误的闸门。
-        # 版本还决定各作业上传 Release 时用的标签名（v<conf 版本>），不一致就会开出两个 Release。
-        # workflow_dispatch 时 GITHUB_REF_NAME 是分支名，不参与比较，故只在推标签时运行。
-        if: github.event_name == 'push'
-        run: |
-          tag="${GITHUB_REF_NAME#v}"
-          conf="$(node -p "require('./src-tauri/tauri.conf.json').version")"
-          echo "触发标签 = ${GITHUB_REF_NAME}，src-tauri/tauri.conf.json 版本 = ${conf}"
-          if [ "${tag}" != "${conf}" ]; then
-            echo "::error::标签 ${GITHUB_REF_NAME} 与源码版本 ${conf} 不一致：产物会被命名为 ${conf}，且该标签提交很可能不含本次版本推进。请先提交版本推进，再在那一个提交上重新打标签。"
-            exit 1
-          fi
-          echo "标签与源码版本一致，可继续构建。"
-
   # ── macOS：.app（tauri）+ .dmg（hdiutil，ad-hoc 签名）──────────────
   build-macos:
     name: macOS (${{ matrix.arch }})
-    needs: test
+    needs: release-gate
     strategy:
       fail-fast: false
       matrix:
@@ -320,7 +350,7 @@ jobs:
   # ── Windows：NSIS + MSI ──────────────────────────────────────────
   build-windows:
     name: Windows (${{ matrix.arch }})
-    needs: test
+    needs: release-gate
     strategy:
       fail-fast: false
       matrix:
@@ -406,7 +436,7 @@ jobs:
   # ── Linux：.AppImage + .deb ──────────────────────────────────────
   build-linux:
     name: Linux (${{ matrix.arch }})
-    needs: test
+    needs: release-gate
     strategy:
       fail-fast: false
       matrix:
