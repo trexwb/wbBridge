@@ -257,10 +257,11 @@ test('buildSystemPrompt / buildRequestMessages：system 打头、工具纪律入
   assert.equal(messages[0].role, 'system')
   assert.equal(messages[messages.length - 1].role, 'user')
   assert.equal(messages[messages.length - 1].content, '现在什么状态')
-  // 默认只带最近 20 条历史，外加本轮提问；未触顶时不插省略说明。
+  // 最小上下文：默认只带最近 6 条历史，外加本轮提问；窗口截断按完整历史显式标注省略条数。
   const body = messages.slice(1)
-  assert.equal(body.length, 21)
-  assert.ok(!body[0].content.includes('已省略'))
+  assert.equal(body.length, 8)
+  assert.ok(body[0].content.includes('已省略'))
+  assert.ok(body[0].content.includes('24'))
   // 超字符预算时才从最早开始丢，并显式标注省略条数（不让模型看到无声断裂的对话）。
   const squeezed = buildRequestMessages({ history, message: '问', maxChars: 5 })
   assert.ok(squeezed[1].content.includes('已省略'))
@@ -271,6 +272,14 @@ test('buildSystemPrompt / buildRequestMessages：system 打头、工具纪律入
   const trimmed = buildRequestMessages({ history: huge, message: '问', maxChars: 100 })
   assert.equal(trimmed[trimmed.length - 1].content, '问')
   assert.ok(trimmed.some(m => m.content === '短'))
+
+  // 单条历史超过 messageChars 就地截断并标注，不再撑爆请求。
+  const longMsg = 'y'.repeat(6000)
+  const capped = buildRequestMessages({ history: [{ role: 'user', content: longMsg }], message: '问' })
+  const cappedBody = capped.find(m => m.content.startsWith('yyy'))
+  assert.ok(cappedBody, '超长历史条目必须保留（截断而非丢弃）')
+  assert.ok(cappedBody.content.endsWith('…（已截断）'))
+  assert.ok(cappedBody.content.length < longMsg.length)
 })
 
 // ── 端点配置 ────────────────────────────────────────────────────────

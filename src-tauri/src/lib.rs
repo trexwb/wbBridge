@@ -1058,6 +1058,29 @@ fn snippet_of(text: &str) -> String {
     out
 }
 
+/// 流中错误帧的识别：SSE 响应头一旦发出（核心 `/v1/chat/completions` 的流式分支先写
+/// 校验注释帧、立刻回 200），后续失败只能以 `data: {"error":{...}}` 补发且没有 `[DONE]`
+/// （`server.rs::StreamJob` 失败路径的唯一出口）。这类帧没有 `choices`，累加器会整帧丢弃；
+/// 不在这里识别，面板拿到的就是「空内容 + 无工具调用」的成功——表现为转圈结束后气泡一片
+/// 空白、不报任何原因。返回可读的错误文案；非错误帧返回 None。
+fn sse_error_of(chunk: &Value) -> Option<String> {
+    let error = chunk.get("error").filter(|value| !value.is_null())?;
+    let text = match error.as_str() {
+        // 少数端点把 error 写成字符串。其余形态优先 message、次选 code，都缺再退化成整段 JSON。
+        Some(text) => text.to_string(),
+        None => error
+            .get("message")
+            .or_else(|| error.get("code"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| error.to_string()),
+    };
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(format!("AI 端点在流中返回错误：{}", snippet_of(&text)))
+}
+
 /// AI 对话（流式）：壳代面板向 OpenAI 兼容端点发请求，SSE 增量经 `ai-chunk` 事件推送，
 /// 结束 / 失败 / 取消分别发 `ai-done` / `ai-error` / `ai-aborted`（payload 都带 chatId）。
 /// 同步返回、请求在独立线程里跑，命令本身不等待。
@@ -1194,6 +1217,13 @@ fn stream_ai_chat(
         }
         // 单行解析失败不影响整条流（部分提供商会夹带注释行 / keep-alive）。
         if let Ok(chunk) = serde_json::from_str::<Value>(data) {
+            // 流中错误帧必须在累加之前判：它没有 choices，先进累加器就等于被吞掉，
+            // 面板会拿到「成功但什么都没有」——这正是 WB · auto 落到慢/坏免费模型时
+            // 「没有任何信息返回」的根源。
+            if let Some(message) = sse_error_of(&chunk) {
+                failed = Some(message);
+                break;
+            }
             let delta = acc.absorb(&chunk);
             if !delta.is_empty() {
                 let _ = app.emit("ai-chunk", serde_json::json!({ "chatId": chat_id, "text": delta }));
@@ -1514,6 +1544,38 @@ mod tests {
         let finished = acc.finish();
         assert_eq!(finished["content"], "");
         assert_eq!(finished["toolCalls"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// 流中错误帧必须被识别为失败：核心在响应头已发出后只能以 `data: {"error":{...}}`
+    /// 补发失败且没有 `[DONE]`（`server.rs::StreamJob` 失败路径）；这类帧没有 `choices`，
+    /// 若不单独识别，面板会拿到「空内容 + 无工具调用」的成功——表现为转圈结束后气泡
+    /// 一片空白、不报任何原因（WB · auto 落到慢/坏免费模型时的真实症状）。
+    #[test]
+    fn ai_stream_error_frame_is_surfaced_not_swallowed() {
+        // 核心 StreamJob 失败路径的原样帧（BackendError::error_value 的形状）。
+        let frame = serde_json::json!({
+            "error": { "message": "Model request timed out", "type": "upstream_error", "code": "upstream_error" }
+        });
+        assert_eq!(
+            sse_error_of(&frame),
+            Some("AI 端点在流中返回错误：Model request timed out".to_string())
+        );
+        // 正常帧（choices / usage-only）不得误判为错误。
+        assert_eq!(sse_error_of(&serde_json::json!({ "choices": [{ "delta": { "content": "hi" } }] })), None);
+        assert_eq!(sse_error_of(&serde_json::json!({ "usage": { "total_tokens": 1 } })), None);
+        // error 为字符串的端点形态同样要识别；null / 空 error 不算错误。
+        assert_eq!(
+            sse_error_of(&serde_json::json!({ "error": "boom" })),
+            Some("AI 端点在流中返回错误：boom".to_string())
+        );
+        assert_eq!(sse_error_of(&serde_json::json!({ "error": null })), None);
+        assert_eq!(sse_error_of(&serde_json::json!({ "error": "" })), None);
+        // message 缺失时退化到 code，再缺退化成整段 JSON 的截断。
+        let code_only = serde_json::json!({ "error": { "type": "upstream_error", "code": "model_failed" } });
+        assert_eq!(
+            sse_error_of(&code_only),
+            Some("AI 端点在流中返回错误：model_failed".to_string())
+        );
     }
 
     /// 错误响应体截断：压掉换行、封顶 200 字符，超长加省略号。

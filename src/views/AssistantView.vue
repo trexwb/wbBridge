@@ -479,11 +479,13 @@ async function send() {
   await runTurn(text, history)
 }
 
-// 重发最近一轮：失败的那条气泡原地替换成新的尝试，历史沿用出错前的那份（不把失败回复教给模型）。
+// 重发最近一轮：失败与成功一样原地替换成新的尝试（「重试 / 重新生成」），
+// 历史沿用当轮开始前的那份快照（不把旧回复教给模型）。工具卡片随旧气泡一起丢弃，
+// 已执行的工具副作用不回滚——重新生成是对「这一轮的回答」重跑，不是对世界撤销。
 async function retry() {
   if (chatting.value || !lastTurn.value) return
   const last = messages.value[messages.value.length - 1]
-  if (last && last.role === 'assistant' && last.failed) messages.value.pop()
+  if (last && last.role === 'assistant') messages.value.pop()
   await runTurn(lastTurn.value.text, lastTurn.value.history)
 }
 
@@ -733,9 +735,16 @@ function quick(text) {
   send()
 }
 
-// 失败气泡上的「重试」只给最新一轮：更早的失败已被后续对话取代，重发会把话题拉回过去。
+// 「重试 / 重新生成」只给最新一轮的助手消息：更早的轮次已被后续对话取代，重发会把话题拉回过去。
+// 本轮生成中（pending / chatting）不出现；历史快照在重载后不可得（lastTurn 不落盘），故仅限本会话。
 function canRetry(message) {
-  return !chatting.value && message.failed && lastTurn.value !== null && messages.value[messages.value.length - 1] === message
+  return (
+    !chatting.value &&
+    message.role === 'assistant' &&
+    !message.pending &&
+    lastTurn.value !== null &&
+    messages.value[messages.value.length - 1] === message
+  )
 }
 
 function toolStatusText(entry) {
@@ -869,7 +878,7 @@ onBeforeUnmount(() => {
         <div class="assistant-msg-meta">
           <span>{{ m.role === 'user' ? '我' : 'AI 助手' }}</span>
           <span v-if="m.role === 'assistant' && m.pending" class="assistant-thinking">正在生成…</span>
-          <button v-else-if="canRetry(m)" type="button" class="assistant-retry" @click="retry">重试</button>
+          <button v-else-if="canRetry(m)" type="button" class="assistant-retry" @click="retry">{{ m.failed ? '重试' : '重新生成' }}</button>
         </div>
         <div class="assistant-bubble">
           <!-- 受控 Markdown 渲染收进子组件：父视图每 ~80ms 因流式增量重渲染一次，
@@ -1252,7 +1261,8 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
 .assistant-msg.user { align-self: flex-end; align-items: flex-end; }
 .assistant-msg.assistant { align-self: flex-start; }
 .assistant-msg-meta { font-size: var(--fs-xs); color: var(--muted-strong); display: flex; align-items: center; gap: 8px; }
-/* 「正在生成…」与「重试」是元信息行的两种终态：前者只在 pending 时出现，后者只在失败且可重发时出现 */
+/* 「正在生成…」与「重试 / 重新生成」是元信息行的两种终态：前者只在 pending 时出现，
+   后者只在最新一轮已完成（含失败 / 停止）且不在生成中时出现 */
 .assistant-thinking { color: var(--green); }
 .assistant-retry {
   font-size: var(--fs-xs);

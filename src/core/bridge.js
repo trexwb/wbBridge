@@ -181,7 +181,12 @@ let activeChatId = null
 function aiEvents(listen, chatId, handlers) {
   return Promise.all(
     Object.entries(handlers).map(([event, handler]) =>
-      listen(event, payload => {
+      // Tauri v2 的监听回调收到的是事件对象 {event, id, payload}（与 ensureBridge 里
+      // core-* 监听同一形状），载荷在 event.payload 上。把事件对象当载荷读 chatId
+      // 恒为 undefined，四类 ai-* 事件会被全部滤掉——助手每一轮都会永远转圈，
+      // 连失败原因与「停止」都不可见（bridge.test.js 钉住此形状）。
+      listen(event, envelope => {
+        const payload = envelope?.payload
         if (payload?.chatId !== chatId) return
         handler(payload)
       }),
