@@ -182,8 +182,18 @@ jobs:
         # 对拍测试比较的是 tests/fixtures/*.json 里冻结的 JS 真相快照，无需 Node。
         run: cargo test --manifest-path src-tauri/core/Cargo.toml
 
+      - name: 安装前端依赖
+        # ⚠ 2026-10-14 实测教训（tag 那次 CI 的 ai.test.js 整文件 1:1 崩、无任何断言输出）：
+        # 「只用 node 内置模块、无需 npm ci」的说法只对 prefs/ops/manifest/updater-key 成立——
+        # ai.test.js 经 ai.js→bridge.js 静态 import @tauri-apps/*，chatSession.test.js 经
+        # chatSession.js import 'vue'，bridge.test.js 同样走 bridge.js。checkout 里没有
+        # node_modules 时这些套件在**加载阶段**就 ERR_MODULE_NOT_FOUND，整个文件按一条失败计。
+        # 本机 node_modules 常在，所以只有 CI 能暴露它。
+        run: npm ci
+
       - name: 运行面板偏好、操作守卫、AI 引擎、对话记录、桥接事件、更新清单与签名注入单测
-        # 七组都是 node --test、只用 node 内置模块（不引测试框架、不需要 npm ci，也不碰真实私钥）：
+        # 七组都是 node --test（不引测试框架、不联网、不起 Tauri、不碰真实私钥）；
+        # 其中 ai / chat / bridge 三组依赖上一步 npm ci 装好的 @tauri-apps/* 与 vue：
         #   • src/core/prefs.test.js —— 凭据字段进不了 localStorage、坏数据回落默认值；
         #   • src/core/ops.test.js —— 操作守卫：成功反馈文案、在飞互斥、完成冷却、拒绝节流；
         #   • src/core/ai.test.js —— AI 助手的工具表/参数校验/Key 掩码/请求裁剪不越界，
