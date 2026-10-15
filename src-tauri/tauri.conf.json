@@ -49,6 +49,12 @@
     "category": "DeveloperTool",
     "shortDescription": "让 WorkBuddy 使用 OpenCode 免费模型",
     "longDescription": "WB Bridge 通过隔离的 OpenCode 运行时为 WorkBuddy 提供免费模型：自动发现与检测免费模型、转换为标准 OpenAI 接口、并把可用模型同步进 WorkBuddy 配置。关闭窗口即退出应用并停止后台服务。",
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper"
+      },
+      "minimumWebview2Version": "110.0.1531.0"
+    },
     "macOS": {
       "minimumSystemVersion": "10.15",
       "signingIdentity": "-"
