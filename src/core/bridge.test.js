@@ -11,12 +11,14 @@ const callbacks = new Map()
 const listenersByEvent = new Map()
 let nextId = 1
 let onChatRequest = null
+let onClearLog = null
 
 function resetIpc() {
   callbacks.clear()
   listenersByEvent.clear()
   nextId = 1
   onChatRequest = null
+  onClearLog = null
 }
 
 globalThis.window = {
@@ -44,6 +46,10 @@ globalThis.window = {
         return Promise.resolve()
       }
       if (cmd === 'ai_abort') return Promise.resolve()
+      if (cmd === 'clear_log') {
+        if (!onClearLog) return Promise.reject(new Error('unexpected invoke: clear_log'))
+        return Promise.resolve(onClearLog())
+      }
       return Promise.reject(new Error(`unexpected invoke: ${cmd}`))
     },
   },
@@ -58,7 +64,7 @@ function deliver(event, payload) {
   }
 }
 
-const { aiChat } = await import('./bridge.js')
+const { aiChat, clearLog } = await import('./bridge.js')
 
 // 回归保险：Promise 若不落定，测试在 1.5s 内失败（而不是把整个套件挂死）。
 function withTimeout(promise, label) {
@@ -127,4 +133,21 @@ test('ai-error 解包后结算为失败并带原因', async () => {
   assert.equal(result.ok, false)
   assert.equal(result.error, 'AI 端点在流中返回错误：boom')
   assert.equal(result.partial, '部分')
+})
+
+test('clearLog 走壳命令 clear_log 并原样带回结果', async () => {
+  resetIpc()
+  onClearLog = () => ({ cleared: true })
+  const result = await withTimeout(clearLog(), 'clearLog 成功')
+  assert.equal(result.ok, true)
+  assert.equal(result.result.cleared, true)
+})
+
+test('clearLog 命令失败时映射为 { ok:false, error }，不抛出', async () => {
+  resetIpc()
+  // 桩未注册 clear_log：invoke 会以 unexpected invoke 拒绝，bridge 不得把它抛成未捕获异常。
+  onClearLog = null
+  const result = await withTimeout(clearLog(), 'clearLog 失败')
+  assert.equal(result.ok, false)
+  assert.match(result.error, /clear_log/)
 })

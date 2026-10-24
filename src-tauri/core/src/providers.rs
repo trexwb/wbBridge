@@ -28,7 +28,7 @@ pub struct DeclaredModel {
     /// 上游的模型 id，逐字用作注入声明段 `models` 的键，也因此成为请求体里的 `modelID`
     /// （`split_namespace` 按**第一个** `/` 切，`org/model` 形态整体落在 `modelID` 里）。
     pub id: &'static str,
-    /// 面板与客户端展示名（前缀是 `Provider::label`）。
+    /// 面板与客户端展示名（前缀是 `Provider::prefix`）。
     pub name: &'static str,
     /// 声明的上下文上限（token）。**取保守值**：ModelScope 的 `config.json` 里
     /// `max_position_embeddings` 与网关实际承接的上限不一致（实测 `MiniMax-M1-80k` 报
@@ -53,8 +53,12 @@ pub struct DeclaredModel {
 pub struct Provider {
     /// OpenCode 配置段的键名，也是 `providers.json` 的键名与面板用的稳定 id。
     pub id: &'static str,
-    /// 面板显示名（也是 `<label> · <name>` 展示 ID 的前缀来源）。
+    /// 面板显示名（「平台」页、provider-status 与活动文案用它；模型 ID 前缀不用它，见 `prefix`）。
     pub label: &'static str,
+    /// 模型 ID 的两字母短前缀（`<prefix> · <名称>`）。2026-10-15 裁定的简称规则：
+    /// ModelScope→MS、SiliconFlow→SF、腾讯混元 TokenHub→TT、智谱→ZP。`client_model_id`
+    /// 与面板展示都以它为准，与 `label` 刻意解耦——label 继续当全名用，prefix 才是对外短码。
+    pub prefix: &'static str,
     /// 注入 `provider.<id>.npm` 的 SDK 包名。
     pub npm: &'static str,
     /// 注入 `provider.<id>.options.baseURL` 的地址（2026-10-03 实测自 models.dev 索引）。
@@ -83,6 +87,7 @@ pub const PROVIDERS: [Provider; 4] = [
     Provider {
         id: "modelscope",
         label: "ModelScope",
+        prefix: "MS",
         npm: OPENAI_COMPATIBLE,
         base_url: "https://api-inference.modelscope.cn/v1",
         // 逐条来自 2026-10-10 对 `GET https://api-inference.modelscope.cn/v1/models`（公开可读、
@@ -170,6 +175,7 @@ pub const PROVIDERS: [Provider; 4] = [
     Provider {
         id: "siliconflow-cn",
         label: "SiliconFlow",
+        prefix: "SF",
         npm: OPENAI_COMPATIBLE,
         base_url: "https://api.siliconflow.cn/v1",
         models: &[],
@@ -177,6 +183,7 @@ pub const PROVIDERS: [Provider; 4] = [
     Provider {
         id: "tencent-tokenhub",
         label: "腾讯混元 TokenHub",
+        prefix: "TT",
         npm: OPENAI_COMPATIBLE,
         base_url: "https://tokenhub.tencentmaas.com/v1",
         models: &[],
@@ -185,6 +192,7 @@ pub const PROVIDERS: [Provider; 4] = [
         // 注意 baseURL 是 `/api/paas/v4`，不是常见的 `/v1`。
         id: "zhipuai",
         label: "智谱",
+        prefix: "ZP",
         npm: OPENAI_COMPATIBLE,
         base_url: "https://open.bigmodel.cn/api/paas/v4",
         models: &[],
@@ -341,10 +349,22 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), count, "注册表里的 id 必须唯一");
+        let mut prefixes: Vec<&str> = PROVIDERS.iter().map(|provider| provider.prefix).collect();
+        let prefix_count = prefixes.len();
+        prefixes.sort_unstable();
+        prefixes.dedup();
+        assert_eq!(prefixes.len(), prefix_count, "短前缀必须全注册表唯一");
         for provider in PROVIDERS {
             assert!(provider.label.starts_with(|c: char| !c.is_whitespace()));
             assert!(provider.base_url.starts_with("https://"), "{} 必须走 HTTPS", provider.id);
             assert_eq!(find(provider.id).map(|found| found.id), Some(provider.id));
+            assert_eq!(provider.prefix.len(), 2, "{} 的短前缀必须两字符：{}", provider.id, provider.prefix);
+            assert!(
+                provider.prefix.chars().all(|c| c.is_ascii_uppercase()),
+                "{} 的短前缀必须全大写字母：{}",
+                provider.id,
+                provider.prefix
+            );
         }
         assert_eq!(find("not-registered"), None);
     }

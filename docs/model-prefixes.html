@@ -1,0 +1,617 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>WB Bridge · 模型名称前缀对照</title>
+<meta name="description" content="WB Bridge 发布给 WorkBuddy / CodeBuddy 的模型 ID 前缀约定：OC（OpenCode）、MS（ModelScope）、SF（SiliconFlow）、TT（腾讯混元 TokenHub）、ZP（智谱），以及合成路由 WB · auto。">
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fff;
+    --panel: #f3f5f4;
+    --row: #f6f7f7;
+    --surface: #fff;
+    --text: #202826;
+    --muted: #78817e;
+    --muted-strong: #5c6764;
+    --line: #e0e7e3;
+    --green: #266e5c;
+    --green-bg: #e8f1ed;
+    --dur-2: 180ms;
+    --dur-3: 260ms;
+    --ease-standard: cubic-bezier(.2, 0, 0, 1);
+    --radius-m: 9px;
+    --radius-l: 12px;
+    --shadow-s: 0 1px 2px rgb(32 40 38 / .05);
+    --shadow-m: 0 1px 2px rgb(32 40 38 / .05), 0 8px 24px rgb(32 40 38 / .07);
+    --focus-ring: 2px solid var(--green);
+
+    /* 前缀徽章（浅色）：五组色相互异，fg/bg 均取自面板已实测的 ≥4.5:1 组合 */
+    --oc-fg: #266e5c; --oc-bg: #e8f1ed;
+    --ms-fg: #815a99; --ms-bg: #eee8f3;
+    --sf-fg: #3f6c99; --sf-bg: #e7eff9;
+    --tt-fg: #a4581a; --tt-bg: #fbefdf;
+    --zp-fg: #b3261e; --zp-bg: #fbe9e7;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #202422;
+      --panel: #272d2a;
+      --row: #2a302d;
+      --surface: #2b312e;
+      --text: #e3ebe6;
+      --muted: #a0ada5;
+      --muted-strong: #c3cec8;
+      --line: #3b4540;
+      --green: #8cc9ad;
+      --green-bg: #2a4035;
+      --shadow-s: 0 1px 2px rgb(0 0 0 / .3);
+      --shadow-m: 0 1px 2px rgb(0 0 0 / .3), 0 10px 28px rgb(0 0 0 / .26);
+      --oc-fg: #8cc9ad; --oc-bg: #2a4035;
+      --ms-fg: #d4b5e8; --ms-bg: #403249;
+      --sf-fg: #a4c9ec; --sf-bg: #293e52;
+      --tt-fg: #e9ad70; --tt-bg: #45392c;
+      --zp-fg: #f0a6a1; --zp-bg: #3a2a29;
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15.5px/1.75 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  code, .mono {
+    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    font-size: .92em;
+  }
+
+  .wrap { max-width: 880px; margin: 0 auto; padding: 0 24px; }
+
+  a { color: var(--green); text-underline-offset: 3px; }
+  a:hover { text-decoration-thickness: 2px; }
+
+  :is(a, button):focus-visible {
+    outline: var(--focus-ring);
+    outline-offset: 2px;
+    border-radius: 6px;
+  }
+
+  /* ── 顶栏 ─────────────────────────────────────────── */
+  .top {
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+  }
+  .top .wrap {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding-top: 14px;
+    padding-bottom: 14px;
+  }
+  .mark { display: inline-flex; color: var(--green); }
+  .brand { font-weight: 700; letter-spacing: .01em; }
+  .top .sep { color: var(--muted); }
+  .top .sub { color: var(--muted-strong); font-size: 14px; }
+  .top nav { margin-left: auto; display: flex; gap: 18px; }
+  .top nav a {
+    color: var(--muted-strong);
+    text-decoration: none;
+    font-size: 13.5px;
+    transition: color var(--dur-2) var(--ease-standard);
+  }
+  .top nav a:hover { color: var(--text); text-decoration: underline; }
+
+  /* ── 主区 ─────────────────────────────────────────── */
+  main { padding: 48px 0 24px; }
+  section + section { margin-top: 52px; }
+
+  .kicker {
+    display: block;
+    margin: 0 0 6px;
+    color: var(--green);
+    font-size: 12.5px;
+    font-weight: 700;
+    letter-spacing: .14em;
+  }
+  h1 {
+    margin: 0 0 14px;
+    font-size: clamp(26px, 4.4vw, 34px);
+    line-height: 1.25;
+    letter-spacing: .01em;
+  }
+  .lede { margin: 0; max-width: 40em; color: var(--muted-strong); }
+  .lede code {
+    background: var(--row);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 1px 6px;
+    white-space: nowrap;
+  }
+
+  h2 {
+    margin: 0 0 6px;
+    font-size: 20px;
+    line-height: 1.4;
+  }
+  h2::before {
+    content: "";
+    display: inline-block;
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--green);
+    margin-right: 10px;
+    vertical-align: 3px;
+  }
+  .section-lede { margin: 0 0 18px; color: var(--muted-strong); font-size: 14.5px; }
+
+  /* ── 示例 ID 大徽章 ───────────────────────────────── */
+  .demo {
+    margin-top: 26px;
+    display: inline-flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px 12px;
+    padding: 14px 18px;
+    background: var(--row);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-l);
+    box-shadow: var(--shadow-s);
+  }
+  .demo .middot { color: var(--muted); font-size: 18px; }
+  .demo .demo-name { font-size: 18px; font-weight: 600; }
+
+  /* ── 徽章 ─────────────────────────────────────────── */
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 34px;
+    padding: 4px 9px;
+    border-radius: 999px;
+    font-size: 12.5px;
+    font-weight: 700;
+    letter-spacing: .07em;
+    line-height: 1.4;
+    white-space: nowrap;
+  }
+  .badge.oc { color: var(--oc-fg); background: var(--oc-bg); }
+  .badge.ms { color: var(--ms-fg); background: var(--ms-bg); }
+  .badge.sf { color: var(--sf-fg); background: var(--sf-bg); }
+  .badge.tt { color: var(--tt-fg); background: var(--tt-bg); }
+  .badge.zp { color: var(--zp-fg); background: var(--zp-bg); }
+  .badge.wb { color: var(--oc-fg); background: var(--oc-bg); }
+
+  /* ── 复制按钮 ─────────────────────────────────────── */
+  .copy {
+    appearance: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 11px;
+    font: inherit;
+    font-size: 13px;
+    color: var(--text);
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-m);
+    cursor: pointer;
+    transition: border-color var(--dur-2) var(--ease-standard),
+                background var(--dur-2) var(--ease-standard),
+                transform var(--dur-2) var(--ease-standard);
+  }
+  .copy:hover { border-color: var(--green); background: var(--row); }
+  .copy:active { transform: translateY(1px); }
+  .copy svg { width: 13px; height: 13px; color: var(--muted-strong); }
+
+  /* ── 前缀总表 ─────────────────────────────────────── */
+  .tablewrap {
+    overflow-x: auto;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-l);
+    background: var(--surface);
+    box-shadow: var(--shadow-s);
+  }
+  table { width: 100%; border-collapse: collapse; min-width: 720px; }
+  caption {
+    position: absolute;
+    width: 1px; height: 1px;
+    margin: -1px; padding: 0;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
+  }
+  thead th {
+    text-align: left;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: .1em;
+    color: var(--muted-strong);
+    background: var(--panel);
+    padding: 11px 16px;
+    border-bottom: 1px solid var(--line);
+    white-space: nowrap;
+  }
+  tbody td {
+    padding: 15px 16px;
+    border-bottom: 1px solid var(--line);
+    vertical-align: top;
+    font-size: 14.5px;
+  }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr { transition: background var(--dur-2) var(--ease-standard); }
+  tbody tr:hover { background: var(--row); }
+
+  td.cell-prefix { white-space: nowrap; }
+  .p-name { font-weight: 600; }
+  .p-alias {
+    display: block;
+    margin-top: 3px;
+    color: var(--muted-strong);
+    font-size: 12.5px;
+    line-height: 1.6;
+  }
+  .p-alias code {
+    background: var(--row);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 0 5px;
+  }
+  .cell-id { white-space: nowrap; }
+  .cell-id .id {
+    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13.5px;
+  }
+  .cell-id .copy { margin-top: 8px; }
+  .cell-note { color: var(--muted-strong); font-size: 13.5px; }
+  .cell-note code {
+    background: var(--row);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 0 5px;
+    white-space: nowrap;
+  }
+
+  .footnote { margin: 14px 0 0; color: var(--muted-strong); font-size: 13px; }
+  .footnote + .footnote { margin-top: 6px; }
+  .footnote code {
+    background: var(--row);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 0 5px;
+    white-space: nowrap;
+  }
+
+  /* ── 命名规则 ─────────────────────────────────────── */
+  .rules { margin: 0; padding: 0; list-style: none; counter-reset: rule; }
+  .rules li {
+    counter-increment: rule;
+    position: relative;
+    padding: 14px 0 14px 46px;
+    border-bottom: 1px solid var(--line);
+  }
+  .rules li:last-child { border-bottom: 0; }
+  .rules li::before {
+    content: counter(rule, decimal-leading-zero);
+    position: absolute;
+    left: 0; top: 16px;
+    font-family: ui-monospace, Menlo, monospace;
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--green);
+  }
+  .rules b { font-weight: 650; }
+  .rules code {
+    background: var(--row);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 1px 6px;
+    white-space: nowrap;
+  }
+
+  /* ── WB · auto 说明卡 ─────────────────────────────── */
+  .callout {
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--green);
+    border-radius: var(--radius-l);
+    background: var(--surface);
+    box-shadow: var(--shadow-s);
+    padding: 20px 22px;
+  }
+  .callout .head {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+  .callout .head .mono { font-size: 16px; font-weight: 600; }
+  .callout ul { margin: 0; padding-left: 20px; }
+  .callout li { margin-top: 6px; color: var(--muted-strong); font-size: 14px; }
+  .callout li:first-child { margin-top: 0; }
+  .callout li code {
+    background: var(--row);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 0 5px;
+    white-space: nowrap;
+    color: var(--text);
+  }
+
+  /* ── 页脚 ─────────────────────────────────────────── */
+  footer {
+    margin-top: 64px;
+    border-top: 1px solid var(--line);
+    background: var(--panel);
+  }
+  footer .wrap { padding-top: 18px; padding-bottom: 22px; }
+  footer p { margin: 0; color: var(--muted-strong); font-size: 13px; }
+
+  /* ── 复制结果提示 ─────────────────────────────────── */
+  #toast {
+    position: fixed;
+    left: 50%;
+    bottom: 26px;
+    transform: translate(-50%, 10px);
+    max-width: min(86vw, 480px);
+    padding: 10px 18px;
+    border-radius: 999px;
+    background: var(--text);
+    color: var(--bg);
+    font-size: 13px;
+    box-shadow: var(--shadow-m);
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transition: opacity var(--dur-2) var(--ease-standard),
+                transform var(--dur-2) var(--ease-standard),
+                visibility 0s linear var(--dur-2);
+    z-index: 10;
+  }
+  #toast.show {
+    opacity: 1;
+    visibility: visible;
+    transform: translate(-50%, 0);
+    transition: opacity var(--dur-2) var(--ease-standard),
+                transform var(--dur-2) var(--ease-standard);
+  }
+
+  @media (max-width: 560px) {
+    .top nav { margin-left: 0; }
+    main { padding-top: 36px; }
+    section + section { margin-top: 40px; }
+    .demo { width: 100%; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    * { transition: none !important; }
+  }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <span class="mark" aria-hidden="true">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M3 17v-4a9 9 0 0 1 18 0v4"/>
+        <path d="M3 17h18"/>
+        <path d="M7 17v3M17 17v3"/>
+        <circle cx="12" cy="9" r="1.6"/>
+      </svg>
+    </span>
+    <span class="brand">WB Bridge</span>
+    <span class="sep" aria-hidden="true">·</span>
+    <span class="sub">模型名称前缀对照</span>
+    <nav aria-label="页内导航">
+      <a href="#table">前缀总表</a>
+      <a href="#rules">命名规则</a>
+      <a href="#auto">WB · auto</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <section class="hero" aria-labelledby="h-hero">
+    <h1 id="h-hero">
+      <span class="kicker">命名约定</span>
+      模型名称前缀对照
+    </h1>
+    <p class="lede">
+      WB Bridge 发布给 WorkBuddy / CodeBuddy 的模型，ID 统一为
+      <code>前缀 · 模型名</code>：前缀标记模型的来源平台，间隔号两侧各有一个空格，
+      其后保留上游原始模型名。
+    </p>
+    <div class="demo">
+      <span class="badge oc">OC</span>
+      <span class="middot" aria-hidden="true">·</span>
+      <span class="demo-name">DeepSeek-V3.1</span>
+      <button type="button" class="copy" data-copy="OC · DeepSeek-V3.1" aria-label="复制示例 ID：OC · DeepSeek-V3.1">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        复制 ID
+      </button>
+    </div>
+  </section>
+
+  <section id="table" aria-labelledby="h-table">
+    <h2 id="h-table">前缀总表</h2>
+    <p class="section-lede">五个前缀各对应一个模型来源，同一列表内前缀互不重复。</p>
+
+    <div class="tablewrap" role="region" aria-label="前缀总表" tabindex="0">
+      <table>
+        <caption>WB Bridge 模型 ID 前缀与平台对照表</caption>
+        <thead>
+          <tr>
+            <th scope="col">前缀</th>
+            <th scope="col">平台</th>
+            <th scope="col">平台 ID 与别名</th>
+            <th scope="col">ID 示例</th>
+            <th scope="col">说明</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="cell-prefix"><span class="badge oc">OC</span></td>
+            <td><span class="p-name">OpenCode</span></td>
+            <td><code>opencode</code>、OpenCode</td>
+            <td class="cell-id">
+              <span class="id">OC · DeepSeek-V3.1</span><br>
+              <button type="button" class="copy" data-copy="OC · DeepSeek-V3.1" aria-label="复制 OC · DeepSeek-V3.1">复制</button>
+            </td>
+            <td class="cell-note">WB Bridge 隔离托管的 OpenCode 免费模型：发现后逐模型探测，仅发布探测通过者。<code>OC</code> 也是现行版本代码中的实际前缀。</td>
+          </tr>
+          <tr>
+            <td class="cell-prefix"><span class="badge ms">MS</span></td>
+            <td><span class="p-name">ModelScope</span></td>
+            <td><code>modelscope</code>、ModelScope</td>
+            <td class="cell-id">
+              <span class="id">MS · MiniMax M1 80k</span><br>
+              <button type="button" class="copy" data-copy="MS · MiniMax M1 80k" aria-label="复制 MS · MiniMax M1 80k">复制</button>
+            </td>
+            <td class="cell-note">魔搭社区免费推理网关（api-inference.modelscope.cn）；注册表中唯一带权威模型清单的平台。</td>
+          </tr>
+          <tr>
+            <td class="cell-prefix"><span class="badge sf">SF</span></td>
+            <td><span class="p-name">SiliconFlow</span></td>
+            <td><code>siliconflow</code>、SiliconFlow<br><span class="p-alias">注册表 id：<code>siliconflow-cn</code></span></td>
+            <td class="cell-id">
+              <span class="id">SF · DeepSeek-V3</span><br>
+              <button type="button" class="copy" data-copy="SF · DeepSeek-V3" aria-label="复制 SF · DeepSeek-V3">复制</button>
+            </td>
+            <td class="cell-note">硅基流动开放平台（api.siliconflow.cn），OpenAI 兼容端点。</td>
+          </tr>
+          <tr>
+            <td class="cell-prefix"><span class="badge tt">TT</span></td>
+            <td><span class="p-name">腾讯混元 TokenHub</span></td>
+            <td><code>tencent-tokenhub</code>、腾讯混元 TokenHub</td>
+            <td class="cell-id">
+              <span class="id">TT · Hunyuan-A13B</span><br>
+              <button type="button" class="copy" data-copy="TT · Hunyuan-A13B" aria-label="复制 TT · Hunyuan-A13B">复制</button>
+            </td>
+            <td class="cell-note">腾讯混元 TokenHub（tokenhub.tencentmaas.com），OpenAI 兼容端点。</td>
+          </tr>
+          <tr>
+            <td class="cell-prefix"><span class="badge zp">ZP</span></td>
+            <td><span class="p-name">智谱</span></td>
+            <td><code>zhipuai</code>、智谱</td>
+            <td class="cell-id">
+              <span class="id">ZP · GLM-4.7-Flash</span><br>
+              <button type="button" class="copy" data-copy="ZP · GLM-4.7-Flash" aria-label="复制 ZP · GLM-4.7-Flash">复制</button>
+            </td>
+            <td class="cell-note">智谱开放平台 bigmodel（open.bigmodel.cn），baseURL 走 <code>/api/paas/v4</code> 而非常见的 <code>/v1</code>。</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="footnote">平台稳定 id（<code>providers.json</code> 的键名、面板动作的 <code>provider</code> 参数）依次为 <code>modelscope</code>、<code>siliconflow-cn</code>、<code>tencent-tokenhub</code>、<code>zhipuai</code>，一经发布不得改名——改了等于让用户已填的 Key 失效。</p>
+    <p class="footnote">现状说明：现行版本的客户端 ID 中，OpenCode 模型使用 <code>OC</code> 前缀；四家平台模型在现行版本里以注册表 label（ModelScope / SiliconFlow / 腾讯混元 TokenHub / 智谱）作为展示前缀，<code>MS</code> / <code>SF</code> / <code>TT</code> / <code>ZP</code> 为本文所记的短前缀口径。若与面板实际显示不一致，以面板为准。</p>
+  </section>
+
+  <section id="rules" aria-labelledby="h-rules">
+    <h2 id="h-rules">命名规则</h2>
+    <p class="section-lede">四条规则，适用于表中全部前缀。</p>
+    <ol class="rules">
+      <li><b>前缀固定大写、一平台一枚。</b><code>OC</code> / <code>MS</code> / <code>SF</code> / <code>TT</code> / <code>ZP</code> 与平台一一对应，同一模型列表内不与其他来源复用。</li>
+      <li><b>分隔符逐字节为「空格 + 间隔号 + 空格」。</b>即 <code>·</code>（U+00B7）两侧各一个半角空格，形如 <code>OC · DeepSeek-V3.1</code>。手填或引用模型 ID 时必须完整保留；写错分隔符（如 <code>WB.auto</code>、缺空格）一律不被识别。</li>
+      <li><b>间隔号之后保留上游模型的展示名。</b>核心内部另用「命名空间/模型」的全限定 id 做路由，对外一律只见「前缀 · 名称」形态，两套形态不会同时出现在同一个 ID 里。</li>
+      <li><b>合成路由不是平台前缀。</b><code>WB</code> 只出现在 <code>WB · auto</code> 这一条合成入口上，见下节。</li>
+    </ol>
+  </section>
+
+  <section id="auto" aria-labelledby="h-auto">
+    <h2 id="h-auto">特殊 ID：WB · auto</h2>
+    <div class="callout">
+      <div class="head">
+        <span class="badge wb">WB</span>
+        <span class="mono">WB · auto</span>
+        <button type="button" class="copy" data-copy="WB · auto" aria-label="复制 WB · auto">复制</button>
+      </div>
+      <ul>
+        <li><b>合成路由入口</b>，不是任何平台的前缀：发布集非空时，它作为独立条目写进 WorkBuddy / CodeBuddy 的 <code>models.json</code>，排在逐模型条目之后。</li>
+        <li>请求打到它时，核心按请求内容在<b>当前可用模型池</b>里自动选一个真实模型承接；池空则它根本不会出现。</li>
+        <li>不计入发布模型的数量统计，也不进面板的模型列表。</li>
+        <li>旧写法 <code>WB.auto</code> 不被任何入口接受。</li>
+      </ul>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>WB Bridge · 模型名称前缀对照 —— 本页是命名约定的参考；若与面板实际显示或当前版本行为不一致，以实际为准。</p>
+  </div>
+</footer>
+
+<div id="toast" role="status" aria-live="polite"></div>
+
+<noscript>
+  <style> .copy { display: none; } </style>
+</noscript>
+
+<script>
+(function () {
+  'use strict';
+
+  var toast = document.getElementById('toast');
+  var timer = null;
+
+  function announce(text) {
+    toast.textContent = text;
+    toast.classList.add('show');
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(function () { toast.classList.remove('show'); }, 1900);
+  }
+
+  function legacyCopy(text) {
+    var area = document.createElement('textarea');
+    area.value = text;
+    area.setAttribute('readonly', '');
+    area.style.position = 'fixed';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.select();
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (error) { ok = false; }
+    document.body.removeChild(area);
+    return ok;
+  }
+
+  function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text).then(
+        function () { return true; },
+        function () { return legacyCopy(text); }
+      );
+    }
+    return Promise.resolve(legacyCopy(text));
+  }
+
+  document.addEventListener('click', function (event) {
+    var button = event.target.closest ? event.target.closest('[data-copy]') : null;
+    if (!button) return;
+    var text = button.getAttribute('data-copy');
+    copyText(text).then(function (ok) {
+      announce(ok ? '已复制：' + text : '复制失败，请手动选择文本复制');
+    });
+  });
+})();
+</script>
+
+</body>
+</html>

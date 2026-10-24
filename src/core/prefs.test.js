@@ -139,9 +139,11 @@ test('ai：只投影已知字段，API Key 连白名单键都拿不到', () => {
     })
   })
 
-  // assistant 是合法视图 id（恢复偏好时不至于渲染一个不存在的视图）。
+  // assistant / prompt 是合法视图 id（恢复偏好时不至于渲染一个不存在的视图）。
   assert.equal(VIEW_IDS.includes('assistant'), true)
   assert.equal(sanitizeView('assistant'), 'assistant')
+  assert.equal(VIEW_IDS.includes('prompt'), true)
+  assert.equal(sanitizeView('prompt'), 'prompt')
 })
 
 test('view：合法值往返，非法值回落默认', () => {

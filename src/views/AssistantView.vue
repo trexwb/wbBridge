@@ -25,6 +25,9 @@ import {
   schedulePersist,
   setPersist,
 } from '../core/chatSession.js'
+// 桥接层只有一个在飞 chatId：助手的请求与提示词优化的请求共用它，
+// 两边同时发起会互相覆盖、连「停止」都会停错对象，因此在入口处互相排斥。
+import { running as promptRunning } from '../core/promptSession.js'
 import MarkdownBlock from '../components/MarkdownBlock.vue'
 import {
   AI_PRESETS,
@@ -435,6 +438,10 @@ function parseArgs(raw) {
 async function send() {
   const text = draft.value.trim()
   if (!text || chatting.value) return
+  if (promptRunning.value) {
+    showNotice('提示词优化正在生成：同一时间只能发一个 AI 请求，等它完成或先到「提示词优化」停止后再发送。')
+    return
+  }
   // 模型还没就位（输入框此时本是禁用态；这里兜住快捷提问等程序化入口，并给出去路）。
   if (blocked.value) {
     showNotice(`${gate.value.title}：${gate.value.reason}`)
@@ -483,7 +490,7 @@ async function send() {
 // 历史沿用当轮开始前的那份快照（不把旧回复教给模型）。工具卡片随旧气泡一起丢弃，
 // 已执行的工具副作用不回滚——重新生成是对「这一轮的回答」重跑，不是对世界撤销。
 async function retry() {
-  if (chatting.value || !lastTurn.value) return
+  if (chatting.value || promptRunning.value || !lastTurn.value) return
   const last = messages.value[messages.value.length - 1]
   if (last && last.role === 'assistant') messages.value.pop()
   await runTurn(lastTurn.value.text, lastTurn.value.history)
@@ -730,7 +737,7 @@ function clearHistory() {
 }
 
 function quick(text) {
-  if (chatting.value || blocked.value) return
+  if (chatting.value || promptRunning.value || blocked.value) return
   draft.value = text
   send()
 }
@@ -740,6 +747,7 @@ function quick(text) {
 function canRetry(message) {
   return (
     !chatting.value &&
+    !promptRunning.value &&
     message.role === 'assistant' &&
     !message.pending &&
     lastTurn.value !== null &&
@@ -860,8 +868,8 @@ onBeforeUnmount(() => {
             :key="prompt"
             type="button"
             class="assistant-chip"
-            :disabled="chatting || blocked"
-            :title="blocked ? gate.title : undefined"
+            :disabled="chatting || promptRunning || blocked"
+            :title="blocked ? gate.title : promptRunning ? '提示词优化正在生成' : undefined"
             @click="quick(prompt)"
           >{{ prompt }}</button>
         </div>
@@ -951,6 +959,14 @@ onBeforeUnmount(() => {
         </svg>
       </button>
     </p>
+    <p v-else-if="promptRunning" class="assistant-keyhint" role="status">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="8.4" />
+        <path d="M12 7.6v5.6M12 16.4v.4" />
+      </svg>
+      <span>提示词优化正在生成：同一时间只能发一个 AI 请求，等它完成（或先到那边停止）后再继续对话。</span>
+      <button type="button" class="assistant-gate-fix" @click="emit('navigate', 'prompt')">查看提示词优化</button>
+    </p>
     <p v-else-if="needsKey && !config.apiKey" class="assistant-keyhint" role="status">
       当前端点需要 API Key：点右上角「设置」填写（仅本会话内存，不落盘；本地 Ollama 一类端点可留空）。
     </p>
@@ -967,7 +983,7 @@ onBeforeUnmount(() => {
         ref="composer"
         v-model="draft"
         rows="1"
-        :disabled="chatting || blocked"
+        :disabled="chatting || promptRunning || blocked"
         :placeholder="composerPlaceholder"
         aria-label="向 AI 助手提问"
         @keydown="onComposerKeydown"
@@ -985,8 +1001,8 @@ onBeforeUnmount(() => {
           v-else
           type="submit"
           class="primary"
-          :disabled="!draft.trim() || props.busy || blocked"
-          :title="props.busy ? '其他操作正在进行中，等它结束后可用' : blocked ? gate.title : undefined"
+          :disabled="!draft.trim() || props.busy || promptRunning || blocked"
+          :title="promptRunning ? '提示词优化正在生成，同一时间只能发一个 AI 请求' : props.busy ? '其他操作正在进行中，等它结束后可用' : blocked ? gate.title : undefined"
         >
           <span v-if="props.busy" class="spinner" />发送
         </button>

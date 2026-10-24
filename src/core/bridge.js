@@ -155,6 +155,17 @@ export async function readLog() {
   }
 }
 
+// 清空运行日志：壳把数据目录下的日志文件截断为空（固定文件名，不接受路径参数，
+// 不碰 opencode.log.previous 轮转存档）。这是运行日志页唯一的写入口。
+export async function clearLog() {
+  ensureBridge()
+  try {
+    return { ok: true, result: await invoke('clear_log') }
+  } catch (error) {
+    return { ok: false, error: String(error) }
+  }
+}
+
 // 用系统浏览器打开外部链接（申请 Key 的官方页）。WebView 里 target=_blank 默认点不开，
 // 必须经壳的 open_external 命令转发（壳侧有 https + 字符白名单 + 精确主机名名单 EXTERNAL_HOSTS
 // 三重校验，名单外的域名一律拒绝）。只收 URL、不做任何 IO。

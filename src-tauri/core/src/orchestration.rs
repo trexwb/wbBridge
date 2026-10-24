@@ -602,7 +602,38 @@ async fn drain_status() {
     drain(&global_app().status_task).await;
 }
 
-/// 当前可发布的模型（对应 `usableModels()`）：通过校验且探测结果为 ok。
+/// 可发布集（对应 `usableModels()`）：目录 ∩ 已校验 ∩ 最近一次结果为 `ok === true`。
+///
+/// 这是过滤不可用/超时模型的**唯一真相**：WorkBuddy / CodeBuddy 的 `models.json` 写入、
+/// `/v1/models`、`WB · auto` 的选择域与翻译模型候选都只认这一份集合。判定只认
+/// `true` 本身（`ok: 1` 这类 truthy 值不算），因此即使 `validated` 里残留了某个 id
+/// （并发写、被外部改过的 `status.json`），只要最近一次结果是 `ok: false`（含
+/// `code: "timeout"`）就进不了发布集。
+fn publishable_models(models: &[Value], validated: &HashSet<String>, results: &Value) -> Vec<Value> {
+    models
+        .iter()
+        .filter(|model| {
+            let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
+            validated.contains(id)
+                && results.get(id).and_then(|entry| entry.get("ok")) == Some(&json!(true))
+        })
+        .map(|model| {
+            let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
+            let chat_only = results
+                .get(id)
+                .and_then(|entry| entry.get("chatOnly"))
+                .unwrap_or(&Value::Bool(false))
+                .clone();
+            let mut model = model.clone();
+            if let Some(object) = model.as_object_mut() {
+                object.insert("chatOnly".to_string(), chat_only);
+            }
+            model
+        })
+        .collect()
+}
+
+/// 当前可发布的模型（读取全局状态后交给 [`publishable_models`]）。
 fn usable_models() -> Vec<Value> {
     let app = global_app();
     let validated = lock(&app.validated).clone();
@@ -611,26 +642,7 @@ fn usable_models() -> Vec<Value> {
         .get("modelResults")
         .cloned()
         .unwrap_or(Value::Null);
-    app.models()
-        .into_iter()
-        .filter(|model| {
-            let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
-            validated.contains(id)
-                && results.get(id).and_then(|entry| entry.get("ok")) == Some(&json!(true))
-        })
-        .map(|mut model| {
-            let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
-            let chat_only = results
-                .get(id)
-                .and_then(|entry| entry.get("chatOnly"))
-                .unwrap_or(&Value::Bool(false))
-                .clone();
-            if let Some(object) = model.as_object_mut() {
-                object.insert("chatOnly".to_string(), chat_only);
-            }
-            model
-        })
-        .collect()
+    publishable_models(&app.models(), &validated, &results)
 }
 
 /// `attachTranslator`：翻译模型按首选名单挑选，未命中时退化为第一个可用模型并留痕。
@@ -846,14 +858,16 @@ async fn record(
         return;
     }
 
-    {
+    // 只有「从通过集里被摘掉」才算发布集真的收缩：已不在集合里时重复失败不该反复重写配置。
+    let became_unavailable = {
         let mut validated = lock(&app.validated);
         if ok {
             validated.insert(model.to_string());
+            false
         } else {
-            validated.remove(model);
+            validated.remove(model)
         }
-    }
+    };
 
     // 同一次结果只写一次 status.json：两次 update 会让每次变更触发一次原子写与一次事件推送。
     let mut patch = Map::new();
@@ -871,6 +885,13 @@ async fn record(
     // `modelResults` 走锁内逐键写入（不再由这里读整份快照再整体覆盖）。
     let model_result = (!model.is_empty()).then_some((model, &result));
     persist_status(update_with_usage(Value::Object(patch), usage_entry, model_result));
+    // 真实请求把模型判成不可用（含超时）之后，插件配置必须当场收敛：否则 WorkBuddy /
+    // CodeBuddy 里仍留着这一条，用户选中就必然失败，而 `usable_models()`（`/v1/models`
+    // 与 `WB · auto` 的选择域）已经把它排除。批量探测期间不在这里写：每个失败都整写一次
+    // 没有意义，交给批次收尾统一按过滤后的发布集重发（见 `republish_after_probe_batch`）。
+    if became_unavailable && source == "request" && !app.probing.load(Ordering::Relaxed) {
+        sync_published(None, false);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1100,6 +1121,15 @@ fn note_single_probe(model_id: &str, running: bool) {
     update_and_persist(json!({ "singleProbes": pending }));
 }
 
+/// 批量探测收尾是否重写插件配置。
+///
+/// `auto_import` 是启动 / 换 Key 路径的「探测完就导入」；`any_unavailable` 则是过滤保证：
+/// 只要本轮有失败或超时，就必须按过滤后的发布集重发一次，把坏模型从 WorkBuddy / CodeBuddy
+/// 配置里摘掉。全通过的手工读取保持原行为（不替用户自动导入）。
+fn republish_after_probe_batch(auto_import: bool, any_unavailable: bool) -> bool {
+    auto_import || any_unavailable
+}
+
 async fn run_probe_batch(
     selected: Vec<Value>,
     mut pending: Vec<String>,
@@ -1108,6 +1138,9 @@ async fn run_probe_batch(
 ) {
     let app = global_app();
     let all_models = app.models();
+    // 本轮是否有模型被判不可用（失败 / 超时 / 探测当场拒答）。只要有一个，收尾就必须重发
+    // 配置——手工读取（auto_import = false）也不例外，否则失败模型会留在插件配置里。
+    let mut any_unavailable = false;
     for model in selected {
         if app.stopping.load(Ordering::Relaxed) {
             break;
@@ -1135,11 +1168,18 @@ async fn run_probe_batch(
         // 探测与结局记录（通过/仅对话/失败）由两条入口共享的同一段决策负责，见
         // `settle_single_probe`。这里只做批量特有的收尾：无论结局如何都从 pending 摘掉
         // 并回写进度（通过/失败路径原本各自做一遍相同的事）。
-        settle_single_probe(&model, &all_models).await;
+        if matches!(
+            settle_single_probe(&model, &all_models).await,
+            ProbeDisposition::Failed
+        ) {
+            any_unavailable = true;
+        }
         drop_pending(&mut pending, &model_id);
         update_and_persist(json!({ "probe": { "running": true, "pending": pending.clone() } }));
     }
-    if auto_import && !app.stopping.load(Ordering::Relaxed) {
+    if republish_after_probe_batch(auto_import, any_unavailable)
+        && !app.stopping.load(Ordering::Relaxed)
+    {
         sync_published(None, false);
     }
     app.probing.store(false, Ordering::Relaxed);
@@ -1157,11 +1197,19 @@ async fn run_single_probe(model: Value) {
     let all_models = app.models();
 
     let disposition = settle_single_probe(&model, &all_models).await;
-    // 「重新检测」只在明确的通过结局（真通过、仅对话降级成功、兜底确认仅对话）后重新发布；
-    // no_action 与失败不触发——与升级前行为逐字一致。
-    if matches!(disposition, ProbeDisposition::Passed) {
+    if republish_after_single_probe(&disposition) {
         sync_published(None, false);
     }
+}
+
+/// 单模型重检是否重写插件配置：通过要发布；失败/超时也要发布（按过滤后的集合重发，
+/// 把这一条从 WorkBuddy / CodeBuddy 配置里摘掉）。仅「只返回文本、已按仅对话发布」
+/// 沿用升级前行为，不触发重发。
+fn republish_after_single_probe(disposition: &ProbeDisposition) -> bool {
+    matches!(
+        disposition,
+        ProbeDisposition::Passed | ProbeDisposition::Failed
+    )
 }
 
 /// 一次探测的归宿结论（[`settle_single_probe`] 的返回值）。
@@ -1171,7 +1219,7 @@ enum ProbeDisposition {
     /// 模型可用但只返回了文本、未产生动作：按仅对话记录，但**不触发重新发布**（沿用既有行为，
     /// 批量入口由 `auto_import` 统一收口）。
     PassedNoAction,
-    /// 探测失败（或正关停、未记录）：不发布。
+    /// 探测失败（或正关停、未记录）：不进入发布集；单模型入口会按过滤后的集合重发配置。
     Failed,
 }
 
@@ -2659,6 +2707,76 @@ mod tests {
         assert!(
             truthy(&flag),
             "探测元信息必须让 backend.rs 的转写闸门判定为「禁用」：{meta}"
+        );
+    }
+
+    /// 出站发布集只能包含最近一次结果为 `ok === true` 的模型：超时、失败、truthy 非 true、
+    /// 尚未探测一律排除——即使 `validated` 里残留了它们的 id。`WB · auto` 的选择域就是这份
+    /// 集合，因此它也不可能选中被过滤的模型。
+    #[test]
+    fn unavailable_and_timed_out_models_never_reach_the_publish_pool() {
+        let models = vec![
+            json!({ "id": "opencode/ok", "name": "OK" }),
+            json!({ "id": "opencode/slow", "name": "Slow" }),
+            json!({ "id": "opencode/down", "name": "Down" }),
+            json!({ "id": "opencode/unprobed", "name": "Unprobed" }),
+            json!({ "id": "opencode/truthy", "name": "Truthy" }),
+        ];
+        let validated: HashSet<String> = models
+            .iter()
+            .filter_map(|model| model["id"].as_str().map(str::to_string))
+            .collect();
+        let results = json!({
+            "opencode/ok": { "ok": true, "source": "probe" },
+            "opencode/slow": { "ok": false, "code": "timeout", "source": "probe" },
+            "opencode/down": { "ok": false, "code": "model_error", "source": "request" },
+            // 没有结果 = 还没探测过，同样不能发布
+            "opencode/truthy": { "ok": 1, "source": "probe" },
+        });
+
+        let publishable = publishable_models(&models, &validated, &results);
+        let ids: Vec<&str> = publishable
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["opencode/ok"], "只有 ok === true 能进入发布集");
+
+        // WB · auto 只能在这份集合里选：200 次抽样不得落到任何一个被过滤的 id 上。
+        let body = json!({
+            "model": crate::auto::AUTO_MODEL_ID,
+            "messages": [{ "role": "user", "content": "hi" }],
+        });
+        for _ in 0..200 {
+            assert_eq!(
+                crate::auto::auto_select(&body, &publishable).as_deref(),
+                Some("opencode/ok")
+            );
+        }
+    }
+
+    /// 失败/超时模型必须在探测收尾与真实请求失败后都触发一次配置重发：否则过滤只存在于
+    /// 内存与 `/v1/models`，WorkBuddy / CodeBuddy 配置里仍留着旧条目。
+    #[test]
+    fn unavailable_models_force_a_republish_of_the_filtered_pool() {
+        assert!(
+            !republish_after_probe_batch(false, false),
+            "全通过的手工读取保持原行为"
+        );
+        assert!(
+            republish_after_probe_batch(false, true),
+            "手工读取里出现失败/超时就必须摘除"
+        );
+        assert!(republish_after_probe_batch(true, false), "导入收口始终重发");
+        assert!(republish_after_probe_batch(true, true));
+
+        assert!(republish_after_single_probe(&ProbeDisposition::Passed));
+        assert!(
+            republish_after_single_probe(&ProbeDisposition::Failed),
+            "重检失败必须同步摘除"
+        );
+        assert!(
+            !republish_after_single_probe(&ProbeDisposition::PassedNoAction),
+            "仅对话降级沿用升级前行为"
         );
     }
 

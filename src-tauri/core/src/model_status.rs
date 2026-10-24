@@ -145,17 +145,20 @@ pub fn split_namespace(id: &str) -> (&str, &str) {
     }
 }
 
-/// 展示前缀：**只有**注册表里的平台换用其 `label`，其余一律 `OC`。
+/// 展示前缀：注册表平台换用其两字母**短前缀**（`Provider::prefix`，2026-10-15 裁定的简称
+/// 规则：MS / SF / TT / ZP，逐字钉在 `client_prefixes_match_the_declared_short_prefix_table`），
+/// 其余一律回落历史前缀 `OC`。
 ///
-/// 这不是偷懒：`opencode` 与「无命名空间」之外的命名空间在今天的调用面里根本不可能出现
-/// （`free_models_in` 只以 `OPENCODE_NAMESPACE` 或注册表 id 被调用，见 Stage 3），而测试与
-/// 对拍夹具里确实存在 `vendor/gpt` 这类合成 id —— 让它们改前缀就是行为变化。
+/// `opencode` 与「无命名空间」之外的命名空间在今天的调用面里只可能是注册表平台
+/// （`free_models_in` 只以 `OPENCODE_NAMESPACE` 或注册表 id 被调用，见 Stage 3）；测试与
+/// 对拍夹具里的 `vendor/gpt` 这类合成 id 走 OC 回落——对拍夹具没有注册表命名空间的用例，
+/// 本裁定不碰 JS 真相，非注册表形态与写死 `OC · ` 时代逐字节一致。
 fn client_prefix(model: &Value) -> &str {
     let (namespace, _) = split_namespace(
         model.get("id").and_then(Value::as_str).unwrap_or_default(),
     );
     crate::providers::find(namespace)
-        .map(|provider| provider.label)
+        .map(|provider| provider.prefix)
         .unwrap_or(OPENCODE_CLIENT_PREFIX)
 }
 
@@ -288,8 +291,9 @@ mod tests {
         assert_eq!(client_model_id(&json!({})), "OC · undefined");
     }
 
-    /// Stage 2 的零回归承诺：命名空间参数化之后，除注册表平台之外的输出必须与写死 `OC · ` 时
-    /// 逐字节一致（含 `vendor/...` 这类测试用的合成命名空间）。
+    /// Stage 2 的零回归承诺收窄到**非注册表命名空间**：2026-10-15 起注册表平台改用短前缀
+    /// （简称规则，见 `client_prefixes_match_the_declared_short_prefix_table`），其余形态与
+    /// 写死 `OC · ` 时逐字节一致（含 `vendor/...` 这类测试用的合成命名空间）。
     #[test]
     fn client_prefix_follows_the_namespace_but_never_renames_opencode() {
         assert_eq!(
@@ -298,11 +302,19 @@ mod tests {
         );
         assert_eq!(
             client_model_id(&json!({ "id": "zhipuai/glm-4.5-air", "name": "GLM" })),
-            "智谱 · GLM"
+            "ZP · GLM"
         );
         assert_eq!(
             client_model_id(&json!({ "id": "modelscope/foo", "name": "Foo" })),
-            "ModelScope · Foo"
+            "MS · Foo"
+        );
+        assert_eq!(
+            client_model_id(&json!({ "id": "siliconflow-cn/air", "name": "Air" })),
+            "SF · Air"
+        );
+        assert_eq!(
+            client_model_id(&json!({ "id": "tencent-tokenhub/hy", "name": "Hy" })),
+            "TT · Hy"
         );
         // 合成 / 未知命名空间不得改前缀：`sync.rs` 的既有测试与对拍夹具依赖这一点。
         assert_eq!(
@@ -313,6 +325,28 @@ mod tests {
         assert_eq!(client_model_id(&json!({ "id": "bare-key", "name": "B" })), "OC · B");
         assert_eq!(client_model_id(&json!({ "id": "", "name": "E" })), "OC · E");
         assert_eq!(client_model_id(&json!({ "id": 7, "name": "N" })), "OC · N");
+    }
+
+    /// 简称前缀表逐字钉住（2026-10-15 用户裁定）：注册表平台发布/显示一律用两字母短码，
+    /// 分隔符与 `OC · ` 同形（空格 + U+00B7 + 空格）。改任何一格都必须是有意的行为变更。
+    #[test]
+    fn client_prefixes_match_the_declared_short_prefix_table() {
+        let expected = [
+            ("modelscope", "MS"),
+            ("siliconflow-cn", "SF"),
+            ("tencent-tokenhub", "TT"),
+            ("zhipuai", "ZP"),
+        ];
+        for (id, prefix) in expected {
+            let provider =
+                crate::providers::find(id).unwrap_or_else(|| panic!("注册表含 {id}"));
+            assert_eq!(provider.prefix, prefix, "{id} 的短前缀与裁定不符");
+            assert_eq!(
+                client_model_id(&json!({ "id": format!("{id}/demo-key"), "name": "Demo" })),
+                format!("{prefix} · Demo"),
+                "{id} 的客户端 ID 必须用短前缀"
+            );
+        }
     }
 
     /// `free_models_in` 是这些 id 的唯一生产者；拆合必须无损，且对 `opencode/` 前缀与旧的
