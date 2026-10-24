@@ -191,13 +191,15 @@ jobs:
         # 本机 node_modules 常在，所以只有 CI 能暴露它。
         run: npm ci
 
-      - name: 运行面板偏好、操作守卫、AI 引擎、对话记录、桥接事件、更新清单与签名注入单测
-        # 七组都是 node --test（不引测试框架、不联网、不起 Tauri、不碰真实私钥）；
-        # 其中 ai / chat / bridge 三组依赖上一步 npm ci 装好的 @tauri-apps/* 与 vue：
+      - name: 运行面板偏好、操作守卫、AI 引擎、提示词优化、对话记录、桥接事件、更新清单与签名注入单测
+        # 八组都是 node --test（不引测试框架、不联网、不起 Tauri、不碰真实私钥）；
+        # 其中 ai / prompt / chat / bridge 四组依赖上一步 npm ci 装好的 @tauri-apps/* 与 vue：
         #   • src/core/prefs.test.js —— 凭据字段进不了 localStorage、坏数据回落默认值；
         #   • src/core/ops.test.js —— 操作守卫：成功反馈文案、在飞互斥、完成冷却、拒绝节流；
         #   • src/core/ai.test.js —— AI 助手的工具表/参数校验/Key 掩码/请求裁剪不越界，
         #     Markdown 渲染只产出转义后的文本（助手渲染的是模型返回的任意内容）；
+        #   • src/core/prompt.test.js —— 提示词优化：模板与上限、优化 / 迭代 / 对比请求的
+        #     消息组装与数据边界（用户文本不得变成指令）、围栏与首行标签清洗、占位符比对；
         #   • src/core/chatSession.test.js —— IndexedDB 会话存储：字段递归裁剪、落盘前丢弃
         #     工具入参（set_provider_key 的 args.apiKey 是用户 Key 明文）、写盘失败静默降级；
         #   • src/core/bridge.test.js —— 面板与壳的唯一边界：Tauri v2 事件对象形状的解包
@@ -213,6 +215,7 @@ jobs:
           node --test src/core/prefs.test.js
           node --test src/core/ops.test.js
           node --test src/core/ai.test.js
+          node --test src/core/prompt.test.js
           node --test src/core/chatSession.test.js
           node --test src/core/bridge.test.js
           node --test scripts/gen-latest-json.test.mjs

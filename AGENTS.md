@@ -58,6 +58,7 @@ WB Bridge 是一个**跨平台托盘工具**，通过**隔离的 OpenCode 技术
 | 运行面板偏好测试 | `npm run test:prefs` | 仓库根 | = `node --test src/core/prefs.test.js`（白名单/凭据字段投影/视图清洗/坏数据回落/存储不可用降级/超大值拒写/静默检查节流）；只测 `src/core/prefs.js`，不联网、不编译 Rust |
 | 运行操作守卫测试 | `npm run test:ops` | 仓库根 | = `node --test src/core/ops.test.js`（成功反馈文案、在飞互斥、完成冷却、拒绝节流、时钟回拨）；只测 `src/core/ops.js` 纯函数，不联网、不编译 Rust |
 | 运行 AI 助手引擎测试 | `npm run test:ai` | 仓库根 | = `node --test src/core/ai.test.js`（Markdown 渲染的转义面、`maskKey`、`validateToolCall` 的未知工具/缺参/非法平台与模型 id/Key 含换行、**18 条工具表与 `TOOL_META` 自洽 + 写入/高危名单逐字钉住**、`PROVIDER_PAGES` 的主机名逐条对账壳侧 `EXTERNAL_HOSTS`、快照（含能力档位行）与 system prompt 如实转述不编数字、`validateConfig`/`validateSelfConfig` 的分工（含 `WB · auto` 免校验）、`trimRequest` 按整块裁剪不留孤儿 tool 消息、只读 `runTool` 不发请求）；只测 `src/core/ai.js` 纯逻辑，不联网、不起 Tauri |
+| 运行提示词优化测试 | `npm run test:prompt` | 仓库根 | = `node --test src/core/prompt.test.js`（模板与输入上限、优化 / 迭代 / 对比请求的消息组装与数据边界、围栏与首行标签清洗、占位符缺失 / 新增比对、版本链编号、陈旧判定、提交拒绝文案与两档节流）；只测 `src/core/prompt.js` 纯函数，不联网、不起 Tauri |
 | 运行对话记录测试 | `npm run test:chat` | 仓库根 | = `node --test src/core/chatSession.test.js`（IndexedDB 会话存储：字段递归裁剪、落盘前丢弃工具入参、写盘失败静默降级）；只测 `src/core/chatSession.js` 纯逻辑，不联网、不起 Tauri |
 | 运行面板桥接测试 | `npm run test:bridge` | 仓库根 | = `node --test src/core/bridge.test.js`（桩 Tauri IPC：v2 监听回调收到的是事件对象，载荷在 `event.payload` 上——拿错一层 ai-* 四类事件全被滤掉、助手永远转圈）；不联网、不编译 Rust |
 | 运行更新清单生成测试 | `npm run test:manifest` | 仓库根 | = `node --test scripts/gen-latest-json.test.mjs`；用临时产物目录跑真脚本，钉住六平台成功路径与缺平台/缺签名/漏架构后缀/歧义产物等失败路径。**严禁**改成真实联网或读仓库 `src-tauri/target/` 下的产物 |
@@ -71,7 +72,7 @@ WB Bridge 是一个**跨平台托盘工具**，通过**隔离的 OpenCode 技术
 | 版本一致性校验 | `npm run version:check` | 仓库根 | `scripts/check-version.mjs`：7 处版本号必须一致，否则退出 1（含核心 crate） |
 | 版本推进 | `npm run version:set -- <x.y.z>` | 仓库根 | `scripts/bump-version.mjs` 同步改写；执行口径见下方「版本号规则」（每次修改必须递增，豁免情形除外） |
 | 健康检查 | `curl --oauth2-bearer "$(cat "<数据目录>/api-key")" http://127.0.0.1:41980/health` | 任意 | `/health` **同样需要 Bearer 鉴权**（无 key 返回 401；`--oauth2-bearer` 即发送 Bearer 头） |
-| 列出已发布模型 | `curl --oauth2-bearer "<api-key 文件内容>" http://127.0.0.1:41980/v1/models` | 任意 | 返回客户端可见模型（id 形如 `OC · 名称`）；发布集非空时**末位**多一条合成路由 `WB · auto`（池空即不列） |
+| 列出已发布模型 | `curl --oauth2-bearer "<api-key 文件内容>" http://127.0.0.1:41980/v1/models` | 任意 | 返回客户端可见模型（id 形如 `<前缀> · 名称`：注册表平台 `MS`/`SF`/`TT`/`ZP`，其余 `OC`）；发布集非空时**末位**多一条合成路由 `WB · auto`（池空即不列） |
 
 > ⚠ `<数据目录>` 取决于运行方式：**壳运行时**是 Tauri 的 `app_data_dir`（macOS `~/Library/Application Support/app.wbbridge.desktop`，identifier `app.wbbridge.desktop`）；**独立进程运行时**是平台默认目录（macOS `~/Library/Application Support/Buddy Bridge`，见下）。两套目录不要混为一谈。
 
@@ -96,7 +97,7 @@ WB Bridge 是一个**跨平台托盘工具**，通过**隔离的 OpenCode 技术
   - 🔴 **url 里的空格必须写成 `.`**：GitHub 在上传时把 Release 资产名里的空格规范化成点（磁盘 `WB Bridge_1.0.2_x64-setup.exe` → API 里 `WB.Bridge_1.0.2_x64-setup.exe`），而 `/releases/download/<tag>/<空格名>`（含 `%20`）一律 404；脚本因此先 `name.replace(/ /g, '.')` 再 `encodeURIComponent`，CI 另有一步用 API 把清单 url 末段与实际资产名逐条对账，对不上即失败。
 - **macOS 的 `.dmg` 不经 Tauri**：`bundle.targets` 为显式列表 `["app", "nsis", "msi", "appimage", "deb"]`（本平台不适用的目标由打包器跳过），`.dmg` 由 `scripts/make-dmg.sh`（`npm run make:dmg`，已接进 `npm run build` 链尾）用 **hdiutil** 生成 —— Tauri 自带的 create-dmg 末尾要用 AppleScript 美化窗口，无 GUI / 无 Finder 自动化授权的 runner 上会失败。脚本从 `tauri.conf.json` 读 `productName`/`version`，架构取 `TARGET_TRIPLE` 前缀（CI 交叉目标**必须传**，否则 `uname -m` 反映的是 runner 架构，会拿错 bundle 目录并把 x86_64 的包标成 aarch64），产物 `bundle/dmg/<productName>_<version>_<arch>.dmg`；非 macOS 直接跳过返回 0。
 - **macOS 更新包名不含版本也不含架构**（就是 `WB Bridge.app.tar.gz`），两个 mac runner 会往同一 Release 传同名资产、后者静默覆盖前者；CI 的「给 macOS 更新包补架构后缀」步骤因此把它改名为 `WB Bridge_<arch>.app.tar.gz`（`.sig` 同步改名——minisign 签的是内容不是文件名）。
-- CI：`.github/workflows/release.yml`（推 `v*` tag 或手动 dispatch）——**发布不被测试阻塞（2026-10-14 用户裁定）**：`release-gate` 作业（轻量、必须通过）跑 `check-version.mjs` + 标签↔版本闸门，三个 build 作业 `needs: release-gate`；`test` 作业照常跑 `cargo test` + 七组 `node --test`（prefs / ops / ai / chat / bridge / manifest / updater-key），但**只作告警展示、不再是发布前置**。三个平台作业跑 `npm ci` → `npm run tauri:build -- --target <triple>`（签名变量取自 `vars.TAURI_SIGNING_PRIVATE_KEY{,_PASSWORD}`，**不设私钥前置校验步骤**）；macOS 另加 `npm run make:dmg`（带 `TARGET_TRIPLE`）与「给 macOS 更新包补架构后缀」两步；`update-manifest` 作业 = 生成 latest.json → 校验清单 url 指向的资产在 Release 上真的存在 → 产物版本自检 → 上传 `latest.json`。Release 由 `softprops/action-gh-release` 创建（**不用 `tauri-apps/tauri-action`**），`tag_name` 由「读取版本号」步骤现读 `tauri.conf.json` 拼成 `v<版本>`。
+- CI：`.github/workflows/release.yml`（推 `v*` tag 或手动 dispatch）——**发布不被测试阻塞（2026-10-14 用户裁定）**：`release-gate` 作业（轻量、必须通过）跑 `check-version.mjs` + 标签↔版本闸门，三个 build 作业 `needs: release-gate`；`test` 作业照常跑 `cargo test` + 八组 `node --test`（prefs / ops / ai / prompt / chat / bridge / manifest / updater-key），但**只作告警展示、不再是发布前置**。三个平台作业跑 `npm ci` → `npm run tauri:build -- --target <triple>`（签名变量取自 `vars.TAURI_SIGNING_PRIVATE_KEY{,_PASSWORD}`，**不设私钥前置校验步骤**）；macOS 另加 `npm run make:dmg`（带 `TARGET_TRIPLE`）与「给 macOS 更新包补架构后缀」两步；`update-manifest` 作业 = 生成 latest.json → 校验清单 url 指向的资产在 Release 上真的存在 → 产物版本自检 → 上传 `latest.json`。Release 由 `softprops/action-gh-release` 创建（**不用 `tauri-apps/tauri-action`**），`tag_name` 由「读取版本号」步骤现读 `tauri.conf.json` 拼成 `v<版本>`。
 
 ### 环境变量（核心）
 
@@ -145,11 +146,15 @@ wbBridge/
 │   ├── core/prefs.test.js        ← `npm run test:prefs`（node --test，9 用例）
 │   ├── core/ai.js                ← AI 助手引擎（纯逻辑）：工具表与 schema、校验/摘要/掩码、状态快照、system prompt、请求裁剪、受控 Markdown；网络只经 bridge.aiChat
 │   ├── core/ai.test.js           ← `npm run test:ai`（node --test，18 用例）
+│   ├── core/prompt.js            ← 提示词优化纯逻辑：模板、校验、优化 / 迭代 / 对比请求组装、结果清洗、占位符比对、提交守卫
+│   ├── core/prompt.test.js       ← `npm run test:prompt`（node --test，22 用例）
+│   ├── core/promptSession.js     ← 提示词优化会话单例：版本链、流式优化 / 对比、互斥与节流
 │   ├── core/activity.js          ← 活动文案（托盘与面板共用，禁止两套文案）
 │   ├── views/                    ← SideBar.vue（分组导航 + 运行设置）、ModelList.vue、ModelDetails.vue（详情右栏）、
 │   │                                ServiceStatus.vue、MetricsBar.vue、FeedbackBar.vue、
 │   │                                LogsView.vue、UsageView.vue、IntegrationView.vue、AboutView.vue（只读视图）、
-│   │                                AssistantView.vue（AI 助手：回合循环 + 写操作逐条确认弹窗）
+│   │                                AssistantView.vue（AI 助手：回合循环 + 写操作逐条确认弹窗）、
+│   │                                PromptView.vue（提示词优化：模板 / 版本链 / 对比测试）
 │   ├── components/ModelRow.vue   styles/{variables,base}.css  public/logo.svg
 ├── src-tauri/                    ← 全部 Rust 代码都在这里（壳 + 核心）
 │   ├── Cargo.toml                ← 壳 crate wbbridge；依赖 wbbridge-core = { path = "core" } + tokio(rt-multi-thread)
@@ -179,7 +184,7 @@ wbBridge/
 │       │   ├── targets.rs        ← 写入目标：检测、分发、聚合
 │       │   ├── system_proxy.rs   ← 系统代理解析（macOS scutil / Windows 注册表）与子进程环境
 │       │   ├── reasoning.rs      ← 推理档位映射与 WorkBuddy 回退策略
-│       │   ├── model_status.rs   ← 模型状态构造、请求元信息、客户端展示 ID（`OC · 名称`）
+│       │   ├── model_status.rs   ← 模型状态构造、请求元信息、客户端展示 ID（`<前缀> · 名称`：注册表平台 `MS`/`SF`/`TT`/`ZP`，其余 `OC`）
 │       │   ├── platform.rs       ← 数据目录、路径/平台原语、运行时包名
 │       │   ├── atomic.rs         ← 原子替换（重试 → 等待 → 换名，Windows 共享冲突友好）
 │       │   └── json.rs           ← 容错 JSON 解析 + JS 语义原语（truthy/js_stringify/…）
@@ -264,7 +269,7 @@ WorkBuddy
 ```
 models.json → free_models(providers)（免费判定：输入/输出/缓存全 0、输出支持文本、非 deprecated）
   → 逐模型探测（probe_model：工具调用类 + 纯文本类，失败可重试 1 次）
-  → 仅 ok 的模型进入发布集（客户端 ID = `OC · <name>`）
+  → 仅 ok 的模型进入发布集（客户端 ID = `<前缀> · <name>`：注册表平台 `MS`/`SF`/`TT`/`ZP`，其余 `OC`）
   → sync_models（原子写）→ merge_models（保留非本工具条目，只清理/更新 OWNER = 'buddy-bridge-v1' 的条目）
   → 生产发布链走 merge_models_auto（`SyncOptions.auto_route = true`）：发布集非空时在末位追加一条 `WB · auto` 合成路由条目，
     使 WorkBuddy/CodeBuddy 里看得见这个入口；该条目不计入 `sync.count`，也不进 `status.json` 的模型列表
@@ -348,15 +353,16 @@ start_backend
 
 - 核心测试全部用 Rust：`cargo test`（`src-tauri/core/`），分三层——lib 单元测试（`src/*.rs` 内 `#[cfg(test)]`）、`tests/js_parity.rs`（JS↔Rust 对拍，比较 `tests/fixtures/*.json` 里冻结的 `expected`）、`tests/red_lines.rs`（运行期红线守卫：鉴权 / Origin / 权限表 / 隔离配置 / 限额 / 环境白名单）。**等价重构的验证方式就是对拍全绿 + `git diff --stat src-tauri/core/tests/fixtures` 为空，不得改夹具。**
 - 壳（`src-tauri/`）另有 `cargo test --lib`：日志尾部读取、`shell_action_routes_match_the_core_contract`（断言壳 `ADMIN_ROUTES` 与核心 `ACTION_ROUTES` 逐项一致）、退出链路 3 项、`status_read_needed_only_skips_when_mtime_is_known`（`status.json` 轮询快路径：只在拿得到 mtime 且 `(mtime, 长度)` 未变时才允许跳过读取）、**AI 通道**（`ai_chat` 的请求形状与上限守卫、SSE 增量聚合、错误片段收口、`build_ai_body` 只在 tools 非空才声明、自托管 base URL 只回环）。
-- **JS 侧七个套件都用 `node --test`（不引测试框架、不依赖 DOM）**：
+- **JS 侧八个套件都用 `node --test`（不引测试框架、不依赖 DOM）**：
   - `npm run test:prefs` = `node --test src/core/prefs.test.js`：`prefs.js` 的键白名单、值字段投影（凭据类字段绝不落 `localStorage`）、坏数据回落默认值、存储不可用/抛错时静默降级、超大值拒写、静默检查 12h 节流。
   - `npm run test:ops` = `node --test src/core/ops.test.js`：`src/core/ops.js` 的常量合法性、终态动作集合与文案表、在飞互斥文案稳定性、完成冷却窗口与时钟回拨、成功反馈文案边界。
   - `npm run test:ai` = `node --test src/core/ai.test.js`：`ai.js` 的受控 Markdown 渲染（原始 HTML 一律转义、未闭合围栏当代码块）、`maskKey`、`validateToolCall`（未知工具/缺参/非法平台与模型 id/Key 含换行）、**工具表自洽（18 条、schema 名唯一、写工具与高危工具名单逐字钉住、`TOOL_META` 全覆盖）**、`summarizeToolCall`/`toolCallPreview` 的 Key 只以掩码出现、`PROVIDER_PAGES` 的主机名必须逐条落在壳侧 `EXTERNAL_HOSTS`（跨语言对账，防「工具成功但壳拒绝」）、快照（含**能力档位**：支持工具调用 / 支持图片 / 仅对话各几个，以及 `WB · auto` 说明行）与 system prompt（含**更新固定顺序**与「做不到的事」清单）如实转述不编数字、`phaseLabel` 未知阶段原样回显、`validateConfig`（外部端点）与 `validateSelfConfig`（本机大脑：`WB · auto` 免校验、指定 id 须在名单内）的分工、`currentConfig` 默认回落（`selfModel` 默认 `WB · auto`）、`trimRequest` 按整块裁剪不留孤儿 `tool` 消息、只读 `runTool` 不发网络请求。不联网、不起 Tauri。
+  - `npm run test:prompt` = `node --test src/core/prompt.test.js`：`prompt.js` 的模板与输入上限、优化 / 迭代 / 对比请求的消息组装与**数据边界**（待处理文本必须标为数据、不得变成指令）、围栏与首行套话清洗、`{{变量}}` 缺失 / 新增比对、版本链编号、源文与对比结果的陈旧判定、提交拒绝文案、500ms 前沿节流与 800ms 拒绝提示节流。不联网、不起 Tauri。
   - `npm run test:chat` = `node --test src/core/chatSession.test.js`：`chatSession.js` 的 IndexedDB 会话存储——字段递归裁剪、**落盘前丢弃工具入参**（`set_provider_key` 的 `args.apiKey` 是用户 Key 明文）、写盘失败（无 `indexedDB`、隐私模式、配额）静默降级为「这次不记住」。不联网、不起 Tauri。
   - `npm run test:bridge` = `node --test src/core/bridge.test.js`：`bridge.js` 的桩 IPC 单测——**Tauri v2 监听回调收到的是事件对象 `{event, id, payload}`**，载荷在 `event.payload` 上；`aiEvents` 必须解包后再按 chatId 过滤（拿错一层等于把 ai-chunk/ai-done/ai-error/ai-aborted 全部滤掉，助手每一轮永远转圈、连「停止」都失效）。不联网、不编译 Rust。
   - `npm run test:manifest` = `node --test scripts/gen-latest-json.test.mjs`：`latest.json` 六平台成功路径（平台键只由 artifact 目录名决定、url 空格编码、签名取自配对 `.sig`）与各类必须失败/告警的路径；用 `spawnSync` 跑真脚本 + 临时目录，**不联网、不碰真实产物**。
   - `npm run test:updater-key` = `node --test scripts/with-updater-key.test.mjs`：签名注入包装器的取值优先级、内联位两种形态的归一、互斥 `_PATH` 的删除、明文钥显式置空口令、公钥配对只认第一条且只告警、`buildCommand` 入参形态，以及接线断言（`tauri:build` 确实经本包装器、`build` 链 `make:dmg`、`release.yml` 用 `vars.` 且调用 `npm run tauri:build`、`plugins.updater.pubkey` 恰好一条、`bundle.targets` 不含 dmg）。**不联网、不调 tauri CLI、不读 `~/.tauri`、不碰真实私钥**。
-  七组都已进 CI 的 `test` 作业（「运行面板偏好、操作守卫、AI 引擎、对话记录、桥接事件、更新清单与签名注入单测」一步；该作业自 2026-10-14 起只作告警展示，不再是发布前置）。改 `prefs.js` 的白名单/投影、`ai.js` 的工具表/校验/裁剪/渲染、`ops.js` 的守卫判定与文案、`gen-latest-json.mjs` 的平台识别与失败判定、或 `with-updater-key.mjs` 的取值/归一/口令/配对判定，**必须同步改对应测试**。
+  八组都已进 CI 的 `test` 作业（「运行面板偏好、操作守卫、AI 引擎、提示词优化、对话记录、桥接事件、更新清单与签名注入单测」一步；该作业自 2026-10-14 起只作告警展示，不再是发布前置）。改 `prefs.js` 的白名单/投影、`ai.js` 的工具表/校验/裁剪/渲染、`prompt.js` 的模板/校验/请求组装/清洗/守卫判定、`ops.js` 的守卫判定与文案、`gen-latest-json.mjs` 的平台识别与失败判定、或 `with-updater-key.mjs` 的取值/归一/口令/配对判定，**必须同步改对应测试**。
 - **JS↔Rust 对拍已快照化**：`tests/fixtures/*.json` 每个用例带 `expected`（迁移前由 JS 实现录制、已抹平随机 id / `created` / `ms` / sync 文案；沙箱绝对路径在比较前还原成 `$BASE` 占位符，快照因此不绑定机器与目录布局）。默认不启动 Node。需要重新录制时，把仓库外归档 `backup/wbBridge-node-20261001/` 的 `core/` 与 `core-rs-tests-js/`（归档内的目录名，放回后即 `tests/js/`）放回原位，再 `WB_PARITY_RECORD=1 cargo test --test js_parity`；**禁止**在没有 JS 真相的情况下手工编辑 `expected` 来"让测试通过"。
 - **测试严禁真实联网、真实下载**：网络与运行时行为必须通过注入点（`RuntimeOptions` 的 `FetchFn`/`LatestFn`/`ProbeFn`、`SyncIo`、`atomic::replace_with_retry_with`）替换。
 - 新增/修改行为必须补测试；测试名要描述被保护的行为。触碰安全/供应链/数据红线时，优先在 `tests/red_lines.rs` 补断言而不是只写文档。
@@ -366,10 +372,11 @@ start_backend
 
 - 面板 = Vue 3 SFC + Vite 构建产物 `dist/`，由 Tauri WebView 加载；**不得引入 CDN 或任何外部请求**，必须满足 `tauri.conf.json` 的 CSP（`default-src 'self'`、`script-src 'self'`、`connect-src ipc: http://ipc.localhost`）。
 - 与壳的通信只走既有契约：`src/core/bridge.js` 的 `action(name, value)` / `onState(cb)` / `onDismiss(cb)` / `aiChat(request, onDelta)` / `aiAbort()`，底层是 `invoke` **8 个 `core_*` 管理命令**（`core_refresh` / `core_probe` / `core_import` / `core_system_proxy` / `core_shutdown` / `core_provider_status` / `core_set_provider_key` / `core_clear_provider_key`，替代旧 `core_action` 通用代理） + `invoke('restart_core' | 'core_running' | 'data_dir_path' | 'read_log' | 'open_external' | 'ai_chat' | 'ai_abort')` + 事件 `core-status`（轻量快照，含顶层 `usage`）/ `core-activity`（`activity` + `modelResults` 明细，面板必须与最近一次轻量快照合并后再下发，否则逐模型状态永远为空）/ `core-failed` / `ai-chunk`·`ai-done`·`ai-error`·`ai-aborted`（按 `chatId` 分发，**不做帧级合并**，流式增量必须即时上屏）。`ai_chat` 的整份请求必须挂在 **`payload` 键**下（Tauri v2 按参数名绑定，平铺传会直接报「missing required key payload」）。新增只读命令时须同步 `src-tauri/src/lib.rs` 的 `generate_handler`；`capabilities/default.json` 对**应用自有命令无需改动**（自有命令不经 capability 授权），但**插件命令必须在此声明**——updater/process 已加 `updater:default` + `process:allow-restart`（刻意不用 `process:default`：它含 `allow-exit`，会让 WebView 绕过 `quit_app` 的优雅关停链硬杀进程）。**不得新增或改名 IPC 命令/事件**，除非同步更新 `src-tauri/src/lib.rs` 与 `src-tauri/capabilities/default.json`。
-- 面板为只读展示 + 动作触发：不得在面板内直接读写文件、直接访问网络、直接调用 OpenCode。**唯一例外是自动更新**：`checkUpdate/downloadUpdate/relaunchApp`（`src/core/bridge.js`）调的是 Tauri 官方 updater/process 插件，联网发生在 **Rust 侧**（插件命令），不经 WebView `fetch`，因此 CSP 的 `default-src 'self'` 无需放宽；更新状态机集中在 `src/core/update.js`，视图只渲染与触发。**第二例外是 AI 助手**：`aiChat/aiAbort`（`src/core/bridge.js`）走的是**壳侧**的 ureq 请求（`src-tauri/src/lib.rs::ai_chat`），联网同样发生在 Rust 侧、不经 WebView `fetch`，因此 CSP 无需放宽；协议与工具语义集中在 `src/core/ai.js`，视图只负责渲染与确认。
+- 面板为只读展示 + 动作触发：不得在面板内直接读写文件、直接访问网络、直接调用 OpenCode。**第一例外是自动更新**：`checkUpdate/downloadUpdate/relaunchApp`（`src/core/bridge.js`）调的是 Tauri 官方 updater/process 插件，联网发生在 **Rust 侧**（插件命令），不经 WebView `fetch`，因此 CSP 的 `default-src 'self'` 无需放宽；更新状态机集中在 `src/core/update.js`，视图只渲染与触发。**第二例外是 AI 助手**：`aiChat/aiAbort`（`src/core/bridge.js`）走的是**壳侧**的 ureq 请求（`src-tauri/src/lib.rs::ai_chat`），联网同样发生在 Rust 侧、不经 WebView `fetch`，因此 CSP 无需放宽；协议与工具语义集中在 `src/core/ai.js`，视图只负责渲染与确认。**提示词优化复用同一条 AI 通道**（同样是 `aiChat/aiAbort`），不新增第二类网络入口；壳侧只有一个 `activeChatId`，因此它与 AI 助手必须互斥。
 - 动作执行期间必须置忙（按钮禁用 + spinner + 结果反馈），失败必须显示原因。
 - **面板偏好只走 `src/core/prefs.js`**：视图不得直接碰 `localStorage`。新增一项偏好 = 在 `SANITIZERS` 里加一个键 + 加一个**只做字段投影**的 `sanitize*` 函数 + 补对应单测；**严禁**把 `api-key`、`OPENCODE_SERVER_PASSWORD`、WorkBuddy models 文件路径、完整 `status.json`、完整配置对象放进 `localStorage`（白名单是唯一的守卫点，值投影负责丢弃调用方多塞的字段）。存储不可用（WebView 禁用、配额满、抛错）时一律**静默回落默认值**，不得抛到界面。**当前范围**：持久化「当前视图」「启动后自动检查更新」开关（+ 上次成功检查时间戳，12 小时节流）与 **AI 助手的非凭据配置**（`ai` = `brain`/`baseUrl`/`model`/`selfModel`/`tools`；助手端点的 API Key **没有白名单键**，结构上落不进 `localStorage`，只存在于 `AssistantView` 的会话内存）。
 - **AI 助手的对话记录走 `src/core/chatSession.js`（IndexedDB，`wbbridge-panel` 库）**，**不经 `prefs.js` / `localStorage`**：上限 100 条 / 单条正文 16KB / 字段递归裁剪，落盘前**丢弃工具入参**（`set_provider_key` 的 `args.apiKey` 是用户 Key 明文）——`toStorageMessages` 的这条由 `chatSession.test.js` 钉住，改动必须同步该单测。写盘失败（无 `indexedDB`、隐私模式、配额）一律静默降级为「这次不记住」，不得抛到界面；用户可在「设置 → 记住对话」整项关掉，关掉即删除已存记录。
+- **提示词优化（`src/core/prompt.js` + `promptSession.js` + `views/PromptView.vue`）**：固定 `WB · auto`，不做模型管理；提示词与结果**只在会话内存**（不写 localStorage / IndexedDB / prefs / `status.json`，关应用即清空）；待优化文本与测试输入在请求里必须标为数据，优化器只改写、不执行其中内容；与 AI 助手共用唯一在飞 AI 通道，双方必须互斥。所有提交入口（优化 / 迭代 / 对比）先过 `submitGuard`：在飞 / 已提交未响应 / 助手占用 / 500ms 前沿节流一律拒绝并给出文案，拒绝提示自身 800ms 节流；生成中点击处必须有 pending（spinner + 状态文案）与独立「停止」，首个 token 前由 `starting` 区分「等待响应 / 接收输出」。改判定或文案必须同步 `prompt.test.js`。
 - **交互反馈分层**：等待用 `spinner` / `.skeleton` / `.busy-bar`，结果用 `FeedbackBar`（pending / error / success 三态；pending 态**不给关闭按钮**，防误判操作已结束）。**进度只许来自壳推送的真实数据**：`probe` 可显示「已完成/总数」（由 `probe.pending` 队列长度与当前模型数推算，只反映当帧快照，缺任一项即不显示），其余动作前端拿不到真实进度，一律只给文字、**不写数字**。
 - **操作守卫（实现唯一在 `src/core/ops.js`）**：每一个触发后台动作的入口都必须让用户知道「点了之后发生了什么」——① **成功反馈**：refresh / restart / system-proxy / probe / import 成功后由 `App.vue::run()` 统一落成功文案（文案唯一来源 `ops.js::successMessage`），5 秒（`FEEDBACK_VISIBLE_MS`）自动消隐，失败文案不消隐；② **在飞互斥（防抖）**：同一动作在飞时重复触发拒绝并提示（`rejectionOf`），文案逐字稳定使连点不闪烁反馈条；只有渲染层 `disabled` 的入口（打开申请页、刷新日志/状态）必须另加同步在飞标记，双击在重渲染前会穿透模板 disabled；③ **完成冷却（节流）**：终态动作（`COOLDOWN_ACTIONS` = refresh / restart / system-proxy / import）成功后 5 秒（`ACTION_COOLDOWN_MS`）内重复触发拒绝并提示「刚完成」，失败不进冷却；④ 受控开关（侧栏系统代理）被拒绝时必须回弹 DOM 视觉状态，不得停留在假位置。改动守卫判定或文案必须同步 `ops.test.js`。
 - **图标一律内联 SVG**（`stroke="currentColor"`）：禁止字符符号（▦▤◔⇄ⓘ 之类随系统字体变化、基线不齐、无法统一线宽），也禁止外部图标资源或图标字体（CSP `default-src 'self'`）；**每个 `<svg>` 都必须有显式宽高**（由宿主类的 `> svg` 规则给，或自带属性）——HTML 里不带宽高的 inline SVG 默认按 300×150 渲染，会把整行布局顶坏，而这种破损在 `vite build` 与 eslint 上都不留痕迹。
@@ -384,9 +391,9 @@ start_backend
   禁止新增按宽度堆叠的媒体查询或 `<900px` 降级分支——`src/` 内现存的媒体查询只有 `prefers-color-scheme`（`variables.css`）与
   `prefers-reduced-motion`（`base.css`）两处。收起详情有三条等价路径：`Esc`（`App.vue::onKeydown`）、详情头部「收起详情」按钮、
   窗口失焦（`onDismiss`）；收起即清空选中，列表占满主区宽度。
-- **侧栏是分组导航**：分组为「模型 / 运行 / 集成 / 其他」，底部为「运行设置」（系统代理开关 + 版本号）。**7 个入口都是已实现的视图**（视图 ID 的唯一名单是 `prefs.js` 的 `VIEW_IDS`，视图状态由 `src/App.vue` 的 `view` 持有，侧栏按 `current` 高亮并带 `aria-current="page"`）：
+- **侧栏是分组导航**：分组为「模型 / 运行 / 集成 / 其他」，底部为「运行设置」（系统代理开关 + 版本号）。**8 个入口都是已实现的视图**（视图 ID 的唯一名单是 `prefs.js` 的 `VIEW_IDS`，视图状态由 `src/App.vue` 的 `view` 持有，侧栏按 `current` 高亮并带 `aria-current="page"`）：
   模型与服务（`.top` + `.content`，保留主从两栏）、平台（`src/views/ProvidersView.vue`，填写/清除四家平台 Key，只显示「已配置 / 未配置」）、运行日志（`src/views/LogsView.vue`，经 `read_log` 只读拉取日志尾部）、用量与额度（`src/views/UsageView.vue`，渲染 `status.json` 顶层 `usage`）、
-  WorkBuddy 集成（`src/views/IntegrationView.vue`，只读展示配置定位与最近发布结果，唯一动作是复用既有 `import`）、**AI 助手**（`src/views/AssistantView.vue` + `src/core/ai.js`：自然语言入口，只读工具立即执行、写入工具一律先作提案再逐条确认；大脑默认本机 `WB · auto`，也可切外部 OpenAI 兼容端点；端点 Key **只在会话内存**（见 `prefs.js` 的 `ai` 键白名单），**对话记录默认记在本机 IndexedDB**（`src/core/chatSession.js`，可在「设置」关掉、可「清空」；工具入参不落盘）；**模型就位前输入区整块禁用**，横幅给出原因与出路）、关于与更新（`src/views/AboutView.vue`，版本与数据目录只读 + **自动更新区**：启动后静默检查、发现新版本才出现更新条、由用户点「下载并安装」，进度百分比只在上游给出 `contentLength` 时显示，装完点「重启应用」经 `process.relaunch` 走 `ExitRequested` 的有界停止）。
+  WorkBuddy 集成（`src/views/IntegrationView.vue`，只读展示配置定位与最近发布结果，唯一动作是复用既有 `import`）、**提示词优化**（`src/views/PromptView.vue` + `src/core/prompt.js` + `src/core/promptSession.js`：固定本机 `WB · auto`；系统 / 用户提示词、7 个内置模板、版本链与迭代、占位符缺失 / 新增提示、「同一输入分别跑源提示词 / 当前版本」的对比测试；内容只存会话内存；与 AI 助手共用壳侧 AI 通道并互斥；提交有在飞互斥、500ms 前沿节流与逐次拒绝文案）、**AI 助手**（`src/views/AssistantView.vue` + `src/core/ai.js`：自然语言入口，只读工具立即执行、写入工具一律先作提案再逐条确认；大脑默认本机 `WB · auto`，也可切外部 OpenAI 兼容端点；端点 Key **只在会话内存**（见 `prefs.js` 的 `ai` 键白名单），**对话记录默认记在本机 IndexedDB**（`src/core/chatSession.js`，可在「设置」关掉、可「清空」；工具入参不落盘）；**模型就位前输入区整块禁用**，横幅给出原因与出路）、关于与更新（`src/views/AboutView.vue`，版本与数据目录只读 + **自动更新区**：启动后静默检查、发现新版本才出现更新条、由用户点「下载并安装」，进度百分比只在上游给出 `contentLength` 时显示，装完点「重启应用」经 `process.relaunch` 走 `ExitRequested` 的有界停止）。
   **禁止**再出现「规划中」标签、禁用占位或可点击却无响应的假入口。
 - **`usage` 口径（`status.json` 顶层字段）**：`{"since": ISO, "total": {requests, ok, failed}, "models": {"<clientModelId>": {requests, ok, failed, lastMs, avgMs}}}`；只累计 `source == "request"` 的真实客户端请求——探测（`probe`）不计；客户端取消（连接断开）走 `server.rs` 的两条早退路径，**整条不计入**（`requests` 也不 +1，不是记为失败）；启动时从上一份 `status.json` 读回，与 `modelResults` 同法跨重启延续。
 - **`schemaVersion` 升级口径**：向后兼容的**加法式**顶层字段（旧壳忽略未知字段即可）**不**递增两侧 `STATUS_SCHEMA_VERSION`，本次保持 `1`；只有删除 / 改名顶层字段、或改变既有字段语义（非兼容变更）时，才把 `src-tauri/src/lib.rs` 与 `src-tauri/core/src/orchestration.rs` 两侧常量**同步 +1**（规则原文见两处注释）。
@@ -482,9 +489,9 @@ start_backend
 
 | 项 | 值 | 来源 |
 |---|---|---|
-| 版本单一来源 | **1.2.0** | 根 `package.json` 的 `version` |
-| 壳工程同步落点 | **1.2.0** | `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `[package] version` |
-| 核心 crate 版本 | **1.2.0** | `src-tauri/core/Cargo.toml`（`wbbridge-core --version` 输出；随产品版本同步，`version:set`/`version:check` 均覆盖） |
+| 版本单一来源 | **1.2.3** | 根 `package.json` 的 `version` |
+| 壳工程同步落点 | **1.2.3** | `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `[package] version` |
+| 核心 crate 版本 | **1.2.3** | `src-tauri/core/Cargo.toml`（`wbbridge-core --version` 输出；随产品版本同步，`version:set`/`version:check` 均覆盖） |
 
 > `status.json` 内写入的 `version` 是历史沿革值 `0.2.0`，**不属版本落点**，不得在无用户指令的情况下静默改动（见「关键常量」）。
 
@@ -500,7 +507,7 @@ start_backend
   3. 纯文案、注释、日志措辞、去抖等不引入新逻辑分支的打磨——同上；
   4. 移植/迁移过程中的等价实现（行为未变即版本未变），除非用户对该次改动明确指示递增。
 - 用户要求"回退到 X.Y.Z"时，所有落点必须一致改写为用户指定值，本回合内不得再以"我刚改了代码所以 +1"为由推进。
-- **`1.2.x ~ 1.3.x` 段位：2026-10-13 由维护者本人改判，此前的「作废、不得再占用」不再适用**。改判依据是可核对的事实：该段位从未构建、从未打标签（`git tag` 最高只到 `v1.1.15`，`v1.2.0` 不存在），所以把基准版本取到 **1.2.0** 不与任何已发布产物或已推送标签冲突。版本号从此按上面的强制递增规则在 1.2.x 起继续推进；曾写到的 `1.4.x` / `1.5.x` 属同一批从未构建、从未打标签的值，随本次改判一并弃用，**不得**再回到那两个段位。
+- **`1.2.x ~ 1.3.x` 段位：2026-10-13 由维护者本人改判，此前的「作废、不得再占用」不再适用**。改判依据是可核对的事实：该段位从未构建、从未打标签（改判当时 `git tag` 最高只到 `v1.1.15`，`v1.2.0` 尚未创建），所以把基准版本取到 **1.2.0** 不与任何已发布产物或已推送标签冲突。`v1.2.0` 已于 2026-10-14 打标签发布，后续按上面的强制递增规则从 1.2.x 继续推进；曾写到的 `1.4.x` / `1.5.x` 属同一批从未构建、从未打标签的值，随本次改判一并弃用，**不得**再回到那两个段位。
 
 ## 变更与交付约定（面向 Agent）
 

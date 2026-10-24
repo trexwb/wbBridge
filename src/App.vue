@@ -28,12 +28,13 @@ import IntegrationView from './views/IntegrationView.vue'
 import AboutView from './views/AboutView.vue'
 import ProvidersView from './views/ProvidersView.vue'
 import AssistantView from './views/AssistantView.vue'
+import PromptView from './views/PromptView.vue'
 
 const state = ref({})
 const selected = ref(null)
 // 详情无结果时共享同一个空对象：引用稳定，ModelDetails 不被无关状态推送触发更新。
 const EMPTY_RESULT = {}
-// 当前视图：与 SideBar 的 item.id 一一对应（'models' | 'providers' | 'logs' | 'usage' | 'workbuddy' | 'about'）。
+// 当前视图：与 SideBar 的 item.id 一一对应（'models' | 'providers' | 'logs' | 'usage' | 'workbuddy' | 'prompt' | 'assistant' | 'about'）。
 // 视图状态由根组件持有，侧栏只派发切换事件，避免两处各存一份选中态。
 // 初值来自 prefs（上次停留的视图）；非法或已删除的视图名会在读取时回落 'models'。
 const view = ref(loadView())
@@ -396,6 +397,8 @@ onUnmounted(() => {
         @import="run('import')"
       />
       <AboutView v-if="view === 'about'" :state="state" />
+      <!-- 提示词优化：固定走本机核心的 WB · auto，只改写文本；会话状态在 promptSession.js 里跨视图保活 -->
+      <PromptView v-if="view === 'prompt'" :state="state" @navigate="view = $event" />
       <!-- AI 助手：自然语言管理 WB Bridge。写入类操作由视图内的提案确认弹窗把关，
            端点 / 模型名走 prefs，API Key 只在视图会话内存里（不落盘） -->
       <AssistantView v-if="view === 'assistant'" :state="state" :busy="!!busyAction" @navigate="view = $event" />
@@ -415,7 +418,7 @@ main {
   gap: var(--sp-4);
 }
 .top { flex-shrink: 0; display: flex; flex-direction: column; gap: var(--sp-4); }
-/* 非模型视图（运行日志 / 用量与额度 / WorkBuddy 集成 / 关于与更新）：填满主区并自行滚动，
+/* 非模型视图（运行日志 / 用量与额度 / 插件集成 / 提示词优化 / AI 助手 / 关于与更新）：填满主区并自行滚动，
    仍不引入任何宽度断点；.shell 的左右两段结构不受影响。 */
 main > .view {
   flex: 1;

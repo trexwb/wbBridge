@@ -1,5 +1,5 @@
 <script setup>
-// 侧栏：品牌、分组导航（五个视图均已实现，点击即切换）、运行设置。
+// 侧栏：品牌、分组导航（八个视图均已实现，点击即切换）、运行设置。
 // 品牌图标是 public 目录里的静态资源，构建时原样拷到产物根，因此只按 URL 引用、不做 JS import
 // （import public 资源会让 Vite 报 "Assets in public directory cannot be imported from JavaScript"）。
 const logo = '/logo.svg'
@@ -32,12 +32,14 @@ const ICONS = {
   logs: 'M5 6.5h14M5 12h14M5 17.5h8',
   usage: 'M12 4a8 8 0 1 0 8 8h-8V4Z',
   assistant: 'M4.5 5.5h15a1.5 1.5 0 0 1 1.5 1.5v7a1.5 1.5 0 0 1-1.5 1.5H10l-4.5 3.5V15.5H4.5A1.5 1.5 0 0 1 3 14V7a1.5 1.5 0 0 1 1.5-1.5Z',
+  // 提示词优化：主星 + 小星（「把提示词打磨得更好」的直译，与其他导航项不撞形）
+  prompt: 'M12 4.2l1.7 4.6 4.6 1.7-4.6 1.7L12 16.8l-1.7-4.6L5.7 10.5l4.6-1.7z M18 14.6l.8 2.1 2.1.8-2.1.8-.8 2.1-.8-2.1-2.1-.8 2.1-.8z',
   workbuddy: 'M8 8.5h10.5l-3-3M16 15.5H5.5l3 3',
   about: 'M12 4a8 8 0 1 0 0 16 8 8 0 0 0 0-16ZM12 11.2v5M12 8.2v.4',
   proxy: 'M12 4.5v7M7.6 6.8a7 7 0 1 0 8.8 0',
 }
 
-// 导航分组：六个视图均已实现，点击即切换主区；当前视图常驻高亮。
+// 导航分组：八个视图均已实现，点击即切换主区；当前视图常驻高亮。
 const groups = [
   {
     title: '模型',
@@ -60,6 +62,7 @@ const groups = [
   {
     title: '其他',
     items: [
+      { id: 'prompt', icon: 'prompt', label: '提示词优化' },
       { id: 'assistant', icon: 'assistant', label: 'AI 助手' },
       { id: 'about', icon: 'about', label: '关于与更新' },
     ],
@@ -216,7 +219,7 @@ h1 { font-size: 20px; margin: 0 0 6px; letter-spacing: -.6px; }
   transform: translateY(-50%);
   transition: height var(--dur-2) var(--ease-emphasis), opacity var(--dur-2) var(--ease-standard);
 }
-/* 导航项均可点击（五个视图都已实现）：hover 用主色淡底提示可点，当前视图常驻高亮。 */
+/* 导航项均可点击（八个视图都已实现）：hover 用主色淡底提示可点，当前视图常驻高亮。 */
 .nav-item:hover:not(.current) { background: var(--nav-hover-bg); color: var(--text); }
 .nav-item.current {
   background: var(--nav-active-bg);
