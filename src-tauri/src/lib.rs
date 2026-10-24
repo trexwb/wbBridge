@@ -755,6 +755,18 @@ fn read_log(app: AppHandle) -> Result<Value, String> {
     read_log_tail(&dir.join(LOG_FILE_NAME), LOG_TAIL_BYTES, LOG_TAIL_LINES)
 }
 
+/// 清空运行日志：把数据目录下的日志文件截断为空。
+///
+/// 边界与 `read_log` 一致：路径由壳按 `app_data_dir` + 固定文件名拼出，**不接受调用方传路径**；
+/// 只截断当前日志文件，不碰轮转存档 `opencode.log.previous`（面板不读它，留着便于排查旧问题）。
+/// 核心以 append 模式持有该文件（`orchestration.rs`），外部截断后新写入仍从新的末尾追加，
+/// 无需通知核心。文件不存在（核心还没写过日志）视为本就为空，不报错。
+#[tauri::command]
+fn clear_log(app: AppHandle) -> Result<Value, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    clear_log_file(&dir.join(LOG_FILE_NAME))
+}
+
 /// 读取日志尾部（纯函数，便于单测）。
 ///
 /// 实现要点：
@@ -800,6 +812,18 @@ fn read_log_tail(path: &Path, max_bytes: u64, max_lines: usize) -> Result<Value,
         "truncated": truncated,
         "bytes": total,
     }))
+}
+
+/// 截断日志文件（纯函数，便于单测）：`write + truncate` 在打开文件这一步就把它清成空。
+fn clear_log_file(path: &Path) -> Result<Value, String> {
+    match fs::OpenOptions::new().write(true).truncate(true).open(path) {
+        Ok(_file) => Ok(serde_json::json!({ "cleared": true })),
+        // 与 read_log 的缺失语义一致：核心还没写过日志，本就没有要清的内容。
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(serde_json::json!({ "cleared": false }))
+        }
+        Err(error) => Err(format!("清空运行日志失败：{error}")),
+    }
 }
 
 // ── AI 助手：OpenAI 兼容端点的流式转发 ───────────────────────────────
@@ -1330,6 +1354,7 @@ pub fn run() {
             core_running,
             data_dir_path,
             read_log,
+            clear_log,
             open_external,
             ai_chat,
             ai_abort
@@ -1450,6 +1475,24 @@ mod tests {
         let value = read_log_tail(&log.0, 1024, 2).expect("读取多行日志");
         assert_eq!(value["truncated"], true);
         assert_eq!(value["text"], "c\nd");
+    }
+
+    /// 清空有内容的日志：文件被截断为空，且随后的 read_log_tail 读到空日志。
+    #[test]
+    fn clear_log_truncates_the_existing_log_file() {
+        let log = TempLog::new("clear", "line one\nline two\n");
+        let value = clear_log_file(&log.0).expect("清空日志");
+        assert_eq!(value["cleared"], true);
+        let after = read_log_tail(&log.0, 1024, 10).expect("清空后读取日志");
+        assert_eq!(after["text"], "");
+        assert_eq!(after["bytes"], 0);
+    }
+
+    /// 文件不存在（核心还没写过日志）时清空按 no-op 处理：不报错、cleared 为 false。
+    #[test]
+    fn clear_log_missing_file_is_a_noop_without_error() {
+        let value = clear_log_file(&absent_log_path("clear-missing")).expect("缺失日志不得报错");
+        assert_eq!(value["cleared"], false);
     }
 
     /// 壳的动作表必须与核心的契约表逐项一致：任一侧改名或漏项，面板动作会在回环 HTTP 上 404，

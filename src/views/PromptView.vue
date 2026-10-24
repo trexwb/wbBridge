@@ -935,7 +935,8 @@ onBeforeUnmount(() => {
 .prompt-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--sp-4); flex-wrap: wrap; }
 .prompt-heading h2 { margin: 0; font-size: var(--fs-xl); }
 .prompt-heading p { margin: var(--sp-1) 0 0; color: var(--muted-strong); font-size: var(--fs-sm); line-height: var(--lh-loose); max-width: 720px; }
-.prompt-head-actions { display: flex; align-items: center; gap: var(--sp-2); }
+/* 标题行也要能换行：窄窗口下「模型胶囊 + 清空会话」不再挤成一行顶出头部 */
+.prompt-head-actions { display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-2); }
 .prompt-model {
   display: inline-flex;
   align-items: center;
@@ -965,14 +966,24 @@ onBeforeUnmount(() => {
 }
 .prompt-banner > svg { width: 16px; height: 16px; flex-shrink: 0; margin-top: 2px; color: var(--orange); }
 .prompt-banner-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+/* 出口按钮不参与收缩：窄窗口下让说明文字多换几行，而不是把按钮压成两三个字 */
+.prompt-banner > button { flex-shrink: 0; }
 .prompt-banner-body strong { font-size: var(--fs-sm); color: var(--text); }
 .prompt-banner-body p { margin: 0; font-size: var(--fs-xs); line-height: var(--lh-loose); color: var(--muted-strong); }
 
+/* 双栏→单栏用 auto-fit 自适应，不引入任何宽度断点（与 .view 的约定一致）：
+   窗口拉窄到装不下两栏时自动退成堆叠单列，由 main > .view 统一纵向滚动。
+   每栏下限写 min(360px, 100%)：容器比 360px 还窄时下限跟着收缩，网格不会把
+   内容顶出去、也就不会出现横向滚动条。 */
 .prompt-workspace {
-  flex: 1;
+  flex: 1 0 auto;
   min-height: 460px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(min(360px, 100%), 1fr));
+  /* 行高下限必须是 min-content：只写 1fr 时窗口压矮，行会被压到内容以下，
+     按钮组就掉到 .prompt-pane 的边框外面去了（用户看到的「按钮超出边框」）。
+     有余量时再按 1fr 拉满主区高度，两者不冲突。 */
+  grid-auto-rows: minmax(min-content, 1fr);
   gap: var(--sp-4);
 }
 .prompt-pane {
@@ -986,6 +997,9 @@ onBeforeUnmount(() => {
   border-radius: var(--radius-l);
   background: var(--surface-raised);
   box-shadow: var(--shadow-s);
+  /* 兜底：极端矮窗口下宁可这一栏内部滚动，也不让内容溢出到边框外。
+     pane 有 16px 内距，textarea 的焦点环（2px 描边 + 2px 外扩）落不进裁剪区。 */
+  overflow-y: auto;
 }
 .prompt-pane-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--sp-2); }
 .prompt-pane-head h3 { margin: 0; font-size: var(--fs-base); }
@@ -993,7 +1007,8 @@ onBeforeUnmount(() => {
 .prompt-count { font-size: var(--fs-xs); color: var(--muted-strong); white-space: nowrap; font-variant-numeric: tabular-nums; }
 .prompt-count.over { color: var(--orange); font-weight: 600; }
 
-.prompt-modes { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--sp-2); }
+/* 与工作区同一套 auto-fit：窄栏里两个模式按钮不再各自挤成 ~150px 的两行半 */
+.prompt-modes { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(180px, 100%), 1fr)); gap: var(--sp-2); }
 .prompt-mode {
   display: flex;
   flex-direction: column;
@@ -1026,9 +1041,11 @@ onBeforeUnmount(() => {
   resize: none;
   transition: border-color var(--dur-1) var(--ease-standard);
 }
-.prompt-source { flex: 1 1 220px; min-height: 180px; }
-.prompt-requirement { min-height: 66px; max-height: 110px; }
-.prompt-output { flex: 1 1 260px; min-height: 220px; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+/* 三个输入框的下限是整栏能否装下的关键：下限太高，窗口一压矮，剩下的按钮组
+   就被顶出 pane。这里给的是「还能写字」的底线，宽裕时由 flex-grow 继续长。 */
+.prompt-source { flex: 1 1 220px; min-height: 120px; }
+.prompt-requirement { min-height: 58px; max-height: 110px; }
+.prompt-output { flex: 1 1 260px; min-height: 150px; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
 .prompt-source:hover:not(:disabled),
 .prompt-requirement:hover:not(:disabled),
 .prompt-output:hover:not(:disabled) { border-color: color-mix(in srgb, var(--green) 30%, var(--line)); }
@@ -1067,7 +1084,9 @@ onBeforeUnmount(() => {
   border: 1px solid var(--line);
 }
 .prompt-vars em { font-style: normal; color: var(--muted-strong); }
-.prompt-vars code { max-width: 100%; overflow-wrap: anywhere; }
+/* 占位符名可能很长（含路径 / 下划线）：两个位置都要能断，否则横向撑破这一栏 */
+.prompt-vars code,
+.prompt-var-warn code { max-width: 100%; overflow-wrap: anywhere; }
 
 .prompt-label-row { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); }
 .prompt-label { display: flex; align-items: center; gap: 6px; font-size: var(--fs-sm); font-weight: 600; }
@@ -1132,8 +1151,11 @@ onBeforeUnmount(() => {
 .prompt-notice,
 .prompt-var-warn {
   margin: 0;
+  min-width: 0;
   font-size: var(--fs-sm);
   line-height: var(--lh-base);
+  /* 上游报错常带一串 URL / 模型 id：不折断就会横向撑破这一栏 */
+  overflow-wrap: anywhere;
 }
 .prompt-error { padding: var(--sp-2) var(--sp-3); border-radius: var(--radius-s); background: var(--orange-bg); color: var(--orange); }
 .prompt-notice {
@@ -1148,7 +1170,7 @@ onBeforeUnmount(() => {
 .prompt-notice > span { flex: 1; min-width: 0; }
 .prompt-notice-close { padding: 4px; flex-shrink: 0; }
 .prompt-notice-close > svg { width: 12px; height: 12px; display: block; }
-.prompt-var-report { display: flex; flex-direction: column; gap: 4px; padding: var(--sp-2) var(--sp-3); border-radius: var(--radius-s); background: var(--orange-bg); }
+.prompt-var-report { display: flex; flex-direction: column; gap: 4px; min-width: 0; padding: var(--sp-2) var(--sp-3); border-radius: var(--radius-s); background: var(--orange-bg); }
 .prompt-var-warn { color: var(--orange); font-size: var(--fs-xs); }
 
 .prompt-empty {
@@ -1234,10 +1256,13 @@ onBeforeUnmount(() => {
   text-align: center;
 }
 .prompt-compare-empty p { margin: 0; max-width: 420px; font-size: var(--fs-xs); line-height: var(--lh-loose); }
-.prompt-compare-out { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--sp-3); min-width: 0; }
+/* 两份输出并排看才有意义，但窄窗口下并排会把两边各挤到 ~150px。
+   用 auto-fit：装得下就并排，装不下自动上下排（比强行并排看不清差别强）。 */
+.prompt-compare-out { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr)); gap: var(--sp-3); min-width: 0; }
 .prompt-compare-col { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .prompt-compare-col-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); }
-.prompt-compare-col h4 { margin: 0; font-size: var(--fs-sm); font-weight: 600; }
+/* 标题要能缩：否则「V3 的输出」+ 复制按钮一起把这一行顶出栏外 */
+.prompt-compare-col h4 { margin: 0; min-width: 0; font-size: var(--fs-sm); font-weight: 600; overflow-wrap: anywhere; }
 .prompt-copy { padding: 2px 8px; font-size: var(--fs-xs); }
 /* 模型输出按原文呈现：不渲染 Markdown，两边才真的是「同一份东西看差别」 */
 .prompt-compare-text {

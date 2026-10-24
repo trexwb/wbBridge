@@ -45,18 +45,19 @@
 `core_provider_status`/`core_set_provider_key`/`core_clear_provider_key`，取代旧 `core_action(action, payload)`
 通用代理：动作名不再是任意字符串，每条只映射一个 `/admin/*` 路由，参数经 serde 类型校验，路由与载荷语义不变）
 → `admin_route()`/`admin_call()`；例外是面板的 `restart` 动作，它不经 `/admin/*`，直接映射为壳命令
-`restart_core`。壳另有 **六个**命令（均不经 `/admin/*`）：
+`restart_core`。壳另有 **七个**命令（均不经 `/admin/*`）：
 
 | 壳命令 | 载荷 | 返回 / 语义 |
 |---|---|---|
 | `core_running` | 无 | 查询核心是否在运行 |
 | `data_dir_path` | 无 | 取当前数据目录路径 |
 | `read_log` | **无参数** | 只读数据目录下 `opencode.log` 的**尾部**，返回 `{ text, truncated, bytes }`；尾部截断 256KB / 最多 1200 行，不读 `opencode.log.previous`；不接受路径入参、不写任何文件 |
+| `clear_log` | **无参数** | 清空数据目录下 `opencode.log`（`write + truncate` 打开即截断为空），返回 `{ cleared }`；文件不存在视为本就为空（`cleared: false`，不报错）；不接受路径入参、只碰这一个固定文件名、不删轮转存档 `opencode.log.previous`；核心以 append 持有该文件，截断后新写入照常从末尾追加 |
 | `open_external` | `url`（仅 https） | 用系统浏览器打开外链；安全边界 = 仅 https + RFC 3986 字符白名单 + 精确主机名名单（`EXTERNAL_HOSTS`，四家平台的官方 Key 申请页），URL 只以命令行参数传给系统打开器（不经 shell 解析） |
 | `ai_chat` | **`payload`**（整份请求挂在这一个键下：`{ chatId, baseUrl, apiKey, selfHosted, model, messages, tools, tool_choice }`） | **AI 助手唯一的网络出口**：先收形状（`AI_MAX_MESSAGES = 40` / `AI_MAX_MESSAGE_CHARS = 30000` / `AI_MAX_TOOLS = 40`，端点必须 https 或本机 http），再由后台线程用 ureq 发请求、逐行解 SSE；`selfHosted` 时**端点与 Bearer 由壳自己从运行中的核心解析**（面板无从知道 api-key）；`build_ai_body` 只在 `tools` 非空时才声明 `tools` 与 `tool_choice`。Tauri v2 按参数名绑定，平铺传会直接报「missing required key payload」 |
 | `ai_abort` | `chatId` | 只置该次流式请求的取消标志，断连由流式线程下次读取时检查完成；不结束核心、不碰其他会话 |
 
-新增 / 改名只读命令必须同步 `src-tauri/src/lib.rs` 的 `generate_handler`；自有命令不经 capability 授权，
+新增 / 改名命令必须同步 `src-tauri/src/lib.rs` 的 `generate_handler`；自有命令不经 capability 授权，
 `capabilities/default.json` 无需改动。
 
 **面板的第三条边界：壳回推的 AI 流式事件**（`ai_chat` 的返回只有「已受理」，内容一律经事件回推；四个事件的 payload 都带 `chatId`，面板按它过滤，避免上一轮迟到的事件串台）：

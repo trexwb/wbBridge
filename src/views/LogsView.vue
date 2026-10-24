@@ -1,8 +1,10 @@
 <script setup>
-// 运行日志：只读展示数据目录下核心日志的尾部。
-// 面板不读文件也不拼路径：壳侧 read_log 自己定位数据目录下的日志文件，只回尾部内容。
-import { computed, onMounted, ref } from 'vue'
-import { readLog } from '../core/bridge.js'
+// 运行日志：只读展示数据目录下核心日志的尾部，另提供一个「清空」动作。
+// 面板不读文件也不拼路径：壳侧 read_log 自己定位数据目录下的日志文件，只回尾部内容；
+// 清空则经壳命令 clear_log 把同一文件截断为空，同样不接受路径参数。
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { clearLog, readLog } from '../core/bridge.js'
+import { FEEDBACK_VISIBLE_MS } from '../core/ops.js'
 
 const log = ref(null) // { text, truncated, bytes }
 const error = ref(null)
@@ -41,6 +43,63 @@ async function load() {
 }
 
 onMounted(load)
+
+// ── 清空：两段式确认（与 PromptView 的会话清空同一模式）──────────
+// 清空不可撤销：第一次点击只进入「确认清空？」态，3 秒不确认自动退回；
+// 双击的两次点击间隔通常 < 300ms，CONFIRM_ARM_MS 最短间隔防止顺手双击直接执行掉。
+const CONFIRM_ARM_MS = 400
+const clearing = ref(false)
+const clearArmed = ref(false)
+let clearArmedAt = 0
+let clearTimer = 0
+// 清空结果反馈：成功 5 秒自动消隐（沿用全局 FEEDBACK_VISIBLE_MS），失败常驻直到下一次操作。
+const clearNotice = ref(null) // { text, error }
+let clearNoticeTimer = 0
+
+function showClearNotice(text, error) {
+  if (clearNoticeTimer) clearTimeout(clearNoticeTimer)
+  clearNoticeTimer = 0
+  clearNotice.value = { text, error }
+  if (!error) {
+    clearNoticeTimer = setTimeout(() => {
+      clearNoticeTimer = 0
+      // 只清成功提示：期间若出现失败提示，clearNotice 已被换成失败对象，不能再置 null。
+      if (clearNotice.value && !clearNotice.value.error) clearNotice.value = null
+    }, FEEDBACK_VISIBLE_MS)
+  }
+}
+
+async function onClear() {
+  // 同步防抖：清空请求在空中时不接受再次触发（确认态已被第一次点击重置，这里兜底）。
+  if (clearing.value) return
+  if (!clearArmed.value) {
+    clearArmed.value = true
+    clearArmedAt = Date.now()
+    clearTimer = setTimeout(() => { clearArmed.value = false }, 3000)
+    return
+  }
+  if (Date.now() - clearArmedAt < CONFIRM_ARM_MS) return
+  if (clearTimer) clearTimeout(clearTimer)
+  clearTimer = 0
+  clearArmed.value = false
+  clearing.value = true
+  const response = await clearLog()
+  clearing.value = false
+  if (response.ok) {
+    // 壳已把文件截断为空：本地同步置空即可，不再自动拉一次——核心可能立刻写入新行，
+    // 要看最新内容请点「刷新」；清空动作本身只负责把旧的清掉。
+    log.value = { text: '', truncated: false, bytes: 0 }
+    error.value = null
+    showClearNotice('运行日志已清空。', false)
+  } else {
+    showClearNotice(`清空运行日志失败：${response.error}`, true)
+  }
+}
+
+onBeforeUnmount(() => {
+  if (clearTimer) clearTimeout(clearTimer)
+  if (clearNoticeTimer) clearTimeout(clearNoticeTimer)
+})
 </script>
 
 <template>
@@ -48,12 +107,32 @@ onMounted(load)
     <header>
       <div>
         <h2>运行日志</h2>
-        <p class="subtitle">核心服务的运行记录，只读展示。</p>
+        <p class="subtitle">核心服务的运行记录，可刷新，也可整段清空。</p>
       </div>
-      <button id="reload-log" :disabled="loading" @click="load">
-        <span v-if="loading" class="spinner" />刷新
-      </button>
+      <div class="header-actions">
+        <button
+          id="clear-log"
+          type="button"
+          class="ghost"
+          :disabled="loading || clearing || !log?.text"
+          :aria-busy="String(clearing)"
+          :title="clearArmed ? '再次点击确认清空；清空后不可恢复' : '清空日志内容（不可恢复）'"
+          @click="onClear"
+        >
+          <span v-if="clearing" class="spinner" />{{ clearArmed ? '确认清空？' : '清空' }}
+        </button>
+        <button id="reload-log" :disabled="loading || clearing" @click="load">
+          <span v-if="loading" class="spinner" />刷新
+        </button>
+      </div>
     </header>
+
+    <!-- 清空结果反馈：成功自动消隐，失败常驻（与全局反馈条的分层一致） -->
+    <p
+      v-if="clearNotice"
+      :class="['notice', { error: clearNotice.error }]"
+      :role="clearNotice.error ? 'alert' : 'status'"
+    >{{ clearNotice.text }}</p>
 
     <div v-if="error" class="notice error" role="alert">
       <svg class="notice-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
@@ -82,7 +161,7 @@ onMounted(load)
         </p>
         <pre v-if="log?.text" class="log">{{ shownText }}</pre>
         <p v-else-if="log" class="notice">
-          日志为空：核心尚未写入任何内容（日志文件由核心启动时创建）。
+          日志为空：核心尚未写入内容（日志文件由核心启动时创建），或日志刚被清空；新的输出会从末尾追加。
         </p>
       </template>
     </template>
@@ -93,6 +172,7 @@ onMounted(load)
 
 <style scoped>
 header { display: flex; justify-content: space-between; gap: var(--sp-3); align-items: center; }
+.header-actions { display: flex; gap: var(--sp-2); align-items: center; }
 .subtitle { margin: 0; color: var(--muted-strong); font-size: var(--fs-sm); }
 .meta {
   margin: 0;
