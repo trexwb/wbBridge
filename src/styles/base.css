@@ -25,9 +25,22 @@ body {
 ::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--muted) 58%, transparent); background-clip: content-box; }
 ::-webkit-scrollbar-corner { background: transparent; }
 
+/* ── 入场动效原子件 ────────────────────────────────────────────────
+   面板是常驻工作区而非落地页：只在「内容刚出现」时播一次，绝不留循环。
+   位移取 4px——足够让人看出「新内容进来了」，又不会在密集列表里晃眼。 */
+@keyframes enter-rise {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes enter-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
 /* ── 按钮 ──────────────────────────────────────────────────────────
    hover 只改背景 / 边框（不做位移，避免密集列表里抖动）；
-   active 按压回弹；disabled 明确降透明度并去掉指针语义。 */
+   active 按压回弹；disabled 明确降透明度并去掉指针语义。
+   opacity 也进过渡：置忙 / 置灰时是渐变而不是闪一下。 */
 button {
   font: inherit;
   color: var(--text);
@@ -41,6 +54,7 @@ button {
               border-color var(--dur-1) var(--ease-standard),
               color var(--dur-1) var(--ease-standard),
               box-shadow var(--dur-2) var(--ease-standard),
+              opacity var(--dur-2) var(--ease-standard),
               transform var(--dur-1) var(--ease-standard);
 }
 button:hover:not(:disabled) {
@@ -87,13 +101,15 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 }
 @keyframes shimmer { from { background-position: 100% 0; } to { background-position: 0 0; } }
 
-/* 不确定进度条：只表达「进行中」，不谎报百分比 */
+/* 不确定进度条：只表达「进行中」，不谎报百分比。
+   出现时淡入一次——它常常是「点完按钮才插入」的元素，硬插入会像界面跳了一下。 */
 .busy-bar {
   position: relative;
   height: 3px;
   border-radius: 999px;
   background: color-mix(in srgb, var(--green) 14%, transparent);
   overflow: hidden;
+  animation: enter-fade var(--dur-2) var(--ease-standard);
 }
 .busy-bar::after {
   content: "";
@@ -146,6 +162,9 @@ button:disabled { opacity: .48; cursor: not-allowed; }
   *, *::before, *::after {
     transition-duration: 1ms !important;
     animation-duration: 1ms !important;
+    /* 错峰延迟也必须归零：入场动画用 backwards 填充，延迟期间元素停在 opacity:0，
+       不归零就等于让列表一项项「迟到出现」 */
+    animation-delay: 0ms !important;
     animation-iteration-count: 1 !important;
   }
   .spinner, .skeleton, .busy-bar::after, .progress.is-active > i::after {

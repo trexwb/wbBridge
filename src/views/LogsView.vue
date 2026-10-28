@@ -200,6 +200,8 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
   overflow-wrap: break-word;
   tab-size: 2;
   user-select: text;
+  /* 骨架 → 正文的交接：淡入而不是直接替换，读起来是「读到了」而不是「换了一屏」 */
+  animation: enter-fade var(--dur-2) var(--ease-standard);
 }
 /* 首次读取的骨架：行宽错落，形似日志正文，而不是一排整齐色块 */
 .log-skeleton {

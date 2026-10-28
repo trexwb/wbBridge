@@ -51,7 +51,6 @@
   --sidebar-w: 208px;
   /* 详情列：常驻右栏，宽 300–360px 随可用宽度自适应（不做宽度触发的降级） */
   --details-w: clamp(300px, 45%, 360px);
-  --content-max: 1180px;
 
   /* 语义色（浅色）：徽章 / 开关 / 状态灯 */
   --badge-reason-fg: #815a99;
@@ -73,6 +72,8 @@
   --dur-1: 120ms;
   --dur-2: 180ms;
   --dur-3: 260ms;
+  /* 逐项错峰步长：列表 / 导航挂载时按 --i 递增延迟（上限 8 级，总时长 < 0.5s） */
+  --stagger-step: 24ms;
   --ease-standard: cubic-bezier(.2, 0, 0, 1);
   --ease-enter: cubic-bezier(.22, .61, .36, 1);
   --ease-emphasis: cubic-bezier(.32, .72, 0, 1);

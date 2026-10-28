@@ -21,7 +21,9 @@ const isError = computed(() => props.phase === 'error')
 <template>
   <div class="service-status" :class="{ error: isError }" role="status" aria-live="polite">
     <span class="dot" :class="{ error: isError }" />
-    <span class="status-text">{{ text }}</span>
+    <!-- 文案随 key 变化重挂载：新阶段淡入，旧文案即刻让位（不做 out-in，
+         否则活动文案连续更新时会出现「整行暂时空白」的空档）。 -->
+    <span :key="text" class="status-text">{{ text }}</span>
     <!-- 重启期间按钮转 spinner 防连点；文案保持「重试」，动作本身没变 -->
     <button
       v-if="isError"
@@ -70,6 +72,6 @@ const isError = computed(() => props.phase === 'error')
   animation: none;
 }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
-.status-text { flex: 1; min-width: 0; }
+.status-text { flex: 1; min-width: 0; animation: enter-fade var(--dur-2) var(--ease-standard); }
 button { margin-left: auto; flex-shrink: 0; }
 </style>

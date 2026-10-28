@@ -68,6 +68,10 @@ const groups = [
     ],
   },
 ]
+
+// 入场错峰的序号：按导航的真实阅读顺序编号，不按下标现算——分组结构以后再变，
+// 延迟顺序也必须仍是「从上到下依次出现」，而不是按分组各自从 0 开始。
+const NAV_INDEX = new Map(groups.flatMap((group) => group.items).map((item, i) => [item.id, i]))
 </script>
 
 <template>
@@ -87,6 +91,7 @@ const groups = [
               :class="{ current: item.id === current }"
               :aria-current="item.id === current ? 'page' : undefined"
               :title="item.id === current ? `${item.label}（当前视图）` : `切换到${item.label}`"
+              :style="{ '--i': NAV_INDEX.get(item.id) }"
               @click="$emit('select', item.id)"
             >
               <svg
@@ -201,6 +206,11 @@ h1 { font-size: 20px; margin: 0 0 6px; letter-spacing: -.6px; }
   border: 1px solid transparent;
   border-radius: var(--radius-s);
   color: var(--muted-strong);
+  /* 挂载时自下而上依次浮现（侧栏常驻，只在应用启动时播一次）。
+     fill-mode 用 backwards 而非 both：动画结束后不保留 transform，
+     否则会压掉 button:active 的按压缩放。 */
+  animation: enter-rise var(--dur-3) var(--ease-enter) backwards;
+  animation-delay: calc(var(--i, 0) * var(--stagger-step));
   transition: background var(--dur-2) var(--ease-standard),
               color var(--dur-2) var(--ease-standard),
               box-shadow var(--dur-2) var(--ease-standard);
