@@ -60,7 +60,7 @@ function ms(value) {
         </tr>
       </thead>
       <tbody>
-        <tr v-for="row in rows" :key="row.id">
+        <tr v-for="(row, i) in rows" :key="row.id" :style="{ '--i': Math.min(i, 8) }">
           <td class="mono">{{ row.id }}</td>
           <td class="num">{{ row.requests ?? 0 }}</td>
           <td class="num">{{ row.ok ?? 0 }}</td>
@@ -129,7 +129,13 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
 .usage thead th:last-child { border-top-right-radius: var(--radius-s); }
 .usage tbody tr:last-child td:first-child { border-bottom-left-radius: var(--radius-s); }
 .usage tbody tr:last-child td:last-child { border-bottom-right-radius: var(--radius-s); }
-.usage tbody tr { transition: background var(--dur-1) var(--ease-standard); }
+/* 逐行淡入：表格行只在首次出现时播一次（计数更新是同 key 原地改文本，不会重播）。
+   只动 opacity 不动 transform —— 表格行做位移会牵动行盒与 sticky 表头的对齐。 */
+.usage tbody tr {
+  animation: enter-fade var(--dur-3) var(--ease-standard) backwards;
+  animation-delay: calc(var(--i, 0) * var(--stagger-step));
+  transition: background var(--dur-1) var(--ease-standard);
+}
 .usage tbody tr:hover { background: color-mix(in srgb, var(--row) 88%, var(--green) 12%); }
 .usage tr:last-child td { border-bottom: none; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }

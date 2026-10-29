@@ -435,9 +435,10 @@ main > .view {
   flex-direction: column;
   gap: var(--sp-4);
   /* 宽度把内边距吃掉的那 8px 补回来：`box-sizing: border-box` 下 padding 会从 width 里扣，
-     只写 100% 会让内容比改之前窄 8px（与 .content 的对齐也就跟着错开）。 */
+     只写 100% 会让内容比改之前窄 8px（与 .content 的对齐也就跟着错开）。
+     不再设 max-width：内容区随主区铺满，最大化窗口时右侧不留空列（此前被 1180px 卡住，
+     宽窗口下右侧空出几百像素、与顶部工具条左右边界也错开）。 */
   width: calc(100% + 8px);
-  max-width: calc(var(--content-max) + 8px);
 }
 .content {
   flex: 1;
@@ -446,8 +447,8 @@ main > .view {
   grid-template-columns: minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr);
   gap: var(--sp-4);
+  /* 列表随主区铺满：与上方 .top 工具条同宽（不再设 max-width，见 main > .view 的说明） */
   width: 100%;
-  max-width: var(--content-max);
 }
 /* 选中模型时切主从两栏：列表占左列（自适应、自身滚动），详情为右列 300–360px。
    两列各自独立高度，详情不占列表的纵向空间；任何窗口宽度都不降级为上下堆叠。 */

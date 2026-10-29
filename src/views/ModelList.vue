@@ -59,9 +59,11 @@ function move(event, step) {
     @keydown.down="move($event, 1)"
     @keydown.up="move($event, -1)"
   >
+    <!-- 逐行错峰入场：序号封顶 8 级，几十个模型一起刷新时尾部不会越等越久 -->
     <ModelRow
-      v-for="model in sorted"
+      v-for="(model, i) in sorted"
       :key="model.id"
+      :style="{ '--i': Math.min(i, 8) }"
       :model="model"
       :result="resultOf(model.id)"
       :waiting="waiting(model.id)"

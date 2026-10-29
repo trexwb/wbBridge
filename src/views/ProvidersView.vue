@@ -276,7 +276,7 @@ onUnmounted(() => {
     </p>
 
     <ul class="providers">
-      <li v-for="provider in providers" :key="provider.id" class="provider">
+      <li v-for="(provider, i) in providers" :key="provider.id" class="provider" :style="{ '--i': i }">
         <div class="provider-head">
           <span class="provider-label">{{ provider.label }}<span class="provider-id">（{{ provider.id }}）</span></span>
           <span class="badge" :class="provider.configured ? 'ok' : 'off'">
@@ -392,14 +392,20 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
   display: flex;
   flex-direction: column;
   gap: 8px;
+  /* 平台卡片按顺序浮现：四个都是一级配置入口，一次性压进来会看不清从哪读起 */
+  animation: enter-rise var(--dur-3) var(--ease-enter) backwards;
+  animation-delay: calc(var(--i, 0) * var(--stagger-step));
 }
 .provider-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .provider-label { font-size: 15px; font-weight: 600; }
 /* 标题内的注册表 id：弱化为括注，不再单独占一行 */
 .provider-id { font-size: 11px; font-weight: 400; color: var(--muted-strong); font-family: ui-monospace, monospace; }
+/* 已配置 / 未配置翻转时渐变，不硬切 */
 .badge {
   font-size: 11px; font-weight: 500; white-space: nowrap;
   padding: 4px 9px; border-radius: 999px;
+  transition: background-color var(--dur-2) var(--ease-standard),
+              color var(--dur-2) var(--ease-standard);
 }
 .badge.ok { background: var(--green-bg); color: var(--green); }
 .badge.off { background: var(--panel); color: var(--muted-strong); }
@@ -456,7 +462,8 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
 .reveal-btn:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-offset); }
 .reveal-btn:disabled { opacity: .4; cursor: not-allowed; }
 .reveal-btn svg { width: 22px; height: 22px; }
-.feedback { margin: 0; font-size: 12px; color: var(--green); }
+/* 保存 / 清除的结果行是插入式出现的：淡入一次，避免卡片高度「啪」地一跳 */
+.feedback { margin: 0; font-size: 12px; color: var(--green); animation: enter-fade var(--dur-2) var(--ease-standard); }
 .feedback.error { color: var(--badge-unavailable-fg); }
 .apply-note {
   border: 1px solid var(--line); border-radius: var(--radius-m);

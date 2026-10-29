@@ -95,6 +95,10 @@ const timing = computed(() => {
   width: 100%;
   white-space: normal;
   cursor: pointer;
+  /* 入场错峰由列表侧给 --i（见 ModelList.vue）；fill-mode 用 backwards，
+     动画结束后不保留 transform，避免压掉 :active 与选中态。 */
+  animation: enter-rise var(--dur-3) var(--ease-enter) backwards;
+  animation-delay: calc(var(--i, 0) * var(--stagger-step));
   transition: background var(--dur-1) var(--ease-standard),
               border-color var(--dur-1) var(--ease-standard),
               box-shadow var(--dur-2) var(--ease-standard);
@@ -131,7 +135,8 @@ const timing = computed(() => {
 .model-name { display: block; font-size: 14px; font-weight: 550; line-height: 1.4; overflow-wrap: anywhere; }
 .duration { display: block; font-size: 11px; color: var(--muted-strong); margin-top: 6px; font-variant-numeric: tabular-nums; }
 .badges { display: flex; align-items: center; gap: 5px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
-/* 徽章统一 pill：状态语义只靠文字与配色区分，不改形状，扫读更快 */
+/* 徽章统一 pill：状态语义只靠文字与配色区分，不改形状，扫读更快。
+   底色与字色也进过渡：状态推进（等待检测 → 检测中 → 可用）若硬切，整行会闪一下。 */
 .badge {
   font-size: 11px;
   font-weight: 500;
@@ -140,6 +145,8 @@ const timing = computed(() => {
   border-radius: 999px;
   background: var(--green-bg);
   color: var(--green);
+  transition: background-color var(--dur-2) var(--ease-standard),
+              color var(--dur-2) var(--ease-standard);
 }
 .reasoning { color: var(--badge-reason-fg); background: var(--badge-reason-bg); }
 .images { color: var(--badge-image-fg); background: var(--badge-image-bg); }
