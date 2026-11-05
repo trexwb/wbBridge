@@ -182,7 +182,7 @@ fn stop_core(core: RunningCore, key: Option<&str>, state: &AppState) {
     // 🔴 HTTP 不可用（典型：核心还在 find_runtime / 下载运行时，回环服务尚未监听；或拿不到 key）
     // 时不能直接丢掉运行时——那会连同关停清理一起丢掉，WorkBuddy/CodeBuddy 里本工具名下的条目
     // 就留在配置里了。核心与壳同进程，直接请它走同一条 shutdown 清理链。
-    if orchestration::request_shutdown(&core.runtime.handle(), 0)
+    if orchestration::request_shutdown(core.runtime.handle(), 0)
         && wait_core_stopped(state, Duration::from_secs(5))
     {
         core.runtime.shutdown_timeout(Duration::from_secs(2));
