@@ -73,17 +73,22 @@ pub struct Provider {
     /// OpenCode 又是把注入段与 catalog **合并**而非替换，所以只声明不够、发现阶段还得按这份
     /// 清单把 catalog 的过期 id 过滤掉，否则探测队列里依旧是对方不承接的那批。
     ///
-    /// 空切片 = 「没有权威清单」，沿用 catalog 声明 + 锚点占位的既有形态（其余三家目前如此：
+    /// 空切片 = 「没有权威清单」，沿用 catalog 声明 + 锚点占位的既有形态（其余八家目前如此：
     /// 它们的 catalog 免费模型能被真实承接，改用清单只会平白缩小可选面）。
     pub models: &'static [DeclaredModel],
 }
 
-/// 四家都是 OpenAI 兼容端点，因此 Stage 3 只有一条注入代码路径。
+/// 九家都是 OpenAI 兼容端点，因此 Stage 3 只有一条注入代码路径。
 const OPENAI_COMPATIBLE: &str = "@ai-sdk/openai-compatible";
 
 /// 注册表：唯一真相。`id` 一旦发布出去（`providers.json` 的键、面板动作的 `provider` 参数）
 /// 就不得改名，改了等于让用户已填的 Key 失效。
-pub const PROVIDERS: [Provider; 4] = [
+///
+/// 2026-11-05 新增的五家（agnes / sensenova / nvidia / openrouter / huggingface）都**不带权威清单**：
+/// 它们都在 models.dev 目录里，且目录中已有标价为零的文本模型；OpenCode 1.19.5 实测会实时拉取该目录，
+/// 声明段只放锚点即可让目录内的免费模型进入发现队列（本地沙箱实测：自定义 provider 仅带锚点也能在
+/// `/provider` 里出现）。带清单反而要在每次上游增删模型时跟着发版。
+pub const PROVIDERS: [Provider; 9] = [
     Provider {
         id: "modelscope",
         label: "ModelScope",
@@ -195,6 +200,55 @@ pub const PROVIDERS: [Provider; 4] = [
         prefix: "ZP",
         npm: OPENAI_COMPATIBLE,
         base_url: "https://open.bigmodel.cn/api/paas/v4",
+        models: &[],
+    },
+    Provider {
+        // 爱思 Agnes：官方文档的 OpenAI 兼容网关（同时有 .cn 域名指向同一套控制台）。
+        // 目录里 agnes-2.0-flash / 2.5-flash / 3.0-flash 标价为零，agnes-2.5-pro-alpha 是付费条目，
+        // 免费判定会把它挡在外面，无需在这里维护清单。
+        id: "agnes",
+        label: "爱思 Agnes",
+        prefix: "AG",
+        npm: OPENAI_COMPATIBLE,
+        base_url: "https://apihub.agnes-ai.com/v1",
+        models: &[],
+    },
+    Provider {
+        // 商汤日日新：目录里的 kimi-k3 / glm-5.2 / deepseek-v4* / sensenova-6.8-flash-lite 均为零价。
+        id: "sensenova",
+        label: "商汤 SenseNova",
+        prefix: "SN",
+        npm: OPENAI_COMPATIBLE,
+        base_url: "https://token.sensenova.cn/v1",
+        models: &[],
+    },
+    Provider {
+        // NVIDIA NIM：新账号含免费推理额度，目录里大批文本模型标价为零。
+        id: "nvidia",
+        label: "NVIDIA NIM",
+        prefix: "NV",
+        npm: OPENAI_COMPATIBLE,
+        base_url: "https://integrate.api.nvidia.com/v1",
+        models: &[],
+    },
+    Provider {
+        // OpenRouter：目录用自家的 SDK，但端点本身 OpenAI 兼容，这里统一走 openai-compatible。
+        // 只放行标价为零的模型（`:free` 一族），免费档有独立速率限制。
+        id: "openrouter",
+        label: "OpenRouter",
+        prefix: "OR",
+        npm: OPENAI_COMPATIBLE,
+        base_url: "https://openrouter.ai/api/v1",
+        models: &[],
+    },
+    Provider {
+        // Hugging Face Inference Providers 的 OpenAI 兼容路由；目录里当前只有
+        // zai-org/GLM-4.7-Flash 标价为零，免费额度与速率以平台公示为准。
+        id: "huggingface",
+        label: "Hugging Face",
+        prefix: "HF",
+        npm: OPENAI_COMPATIBLE,
+        base_url: "https://router.huggingface.co/v1",
         models: &[],
     },
 ];
@@ -372,7 +426,7 @@ mod tests {
     /// 权威清单的形态自检：这份表是**手工抓取**的（不联网、没有远端真相可对账），
     /// 所以每一条都得靠断言钉住可用性与「清单与非清单平台的分界」。
     /// 只有 ModelScope 有清单是 2026-10-10 的实测结论（那家 catalog 与网关交集为空），
-    /// 其余三家按 catalog 声明即可命中，加清单只会平白缩小可选面。
+    /// 其余八家按 catalog 声明即可命中，加清单只会平白缩小可选面。
     #[test]
     fn the_authoritative_model_list_is_well_formed_and_scoped_to_modelscope() {
         for provider in PROVIDERS {
@@ -426,11 +480,41 @@ mod tests {
         assert_eq!(sorted, modelscope.models.to_vec(), "清单必须按 id 升序");
     }
 
+    /// 2026-11-05 新增的五家必须与 models.dev 目录里的 provider id 逐字一致：
+    /// 发现阶段按 `{id}/{model}` 查 `/provider`，id 拼错等于该平台永远「一条模型都不出」。
+    #[test]
+    fn the_new_free_platforms_are_registered_under_their_catalog_ids() {
+        let expected = [
+            ("agnes", "AG", "https://apihub.agnes-ai.com/v1"),
+            ("sensenova", "SN", "https://token.sensenova.cn/v1"),
+            ("nvidia", "NV", "https://integrate.api.nvidia.com/v1"),
+            ("openrouter", "OR", "https://openrouter.ai/api/v1"),
+            ("huggingface", "HF", "https://router.huggingface.co/v1"),
+        ];
+        for (id, prefix, base_url) in expected {
+            let provider = find(id).unwrap_or_else(|| panic!("注册表缺 {id}"));
+            assert_eq!(provider.prefix, prefix, "{id} 的短前缀与裁定不符");
+            assert_eq!(provider.base_url, base_url, "{id} 的端点必须与目录一致");
+            assert!(provider.models.is_empty(), "{id} 走 catalog 声明，不该带清单");
+        }
+    }
+
     /// 查不到平台必须回落**空清单**（＝不过滤），而不是「有清单但一条都不在」：
     /// 后者会把该命名空间发现出的模型全数丢掉。`opencode` 与合成命名空间都走这条路。
     #[test]
     fn served_models_is_empty_for_any_namespace_without_a_list() {
-        for namespace in ["opencode", "vendor", "siliconflow-cn", "", "not-registered"] {
+        for namespace in [
+            "opencode",
+            "vendor",
+            "siliconflow-cn",
+            "agnes",
+            "sensenova",
+            "nvidia",
+            "openrouter",
+            "huggingface",
+            "",
+            "not-registered",
+        ] {
             assert!(
                 served_models(namespace).is_empty(),
                 "{namespace} 不该有清单，否则发现阶段会全量过滤"

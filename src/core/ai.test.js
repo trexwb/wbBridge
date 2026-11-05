@@ -104,7 +104,7 @@ test('validateToolCall：未知工具、缺参、非法平台/模型一一拦截
   assert.equal(validateToolCall('list_models', { filter: 'available' }).ok, true)
   assert.equal(validateToolCall('restart_core', {}).ok, true)
 
-  // open_provider_page 只认注册表里的四家：填别的域名不该被带到壳的 open_external。
+  // open_provider_page 只认注册表里的平台：填别的域名不该被带到壳的 open_external。
   assert.equal(validateToolCall('open_provider_page', {}).ok, false)
   assert.equal(validateToolCall('open_provider_page', { provider: 'zhipuai' }).ok, true)
   assert.equal(validateToolCall('open_provider_page', { provider: 'evil.example.com' }).ok, false)
@@ -229,6 +229,24 @@ test('buildSnapshot：如实转述壳推送快照，缺字段不编造', () => {
   assert.ok(empty.includes('阶段：未知'))
   assert.ok(empty.includes('尚未导入'))
   assert.ok(empty.includes('支持工具调用 0 个'))
+})
+
+test('已移除模型不计入助手的活跃统计，并单独报出数量', async () => {
+  const state = {
+    phase: 'ready',
+    models: [{ id: 'a' }, { id: 'b' }, { id: 'c' }],
+    availableModels: ['a'],
+    removedModels: ['c'],
+    modelResults: { c: { ok: false } },
+  }
+  const snapshot = buildSnapshot(state)
+  assert.ok(snapshot.includes('共 2 个'))
+  assert.ok(snapshot.includes('另有 1 个已被用户移除'))
+  const list = await runTool('list_models', { filter: 'all' }, { state })
+  assert.deepEqual(list.result.models.map(model => model.id), ['a', 'b'])
+  const status = await runTool('get_status', {}, { state })
+  assert.equal(status.result.models, 2)
+  assert.equal(status.result.removedModels, 1)
 })
 
 test('phaseLabel：已知阶段给中文，未知阶段原样回显不编造', () => {

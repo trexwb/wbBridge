@@ -2,7 +2,7 @@
 
 > 本文件是「面板动作 → 核心路由」唯一的人工可读契约。以下三处实现必须保持一致：
 > 1. `src-tauri/src/lib.rs` 的 `ADMIN_ROUTES` 与 `admin_route()`（壳侧动作表；托盘 pick 分支仍经
->    `admin_route("import")`，面板入口已收口为 8 个类型化命令，见下节）
+>    `admin_route("import")`，面板入口已收口为 10 个类型化命令，见下节）
 > 2. `src-tauri/core/src/server.rs` 的 `ACTION_ROUTES` 与 `route_for()`（核心侧路由表）
 > 3. 本文件的表格
 >
@@ -29,6 +29,13 @@
 | `provider-status` | `/admin/provider-status` | POST | 无（不读请求体，同 `refresh`） | 平台注册表 + 每个平台「是否已配置」；**返回体不含任何 Key 材料** |
 | `set-provider-key` | `/admin/set-provider-key` | POST | `{ "provider": string, "apiKey": string }` | 写入/更新一个平台的用户自持 Key（落 `<数据目录>/providers.json`，`0600`）；成功返回新的 `provider-status` 形态 |
 | `clear-provider-key` | `/admin/clear-provider-key` | POST | `{ "provider": string }` | 删除一个平台的 Key（未配置过也返回成功，幂等）；同样返回新状态 |
+| `remove-model` | `/admin/remove-model` | POST | `{ "model": string }` | 用户手动移除一个模型：持久化到 `settings.json` 的 `removedModels`，此后**不再探测、不再发布**（从 `/v1/models`、插件配置与 `WB · auto` 选择域中排除）。目录条目保留以便恢复；模型不在目录中返回 400 `model_not_found`；重复移除幂等 |
+| `restore-model` | `/admin/restore-model` | POST | `{ "model": string }` | 从移除名单恢复并立即对该模型发起一次单模型探测；恢复不等于可用，探测通过后才重新进入发布集。模型不在当前目录中返回 400 `model_not_found`；未在移除名单中时幂等返回 `restored: false` |
+
+> 移除语义是「不再检测、不再发布」，不是从目录删除：`status.json` 的 `models` 仍含该条目，
+> 面板靠顶层 `removedModels`（全限定 id 数组）把它归入「模型回收站」面板。该字段是加法式变更
+> （`schemaVersion` 不递增），跨重启由 `settings.json` 恢复。所有探测入口（批量 / 平台定向 /
+> 单模型）都会先排除移除名单，因此被移除的模型不会因为刷新、重检或自动自愈而被重新探测。
 
 > 🔴 凭据口径（这三条动作是本契约里**唯一**允许把用户凭据带进核心的入口）：
 > `apiKey` 只经请求体进入，只落 `providers.json`；不出现在响应体、`status.json`、日志、面板偏好
@@ -41,8 +48,9 @@
 > 且写入的 Key 目前**没有消费者**（`isolated_config()` 注入属 Stage 3）——按它们做动作不会多发布一个模型。
 
 面板侧链路：`src/core/bridge.js` 的 `action(name, value)`（前端内核，不是后端）先把动作分发到
-**8 个类型化 Tauri 命令**（`core_refresh`/`core_probe`/`core_import`/`core_system_proxy`/`core_shutdown`/
-`core_provider_status`/`core_set_provider_key`/`core_clear_provider_key`，取代旧 `core_action(action, payload)`
+**10 个类型化 Tauri 命令**（`core_refresh`/`core_probe`/`core_import`/`core_system_proxy`/`core_shutdown`/
+`core_provider_status`/`core_set_provider_key`/`core_clear_provider_key`/`core_remove_model`/`core_restore_model`，
+取代旧 `core_action(action, payload)`
 通用代理：动作名不再是任意字符串，每条只映射一个 `/admin/*` 路由，参数经 serde 类型校验，路由与载荷语义不变）
 → `admin_route()`/`admin_call()`；例外是面板的 `restart` 动作，它不经 `/admin/*`，直接映射为壳命令
 `restart_core`。壳另有 **七个**命令（均不经 `/admin/*`）：
@@ -53,7 +61,7 @@
 | `data_dir_path` | 无 | 取当前数据目录路径 |
 | `read_log` | **无参数** | 只读数据目录下 `opencode.log` 的**尾部**，返回 `{ text, truncated, bytes }`；尾部截断 256KB / 最多 1200 行，不读 `opencode.log.previous`；不接受路径入参、不写任何文件 |
 | `clear_log` | **无参数** | 清空数据目录下 `opencode.log`（`write + truncate` 打开即截断为空），返回 `{ cleared }`；文件不存在视为本就为空（`cleared: false`，不报错）；不接受路径入参、只碰这一个固定文件名、不删轮转存档 `opencode.log.previous`；核心以 append 持有该文件，截断后新写入照常从末尾追加 |
-| `open_external` | `url`（仅 https） | 用系统浏览器打开外链；安全边界 = 仅 https + RFC 3986 字符白名单 + 精确主机名名单（`EXTERNAL_HOSTS`，四家平台的官方 Key 申请页），URL 只以命令行参数传给系统打开器（不经 shell 解析） |
+| `open_external` | `url`（仅 https） | 用系统浏览器打开外链；安全边界 = 仅 https + RFC 3986 字符白名单 + 精确主机名名单（`EXTERNAL_HOSTS`，各注册表平台的官方 Key 申请页），URL 只以命令行参数传给系统打开器（不经 shell 解析） |
 | `ai_chat` | **`payload`**（整份请求挂在这一个键下：`{ chatId, baseUrl, apiKey, selfHosted, model, messages, tools, tool_choice }`） | **AI 助手唯一的网络出口**：先收形状（`AI_MAX_MESSAGES = 40` / `AI_MAX_MESSAGE_CHARS = 30000` / `AI_MAX_TOOLS = 40`，端点必须 https 或本机 http），再由后台线程用 ureq 发请求、逐行解 SSE；`selfHosted` 时**端点与 Bearer 由壳自己从运行中的核心解析**（面板无从知道 api-key）；`build_ai_body` 只在 `tools` 非空时才声明 `tools` 与 `tool_choice`。Tauri v2 按参数名绑定，平铺传会直接报「missing required key payload」 |
 | `ai_abort` | `chatId` | 只置该次流式请求的取消标志，断连由流式线程下次读取时检查完成；不结束核心、不碰其他会话 |
 
@@ -72,7 +80,7 @@
 `ai_chat` 的入参结构（`AiChatRequest`，键名逐字）：`chatId` / `baseUrl` / `apiKey` / `selfHosted` / `model` /
 `messages` / `tools` / `toolChoice`；除 `model` 与 `messages` 外都带 serde `default`，`tools` 缺省空数组即本轮不启用工具。
 
-**面板的第二条边界：Tauri 官方插件命令（自动更新）**，它**不经**上面的 8 个 `core_*` 管理命令 / `/admin/*`，因此不在上面的动作表里：
+**面板的第二条边界：Tauri 官方插件命令（自动更新）**，它**不经**上面的 10 个 `core_*` 管理命令 / `/admin/*`，因此不在上面的动作表里：
 
 | 面板调用（`src/core/bridge.js`） | 底层插件命令 | 说明 |
 |---|---|---|
@@ -102,6 +110,9 @@
   改为等待核心的退出回调（`orchestration::set_exit_hook`，预算 10s），超时后强制关闭核心的专用 tokio
   运行时（`shutdown_timeout`，在途任务被丢弃，等价于旧版强杀）。核心任何退出路径都只能触发回调，
   绝不能终止壳进程。
+- 回环 HTTP 不可用时（典型：启动早期核心还在 `find_runtime` / 下载运行时，服务尚未监听；或拿不到
+  `api-key`），壳改为调用进程内的 `orchestration::request_shutdown(&runtime.handle(), 0)`，走**同一条**
+  `shutdown()` 清理链（含 WorkBuddy/CodeBuddy 条目清空），预算 5s；仍不成立才强制关闭运行时。
 - 面板主动终止核心、或核心任务非预期结束后的重启，均走同一个 `shutdown` 动作（核心侧会先完成
   WorkBuddy 配置清理再收尾），重启由壳命令 `restart_core` 重新装配一次核心实例。
 
@@ -118,7 +129,8 @@
 |---|---|
 | `GET /v1/models` | **池非空**时列表末位多一条 `{ "id": "WB · auto", "object": "model", "owned_by": "opencode", "name": "WB · auto" }`；池为空（探测全失败/尚未探测）**不追加**——不给客户端一个必然 400 的入口 |
 | `POST /v1/chat/completions` | `model` 填 `WB · auto` 即由核心按请求内容在**可用池**里选一个实际模型转发；其余字段、错误码、SSE 帧序与手动指定模型时**逐字一致** |
-| 选档规则 | 纯文本 → 全池（含仅对话模型）；带图片 part → 要求 `images`；带非空 `tools` → 要求 `toolcall` 且非 `chatOnly`；图片 + 工具 → 要求两者；该档候选为空 → **退回全池**（不新增错误码，随后由 `prepare` 给出既有 400）；同档多候选 → 均匀随机取一（分散负载） |
+| 选档规则 | 纯文本 → 全池（含仅对话模型）；带图片 part → 要求 `images`；带非空 `tools` → 要求 `toolcall` 且非 `chatOnly`；图片 + 工具 → 要求两者；该档候选为空 → **退回全池**（不新增错误码，随后由 `prepare` 给出既有 400）；同档多候选 → **取速度权重最高者**，同权重时随机取一（分散负载） |
+| 速度权重（v1.3.0 新增，加法式变更） | `status.json` 的 `modelResults.<全限定 id>.weight`（`schemaVersion` 不递增）：探测**成功**时按本次探测耗时重新定权（≤2/5/10/20/40s → 100/80/60/40/20，更慢 10，恒为正）；真实请求**成功且整条耗时 ≥ 30s** 扣 20（最低 0），快请求与失败都不改权重；缺 `weight`（旧版 `status.json`、尚未探测）按满分 100。选择器只在**同档候选**内比较权重。池内所有可用模型权重归 0、且当前没有读取/探测在进行时，**下一次真实请求**会触发一次全量重新检测（探测通过即按新耗时重新分配权重）；探测路径本身不触发，避免全失败的一轮反复自检 |
 | 响应与记账 | 响应的 `model` 字段（流式与非流式都一样）= **实际选中模型的全限定 id**（如 `modelscope/Qwen/Qwen3-8B`），**不是** `WB · auto`；`status.json` 的 `usage.models`、`modelResults` 与 `validated` 的键同样是这个实际 id |
 | 失败即摘除 | 复用既有链路，本功能零新增判决：受限 / 超时 / 不可用类的失败会 `validated.remove(实际 id)` → `/v1/models` 与面板状态当次即收缩；格式类四项（`invalid_model_output` / `invalid_tool_call` / `native_tool_activity` / `output_truncated`）按数据红线**不摘除**；客户端取消、429 `busy`、408 读体超时、本地 400 全部发生在记账之前，**不构成对任何模型的判决** |
 | 插件配置（**v1.1.15 起的改动**） | 发布集非空时，`WB · auto` 会作为一条**独立条目**写进 WorkBuddy 与 CodeBuddy 的 `models.json`，排在本工具名下逐模型条目**之后**，并同样进该文档的可用模型列表——插件的模型选择器里因此选得到它。v1.1.14 裁定的是「绝不写进插件」，用户实测后推翻（「不然谁都不知道如何使用」）。字段形态（保守声明，能力字段宁少勿多）：`{ id, name }` = `WB · auto`（该 `id` **刻意绕过** `client_model_id`，否则会生成 `OC · WB · auto`、与 `chat()` 的字面比较永不匹配）；`vendor` = `Custom`；`url` / `apiKey` / `buddyBridgeOwner` 与逐模型条目同源；`supportsToolCall` = **池里是否存在能接工具调用的候选**（`auto::any_tool_capable`，与核心选档共用同一谓词，因此两侧不可能分叉）；`supportsImages` = `false`；`maxInputTokens` = 池内**最小**上下文（每次同步重算，取 `input`、缺失回落 `context`，非数值/0/负数跳过；一个都没有就**不写该键**）；**不写** `reasoning` 与 `maxOutputTokens`。发布集为空则整条不写；用户手动建的同名 `id` 条目按数据红线**不被覆盖**（本条直接放弃）。✅ 2026-10-11 实机取证：两个插件的 `models.json` 均含 `WB · auto`，且 `status.json.usage` 累计 37 次真实请求（ok 32 / failed 5），证实插件侧能识别并按它发请求 |

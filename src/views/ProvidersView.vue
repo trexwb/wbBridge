@@ -13,13 +13,18 @@ const props = defineProps({
 })
 
 // 静态平台清单（与核心 providers.rs 注册表的 id/label 一致，不含 Key）：
-// 四张卡片**不依赖核心在线**就渲染 —— 卡片列表若完全由 provider-status 的请求结果驱动，
+// 卡片**不依赖核心在线**就渲染 —— 卡片列表若完全由 provider-status 的请求结果驱动，
 // 核心未就绪/未运行时表单整页消失，用户没有地方填 Key。请求只负责刷新「已配置」徽章。
 const PLATFORMS = [
   { id: 'modelscope', label: 'ModelScope' },
   { id: 'siliconflow-cn', label: 'SiliconFlow' },
   { id: 'tencent-tokenhub', label: '腾讯混元 TokenHub' },
   { id: 'zhipuai', label: '智谱' },
+  { id: 'agnes', label: '爱思 Agnes' },
+  { id: 'sensenova', label: '商汤 SenseNova' },
+  { id: 'nvidia', label: 'NVIDIA NIM' },
+  { id: 'openrouter', label: 'OpenRouter' },
+  { id: 'huggingface', label: 'Hugging Face' },
 ]
 
 // 每家平台的申请引导：官方入口（已核实）+ 三步指引。链接经壳的 open_external 用系统浏览器打开
@@ -56,6 +61,46 @@ const PLATFORM_GUIDES = {
       '打开下方官方申请页，注册或登录智谱开放平台。',
       '进入「API keys」页，点击「创建 API Key」（glm-4.5-flash 等 flash 系列免费）。',
       '复制 Key，粘贴到上方输入框点「保存」。',
+    ],
+  },
+  agnes: {
+    url: 'https://platform.agnes-ai.com/',
+    steps: [
+      '打开下方爱思 Agnes 开发者平台，注册或登录。',
+      '在控制台创建 API Key（Bearer 形式，直接粘贴 Key 本身、不要带 Bearer 前缀）。',
+      '粘贴到上方输入框点「保存」。端点固定为 https://apihub.agnes-ai.com/v1，推广期文本模型免费（以平台公示为准）。',
+    ],
+  },
+  sensenova: {
+    url: 'https://platform.sensenova.cn/console',
+    steps: [
+      '打开下方商汤日日新控制台，注册或登录。',
+      '左侧「管理中心 → API-Key 管理」创建 API-Key（完整值只在创建时显示一次）。',
+      '复制粘贴到上方输入框点「保存」。公测期有免费额度与速率限制（以平台公示为准）。',
+    ],
+  },
+  nvidia: {
+    url: 'https://build.nvidia.com/settings/api-keys',
+    steps: [
+      '打开下方 NVIDIA Build，注册并验证账号。',
+      '在「API Keys」页生成 Key（nvapi- 开头），复制保存。',
+      '粘贴到上方输入框点「保存」。新账号含免费推理额度，超出额度或速率会被限流（以平台公示为准）。',
+    ],
+  },
+  openrouter: {
+    url: 'https://openrouter.ai/settings/keys',
+    steps: [
+      '打开下方 OpenRouter，注册或登录。',
+      '在「Keys」页创建 API Key（sk-or- 开头），复制保存。',
+      '粘贴到上方输入框点「保存」。只会发现标价为零的 :free 模型，免费档有独立速率限制（以平台公示为准）。',
+    ],
+  },
+  huggingface: {
+    url: 'https://huggingface.co/settings/tokens',
+    steps: [
+      '打开下方 Hugging Face，注册或登录。',
+      '在「Access Tokens」页创建 token（read 权限即可），复制保存。',
+      '粘贴到上方输入框点「保存」。免费推理路由有速率与额度限制（以平台公示为准）。',
     ],
   },
 }

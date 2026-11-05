@@ -299,6 +299,10 @@ struct App {
     codebuddy_models_file: Arc<Mutex<Option<String>>>,
     models: Arc<Mutex<Vec<Value>>>,
     validated: Arc<Mutex<HashSet<String>>>,
+    /// 用户手动移除的模型全限定 id（持久化在 `settings.json` 的 `removedModels`）。
+    /// 目录条目照旧保留（面板的「已移除」分组要靠它显示名称与恢复入口），但探测、
+    /// 发布集与 `WB · auto` 的选择域一律排除——「移除」的语义就是不再检测、不再发布。
+    removed: Arc<Mutex<Vec<String>>>,
     binary: Arc<Mutex<Option<String>>>,
     runtime: Arc<Mutex<Option<Arc<Started>>>>,
     stopping: Arc<AtomicBool>,
@@ -417,7 +421,23 @@ fn apply_patch(
                 *entry = json!({});
             }
             if let Some(results) = entry.as_object_mut() {
+                // 权重更新必须在这里读上一份值：并发请求各自在锁外读权重再写回会丢掉扣分。
+                let previous_weight = results
+                    .get(model)
+                    .and_then(|entry| entry.get("weight"))
+                    .and_then(Value::as_u64)
+                    .map(|weight| u32::try_from(weight).unwrap_or(u32::MAX));
+                let ok = result.get("ok") == Some(&Value::Bool(true));
+                let source = result.get("source").and_then(Value::as_str).unwrap_or_default();
+                let duration_ms = result.get("durationMs").and_then(Value::as_i64).unwrap_or(0);
                 results.insert(model.to_string(), result.clone());
+                if let Some(weight) =
+                    crate::auto::next_weight(previous_weight, ok, source, duration_ms)
+                {
+                    if let Some(entry) = results.get_mut(model).and_then(Value::as_object_mut) {
+                        entry.insert("weight".to_string(), json!(weight));
+                    }
+                }
             }
         }
         if let Some(map) = state.as_object_mut() {
@@ -515,6 +535,29 @@ fn restored_models(previous: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// 用户手动移除的模型（`settings.json` 的 `removedModels`）。
+///
+/// 只收非空字符串并去重排序：`settings.json` 是用户可见的普通配置文件，可能被手改成
+/// 任意形状；坏数据不能让启动失败，也不该让同一个 id 在「已移除」分组里出现两次。
+/// id 不做 trim——全限定 id 是上游模型 key 拼出来的，理论上可能带空格，改一个字节就会
+/// 导致「恢复后仍被过滤」。
+fn restored_removed_models(settings: &Value) -> Vec<String> {
+    let mut ids: Vec<String> = settings
+        .get("removedModels")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 /// 从沿用的目录与历史结果重建「已通过校验」集合：只认 `ok === true` 且带字符串 `id` 的条目。
 ///
 /// 判定与 `usable_models()` 用的是同一个表达式，所以「沿用上次结果」与「重新探测」不会有两套口径；
@@ -602,19 +645,27 @@ async fn drain_status() {
     drain(&global_app().status_task).await;
 }
 
-/// 可发布集（对应 `usableModels()`）：目录 ∩ 已校验 ∩ 最近一次结果为 `ok === true`。
+/// 可发布集（对应 `usableModels()`）：目录 ∩ 已校验 ∩ 最近一次结果为 `ok === true`，
+/// 并排除用户手动移除的模型。
 ///
-/// 这是过滤不可用/超时模型的**唯一真相**：WorkBuddy / CodeBuddy 的 `models.json` 写入、
+/// 这是过滤不可用/超时/已移除模型的**唯一真相**：WorkBuddy / CodeBuddy 的 `models.json` 写入、
 /// `/v1/models`、`WB · auto` 的选择域与翻译模型候选都只认这一份集合。判定只认
 /// `true` 本身（`ok: 1` 这类 truthy 值不算），因此即使 `validated` 里残留了某个 id
 /// （并发写、被外部改过的 `status.json`），只要最近一次结果是 `ok: false`（含
-/// `code: "timeout"`）就进不了发布集。
-fn publishable_models(models: &[Value], validated: &HashSet<String>, results: &Value) -> Vec<Value> {
+/// `code: "timeout"`）就进不了发布集。已移除模型同样按 id 排除——即使它此刻恰好探测
+/// 通过（移除动作与在飞探测并发时会出现），也不能重新发布。
+fn publishable_models(
+    models: &[Value],
+    validated: &HashSet<String>,
+    results: &Value,
+    removed: &[String],
+) -> Vec<Value> {
     models
         .iter()
         .filter(|model| {
             let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
-            validated.contains(id)
+            !removed.iter().any(|removed_id| removed_id == id)
+                && validated.contains(id)
                 && results.get(id).and_then(|entry| entry.get("ok")) == Some(&json!(true))
         })
         .map(|model| {
@@ -624,9 +675,19 @@ fn publishable_models(models: &[Value], validated: &HashSet<String>, results: &V
                 .and_then(|entry| entry.get("chatOnly"))
                 .unwrap_or(&Value::Bool(false))
                 .clone();
+            // 速度权重随发布集一起带出：`WB · auto` 的选择器只读这份快照，权重缺失（旧版
+            // status.json / 尚未探测）时由 `auto::weight_of` 按满分处理，这里只在有数值时覆写。
+            let weight = results
+                .get(id)
+                .and_then(|entry| entry.get("weight"))
+                .filter(|value| value.as_u64().is_some())
+                .cloned();
             let mut model = model.clone();
             if let Some(object) = model.as_object_mut() {
                 object.insert("chatOnly".to_string(), chat_only);
+                if let Some(weight) = weight {
+                    object.insert("weight".to_string(), weight);
+                }
             }
             model
         })
@@ -637,12 +698,37 @@ fn publishable_models(models: &[Value], validated: &HashSet<String>, results: &V
 fn usable_models() -> Vec<Value> {
     let app = global_app();
     let validated = lock(&app.validated).clone();
+    let removed = lock(&app.removed).clone();
     let state = app.snapshot();
     let results = state
         .get("modelResults")
         .cloned()
         .unwrap_or(Value::Null);
-    publishable_models(&app.models(), &validated, &results)
+    publishable_models(&app.models(), &validated, &results, &removed)
+}
+
+/// 全池权重归零后的自愈：触发一次**全量**重新检测，探测通过时按新耗时重新分配权重。
+///
+/// 只在真实请求路径上判定：探测本身也写 `modelResults`，若在探测路径判定，全失败的一轮
+/// 会反复触发自己。`start_probes` 自带 `probing` 互斥（已有探测在跑时返回 `started: false`），
+/// 这里先做一次无锁预判，避免每个请求都去抢那个原子位。
+fn reprobe_when_weights_exhausted(source: &str) {
+    let app = global_app();
+    if source != "request"
+        || app.stopping.load(Ordering::Relaxed)
+        || app.probing.load(Ordering::Relaxed)
+        || lock(&app.refresh).is_some()
+    {
+        return;
+    }
+    if !crate::auto::all_weights_exhausted(&usable_models()) {
+        return;
+    }
+    log_line("WB · auto 的模型权重已全部归零，重新检测全部模型并重新分配权重");
+    let started = start_probes(None, false, false, &Scope::All);
+    if started.get("started") != Some(&json!(true)) {
+        log_line("权重归零后的重新检测未能启动（已有读取或探测在进行）");
+    }
 }
 
 /// `attachTranslator`：翻译模型按首选名单挑选，未命中时退化为第一个可用模型并留痕。
@@ -696,6 +782,13 @@ fn rejects_empty_publication(models: &[Value], allow_empty: bool) -> bool {
     models.is_empty() && !allow_empty
 }
 
+/// 🔴 关停开始后拒绝**非空**发布：`shutdown` 自己写的是空集（清理），必须放行；而启动时序
+/// （`startup_sequence` 里「沿用上次结果」那一支）可能在关停触发后仍继续推进，迟到的非空发布
+/// 会把刚清掉的条目重新写回插件配置——应用退出后用户看到的仍是一批指向已停端点的模型。
+fn rejects_publication_while_stopping(stopping: bool, models: &[Value]) -> bool {
+    stopping && !models.is_empty()
+}
+
 /// `syncPublished(published, allowEmpty)`：把发布集串行写入所有已检测到的插件配置 —— WorkBuddy 与
 /// CodeBuddy 的 `models.json`；未检测到的目标在 `sync.targets` 里报 `missing` 及原因。
 ///
@@ -708,6 +801,9 @@ fn rejects_empty_publication(models: &[Value], allow_empty: bool) -> bool {
 fn sync_published(published: Option<Vec<Value>>, allow_empty: bool) {
     let app = global_app();
     let models = published.unwrap_or_else(usable_models);
+    if rejects_publication_while_stopping(app.stopping.load(Ordering::Relaxed), &models) {
+        return;
+    }
     let endpoint = format!("{}/chat/completions", app.endpoint);
     let key = app.bridge_key.to_string();
 
@@ -855,6 +951,9 @@ async fn record(
         patch.insert("lastRequest".to_string(), result.clone());
         insert_all(&mut patch, captured.as_ref());
         persist_status(update_with_usage(Value::Object(patch), usage_entry, None));
+        // 格式类失败不扣权重，但它仍是一次真实请求：若池里权重已全部归零（例如重启后沿用
+        // 了一份耗尽的状态），这次请求就是重新检测的触发点。
+        reprobe_when_weights_exhausted(source);
         return;
     }
 
@@ -892,6 +991,9 @@ async fn record(
     if became_unavailable && source == "request" && !app.probing.load(Ordering::Relaxed) {
         sync_published(None, false);
     }
+    // 本次结果可能把最后一个正权重扣到 0（权重更新在同一把状态锁里完成），在这里统一判定：
+    // 全部为 0 时触发全量重检，探测通过后按新耗时重新分配权重。
+    reprobe_when_weights_exhausted(source);
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,7 +1137,15 @@ fn start_probes(
     if app.stopping.load(Ordering::Relaxed) || lock(&app.refresh).is_some() {
         return json!({ "error": { "message": "请等待模型读取完成", "type": "invalid_request_error" } });
     }
-    let models = app.models();
+    let removed = lock(&app.removed).clone();
+    let models: Vec<Value> = app
+        .models()
+        .into_iter()
+        .filter(|model| {
+            let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
+            !removed.iter().any(|removed_id| removed_id == id)
+        })
+        .collect();
     let selected: Vec<Value> = match model_id.as_ref().and_then(Value::as_str) {
         Some(id) => models
             .iter()
@@ -1049,7 +1159,14 @@ fn start_probes(
             .collect(),
     };
     if selected.is_empty() {
-        return json!({ "error": { "message": "模型不在当前目录中", "type": "invalid_request_error" } });
+        // 显式指定模型与全量/平台检测分开措辞：后者为空通常是把模型都移除了，
+        // 说「模型不在当前目录中」会让人以为目录读取失败。
+        let message = if model_id.is_some() {
+            "模型不在当前目录中（或已被移除）"
+        } else {
+            "没有可检测的模型（可能已被全部移除）"
+        };
+        return json!({ "error": { "message": message, "type": "invalid_request_error" } });
     }
     // 单模型探测不与批量探测互斥：直接 spawn 独立 task，不走 probing 全局锁
     if model_id.is_some() {
@@ -1859,6 +1976,23 @@ fn spawn_shutdown(code: u8) {
     });
 }
 
+/// 壳在回环 HTTP 不可用时触发的关停入口（典型：启动早期 `find_runtime` 尚未开始监听）。
+///
+/// 与 `/admin/shutdown` 走**同一条** [`shutdown`] 清理链（含 WorkBuddy/CodeBuddy 条目清空），
+/// 区别只是不再依赖 HTTP 服务器已经起来；未装入实例（bootstrap 未完成）时返回 `false`，
+/// 由调用方回落到强制关闭运行时。重复调用是幂等的：后来者等待同一次关停的结果。
+pub fn request_shutdown(handle: &tokio::runtime::Handle, code: u8) -> bool {
+    if lock(&APP).is_none() {
+        return false;
+    }
+    // 显式丢弃 JoinHandle：关停结果经 `exit_process`（壳里是 exit hook）交出，不需要等待句柄。
+    drop(handle.spawn(async move {
+        let code = shutdown(code).await;
+        exit_process(code);
+    }));
+    true
+}
+
 // ---------------------------------------------------------------------------
 // 入口
 // ---------------------------------------------------------------------------
@@ -2027,6 +2161,7 @@ fn bootstrap(options: &StartOptions) -> Result<Arc<App>, String> {
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_else(|| json!({}));
+    let removed_models = restored_removed_models(&settings);
 
     // 6. status.json 的上一次快照（modelResults 需要延续）。
     let previous: Value = std::fs::read_to_string(join_host(&[&data_dir, "status.json"]))
@@ -2080,7 +2215,10 @@ fn bootstrap(options: &StartOptions) -> Result<Arc<App>, String> {
     // 「读取免费模型」仍然走完整的重新发现 + 重新探测，是唯一的刷新入口。
     let previous_models = restored_models(&previous);
     let previous_results = restored_model_results(&previous);
-    let previous_validated = validated_from_results(&previous_models, &previous_results);
+    let mut previous_validated = validated_from_results(&previous_models, &previous_results);
+    // 已移除的模型即使上一轮判过「通过」也不再算通过：启动的沿用判定与发布集都以
+    // 这份集合为准，否则移除会只作用于本次进程，重启后又回到发布集。
+    previous_validated.retain(|id| !removed_models.iter().any(|removed| removed == id));
 
     let state = json!({
         "schemaVersion": STATUS_SCHEMA_VERSION,
@@ -2102,6 +2240,9 @@ fn bootstrap(options: &StartOptions) -> Result<Arc<App>, String> {
             .unwrap_or_else(fresh_usage),
         "sync": Value::Null,
         "availableModels": [],
+        // 面板按这份名单把目录里的模型分到「已移除」分组；探测 / 发布 / WB · auto
+        // 的选择域由 core 侧过滤，面板只负责显示与恢复入口。
+        "removedModels": removed_models.clone(),
         "probe": { "running": false },
         "singleProbes": [],
     });
@@ -2122,6 +2263,7 @@ fn bootstrap(options: &StartOptions) -> Result<Arc<App>, String> {
         codebuddy_models_file: Arc::new(Mutex::new(None)),
         models: Arc::new(Mutex::new(previous_models)),
         validated: Arc::new(Mutex::new(previous_validated)),
+        removed: Arc::new(Mutex::new(removed_models)),
         binary: Arc::new(Mutex::new(None)),
         runtime: Arc::new(Mutex::new(None)),
         stopping: Arc::new(AtomicBool::new(false)),
@@ -2294,6 +2436,16 @@ async fn startup_sequence(app: &App) -> Result<String, BackendError> {
         }));
         // 空集闸门照常生效：沿用判定要求至少一个通过，这里不会因空集被拒。
         sync_published(None, false);
+        // 速度权重的迁移：旧版 `status.json` 的 `modelResults` 没有 `weight`。沿用结果能立刻
+        // 就绪，但 `WB · auto` 需要权重才能挑出最快的模型——在后台补一次全量探测来分配，
+        // 不阻塞就绪；探测失败仍按既有规则从发布集摘除。全部条目都已有权重时不做任何事。
+        if usable
+            .iter()
+            .any(|model| model.get("weight").and_then(Value::as_u64).is_none())
+        {
+            log_line("沿用上次检测结果但没有速度权重，后台重新检测一次以分配权重");
+            start_probes(None, false, false, &Scope::All);
+        }
     } else {
         refresh(false, None, Scope::All).await?;
         start_probes(None, true, true, &Scope::All);
@@ -2347,6 +2499,8 @@ fn build_server(app: &App) -> (axum::Router, ServerControl) {
             Box::pin(async move { set_system_proxy(enabled).await })
         })
         .probe(start_probes_admin)
+        .remove_model(|body| Box::pin(async move { remove_model(body).await }))
+        .restore_model(|body| Box::pin(async move { restore_model(body).await }))
         .provider_status(|_| Box::pin(async move { provider_status().await }))
         .set_provider_key(move |body| {
             Box::pin(async move { set_provider_key(body).await })
@@ -2525,6 +2679,117 @@ async fn import_models(selected: Option<Value>) -> Result<Value, BackendError> {
     Ok(sync)
 }
 
+/// 把「已移除」名单与新的可用集写进状态（串行 + 原子写）。
+/// 可用集由 [`usable_models`] 现算，所以移除/恢复后面板的计数与 `/v1/models` 同源。
+fn persist_removed_models(removed: &[String]) {
+    let ids: Vec<Value> = usable_models()
+        .iter()
+        .map(|model| model.get("id").cloned().unwrap_or(Value::Null))
+        .collect();
+    update_and_persist(json!({
+        "removedModels": removed,
+        "availableModels": ids,
+    }));
+}
+
+/// `POST /admin/remove-model`：`{ model }`。用户显式移除一个模型。
+///
+/// 语义是「不再检测、不再发布」，而不是「从目录里删掉」：目录条目保留，面板的「已移除」
+/// 分组才能显示它并提供恢复入口。持久化在 `settings.json` 的 `removedModels`，跨重启生效。
+async fn remove_model(body: Value) -> Result<Value, BackendError> {
+    let app = global_app();
+    if app.stopping.load(Ordering::Relaxed) {
+        return Err(BackendError::plain("服务正在停止"));
+    }
+    let Some(model) = body
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return Err(BackendError::with("model 必须是非空字符串", 400, "invalid_request_error"));
+    };
+    if !app
+        .models()
+        .iter()
+        .any(|entry| entry.get("id").and_then(Value::as_str) == Some(model))
+    {
+        return Err(BackendError::with("模型不在当前目录中", 400, "model_not_found"));
+    }
+    let mut removed = lock(&app.removed).clone();
+    if !removed.iter().any(|id| id == model) {
+        removed.push(model.to_string());
+        removed.sort();
+    }
+    let next_settings = with_field(&app.read_settings(), "removedModels", json!(removed));
+    app.write_settings(next_settings)
+        .await
+        .map_err(BackendError::plain)?;
+    *lock(&app.removed) = removed.clone();
+    // 通过集同步摘除：即便发布集过滤失效，也不再让它在任何判定里被当成可用。
+    lock(&app.validated).remove(model);
+    persist_removed_models(&removed);
+    // 用户明确移除时允许空发布集：把最后一个模型移除后，插件配置里必须真的清空；
+    // 空集闸门默认「保留既有配置」是防发现失败误清，不适用于这条显式意图。
+    sync_published(None, true);
+    Ok(json!({ "removed": true, "model": model, "removedModels": removed }))
+}
+
+/// `POST /admin/restore-model`：`{ model }`。从「已移除」名单里恢复，并立刻重新检测一次。
+///
+/// 恢复只是解除过滤，不等于宣布可用：单模型探测通过后才重新进入发布集（失败仍按既有规则
+/// 记为不可用，但已不再被移除名单挡住，下次检测会再试）。
+async fn restore_model(body: Value) -> Result<Value, BackendError> {
+    let app = global_app();
+    if app.stopping.load(Ordering::Relaxed) {
+        return Err(BackendError::plain("服务正在停止"));
+    }
+    let Some(model) = body
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return Err(BackendError::with("model 必须是非空字符串", 400, "invalid_request_error"));
+    };
+    // 目录里没有的 id 恢复后也无从检测（常见于上游已下架、目录又被重新读取过）。
+    if !app
+        .models()
+        .iter()
+        .any(|entry| entry.get("id").and_then(Value::as_str) == Some(model))
+    {
+        return Err(BackendError::with(
+            "模型不在当前目录中，请先读取免费模型",
+            400,
+            "model_not_found",
+        ));
+    }
+    let current = lock(&app.removed).clone();
+    if !current.iter().any(|id| id == model) {
+        // 幂等：重复恢复不报错，也不再叠一次探测。
+        return Ok(json!({ "restored": false, "model": model, "removedModels": current, "started": false }));
+    }
+    let removed: Vec<String> = current.into_iter().filter(|id| id != model).collect();
+    let next_settings = with_field(&app.read_settings(), "removedModels", json!(removed));
+    app.write_settings(next_settings)
+        .await
+        .map_err(BackendError::plain)?;
+    *lock(&app.removed) = removed.clone();
+    persist_removed_models(&removed);
+    // 恢复即重新参与检测：单模型探测，与行内「重新检测」同一条入口（成功后自动重发发布集）。
+    let started = start_probes(Some(json!(model)), false, false, &Scope::All);
+    let message = started
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    Ok(json!({
+        "restored": true,
+        "model": model,
+        "removedModels": removed,
+        "started": started.get("started").cloned().unwrap_or(json!(false)),
+        "message": message,
+    }))
+}
+
 async fn set_system_proxy(enabled: Value) -> Result<Value, BackendError> {
     let app = global_app();
     let Some(enabled) = enabled.as_bool() else {
@@ -2669,6 +2934,17 @@ mod tests {
         assert!(pending.is_empty());
     }
 
+    /// 关停开始后只放行「清空」：空集是 `shutdown` 的清理写，必须通过；非空发布必须被拒绝，
+    /// 否则启动时序里迟到的「沿用上次结果」重发会把刚清掉的条目写回插件配置。
+    #[test]
+    fn stopping_allows_cleanup_but_rejects_non_empty_publication() {
+        let model = json!({ "id": "opencode/m", "name": "M" });
+        assert!(rejects_publication_while_stopping(true, std::slice::from_ref(&model)));
+        assert!(!rejects_publication_while_stopping(true, &[]));
+        assert!(!rejects_publication_while_stopping(false, std::slice::from_ref(&model)));
+        assert!(!rejects_publication_while_stopping(false, &[]));
+    }
+
     /// 重新检测的在飞集合：面板的「检测中」完全由它驱动，所以漏撤会让按钮永远点不动、
     /// 重复登记会凭空多出一条，撤销从未登记过的 id 则绝不能 panic。
     #[test]
@@ -2734,7 +3010,7 @@ mod tests {
             "opencode/truthy": { "ok": 1, "source": "probe" },
         });
 
-        let publishable = publishable_models(&models, &validated, &results);
+        let publishable = publishable_models(&models, &validated, &results, &[]);
         let ids: Vec<&str> = publishable
             .iter()
             .filter_map(|model| model["id"].as_str())
@@ -2752,6 +3028,49 @@ mod tests {
                 Some("opencode/ok")
             );
         }
+    }
+
+    /// 用户手动移除的模型即使探测通过、`validated` 里仍有它，也不得进入发布集与 `WB · auto` 的选择域。
+    #[test]
+    fn removed_models_never_reach_the_publish_pool() {
+        let models = vec![
+            json!({ "id": "opencode/keep", "name": "Keep" }),
+            json!({ "id": "opencode/removed", "name": "Removed" }),
+        ];
+        let validated: HashSet<String> = models
+            .iter()
+            .filter_map(|model| model["id"].as_str().map(str::to_string))
+            .collect();
+        let results = json!({
+            "opencode/keep": { "ok": true, "source": "probe" },
+            "opencode/removed": { "ok": true, "source": "probe" },
+        });
+        let removed = vec!["opencode/removed".to_string()];
+
+        let publishable = publishable_models(&models, &validated, &results, &removed);
+        let ids: Vec<&str> = publishable
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["opencode/keep"], "被移除的模型不得出现在发布集");
+    }
+
+    /// `settings.json` 的 `removedModels` 是用户手写/历史版本可能污染过的字段：只收非空字符串，
+    /// 并排序去重，避免持久化值里出现重复项或 null 影响面板与过滤判定。
+    #[test]
+    fn restored_removed_models_sanitizes_persisted_ids() {
+        assert_eq!(restored_removed_models(&json!({})), Vec::<String>::new());
+        let settings = json!({
+            "removedModels": ["opencode/b", "opencode/a", "opencode/b", "", 7, null, "opencode/c"],
+        });
+        assert_eq!(
+            restored_removed_models(&settings),
+            vec![
+                "opencode/a".to_string(),
+                "opencode/b".to_string(),
+                "opencode/c".to_string()
+            ]
+        );
     }
 
     /// 失败/超时模型必须在探测收尾与真实请求失败后都触发一次配置重发：否则过滤只存在于
@@ -3052,6 +3371,65 @@ mod tests {
         apply_patch(&mut state, &json!({}), None, Some(("OC · A", &json!({ "ok": true }))));
         assert!(state["modelResults"].is_object(), "合并必须重建对象而非 panic");
         assert_eq!(state["modelResults"]["OC · A"], json!({ "ok": true }));
+    }
+
+    /// 权重必须与结果在**同一次锁内写入**：探测成功按本次耗时重定权，真实请求慢时扣分，
+    /// 失败保持原值。锁外读旧权重再写回会在并发请求下丢掉扣分，所以判定放在 `apply_patch`。
+    #[test]
+    fn weights_are_updated_in_the_same_locked_write_as_the_result() {
+        let model = "opencode/fast";
+        let mut state = json!({ "modelResults": { model: { "ok": true, "weight": 100 } } });
+
+        let slow = json!({ "ok": true, "source": "request", "durationMs": 45_000 });
+        apply_patch(&mut state, &json!({}), None, Some((model, &slow)));
+        assert_eq!(state["modelResults"][model]["weight"], json!(80), "慢请求扣 20");
+
+        let fast = json!({ "ok": true, "source": "request", "durationMs": 1_000 });
+        apply_patch(&mut state, &json!({}), None, Some((model, &fast)));
+        assert_eq!(state["modelResults"][model]["weight"], json!(80), "快请求不扣也不加");
+
+        let probe = json!({ "ok": true, "source": "probe", "durationMs": 1_000 });
+        apply_patch(&mut state, &json!({}), None, Some((model, &probe)));
+        assert_eq!(state["modelResults"][model]["weight"], json!(100), "探测成功按新耗时重定权");
+
+        let failed = json!({ "ok": false, "source": "request", "durationMs": 50_000 });
+        apply_patch(&mut state, &json!({}), None, Some((model, &failed)));
+        assert_eq!(state["modelResults"][model]["weight"], json!(100), "失败不改变权重");
+    }
+
+    /// 发布集必须带出当前权重，否则 `WB · auto` 的选择器看不到降权结果；
+    /// 缺 `weight` 的旧结果不带该键，由 `auto::weight_of` 按满分处理。
+    #[test]
+    fn the_publishable_pool_carries_the_weight_for_the_auto_router() {
+        let models = vec![
+            json!({ "id": "opencode/old", "name": "Old" }),
+            json!({ "id": "opencode/tired", "name": "Tired" }),
+            json!({ "id": "opencode/fresh", "name": "Fresh" }),
+        ];
+        let validated: HashSet<String> =
+            models.iter().filter_map(|m| m["id"].as_str().map(str::to_string)).collect();
+        let results = json!({
+            "opencode/old": { "ok": true },
+            "opencode/tired": { "ok": true, "weight": 0 },
+            "opencode/fresh": { "ok": true, "weight": 60 },
+        });
+        let pool = publishable_models(&models, &validated, &results, &[]);
+        assert!(pool[0].get("weight").is_none(), "旧结果不加权重键");
+        assert_eq!(crate::auto::weight_of(&pool[0]), crate::auto::DEFAULT_WEIGHT);
+        assert_eq!(pool[1]["weight"], json!(0));
+        assert_eq!(pool[2]["weight"], json!(60));
+
+        let body = json!({
+            "model": crate::auto::AUTO_MODEL_ID,
+            "messages": [{ "role": "user", "content": "hi" }],
+        });
+        // 缺 weight 的旧条目按默认满分（100）参与选择，因此稳定压过 60 与 0。
+        for _ in 0..50 {
+            assert_eq!(
+                crate::auto::auto_select(&body, &pool).as_deref(),
+                Some("opencode/old")
+            );
+        }
     }
 
     /// api-key 引导红线：空白文件必须重新生成，而不是 `trim()` 成空串沿用。

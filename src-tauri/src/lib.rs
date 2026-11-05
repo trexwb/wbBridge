@@ -165,26 +165,30 @@ fn wait_core_stopped(state: &AppState, budget: Duration) -> bool {
     false
 }
 
-/// 停止单个核心实例：HTTP 优雅退出 → 等待编排任务收摊 → 关闭专用运行时。
-/// `key` 为 API key（拿不到就直接跳过 HTTP 走超时兜底）。
+/// 停止单个核心实例：HTTP 优雅退出 → 等不到时改为进程内关停 → 关闭专用运行时。
+/// `key` 为 API key（拿不到就跳过 HTTP，仍走进程内关停）。
 fn stop_core(core: RunningCore, key: Option<&str>, state: &AppState) {
-    let Some(key) = key else {
-        // 没有 key 就无法调用 /admin/shutdown；核心的串行写链还在跑，只能给运行时一个
-        // 有界的排空窗口，超时会丢弃未完成任务（与 Node 侧强杀等价）。
-        core.runtime.shutdown_timeout(Duration::from_secs(5));
-        state.core_stopped.store(true, Ordering::SeqCst);
-        return;
-    };
     state.stopping_by_request.store(true, Ordering::SeqCst);
     // 退出预算必须短：核心正常时 1s 内即退出，卡住时不该让壳等满几十秒（面板点「重启」尤其明显）。
-    // 优雅退出 + 等待编排任务收摊，两步都成立才算干净停止；任一不成立都走强制关闭兜底。
-    if admin_call_with(core.port, key, "/admin/shutdown", None, Duration::from_secs(5)).is_ok()
-        && wait_core_stopped(state, Duration::from_secs(10))
+    // 优雅退出 + 等待编排任务收摊，两步都成立才算干净停止；任一不成立都走兜底。
+    if let Some(key) = key {
+        if admin_call_with(core.port, key, "/admin/shutdown", None, Duration::from_secs(5)).is_ok()
+            && wait_core_stopped(state, Duration::from_secs(10))
+        {
+            core.runtime.shutdown_timeout(Duration::from_secs(2));
+            return;
+        }
+    }
+    // 🔴 HTTP 不可用（典型：核心还在 find_runtime / 下载运行时，回环服务尚未监听；或拿不到 key）
+    // 时不能直接丢掉运行时——那会连同关停清理一起丢掉，WorkBuddy/CodeBuddy 里本工具名下的条目
+    // 就留在配置里了。核心与壳同进程，直接请它走同一条 shutdown 清理链。
+    if orchestration::request_shutdown(core.runtime.handle(), 0)
+        && wait_core_stopped(state, Duration::from_secs(5))
     {
         core.runtime.shutdown_timeout(Duration::from_secs(2));
         return;
     }
-    // 优雅路径没走通：给在途任务一个短排空窗口后强制关闭运行时。
+    // 进程内关停也没走通：给在途任务一个短排空窗口后强制关闭运行时。
     eprintln!("核心未在预算内优雅退出，强制关闭其运行时");
     core.runtime.shutdown_timeout(Duration::from_secs(5));
     state.core_stopped.store(true, Ordering::SeqCst);
@@ -468,7 +472,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 /// 面板动作 → 核心路由的映射表。与 src-tauri/core/src/server.rs 的 ACTION_ROUTES 逐项一致
 /// （由本文件的 `shell_action_routes_match_the_core_contract` 断言）；docs/contract.md 的契约表
 /// 是同一份内容的文字版，改动时仍需人工同步。
-const ADMIN_ROUTES: [(&str, &str); 8] = [
+const ADMIN_ROUTES: [(&str, &str); 10] = [
     ("refresh", "/admin/refresh"),
     ("probe", "/admin/probe"),
     ("import", "/admin/import"),
@@ -477,6 +481,8 @@ const ADMIN_ROUTES: [(&str, &str); 8] = [
     ("provider-status", "/admin/provider-status"),
     ("set-provider-key", "/admin/set-provider-key"),
     ("clear-provider-key", "/admin/clear-provider-key"),
+    ("remove-model", "/admin/remove-model"),
+    ("restore-model", "/admin/restore-model"),
 ];
 
 fn admin_route(action: &str) -> Result<&'static str, String> {
@@ -512,15 +518,15 @@ async fn admin_command(
 }
 
 /// 面板动作一律以**类型化命令**暴露（替换旧的 `core_action` 通用代理）：
-/// - 动作名不再是任意字符串：八个动作各对应一条命令（即 [`ADMIN_ROUTES`] / 核心
-///   `ACTION_ROUTES` 的八条路由），未知命令在 IPC 层根本不存在，无法再拼任意动作名；
+/// - 动作名不再是任意字符串：十个动作各对应一条命令（即 [`ADMIN_ROUTES`] / 核心
+///   `ACTION_ROUTES` 的十条路由），未知命令在 IPC 层根本不存在，无法再拼任意动作名；
 /// - 每个命令的参数都是强类型字段，serde 反序列化即完成校验：字段名或类型错误在 IPC 层
 ///   直接拒绝；payload 由壳侧按该动作的契约组装后再转发，调用方不再能送任意请求体；
 /// - 与既往前端契约保持形状兼容：`refresh / shutdown / provider-status` 无参数，
 ///   `probe` 收可选 `model / providers`，`import` 收可选 `modelsFile`，
 ///   `system-proxy` 必填 `enabled`，`set-provider-key` 必填 `provider + apiKey`，
-///   `clear-provider-key` 必填 `provider`（后两者的 provider 合法性仍由核心裁决，
-///   壳层不重复业务校验，保持单一真相）。
+///   `clear-provider-key` 必填 `provider`，`remove-model` / `restore-model` 必填 `model`
+///   （provider 与 model 的合法性仍由核心裁决，壳层不重复业务校验，保持单一真相）。
 
 #[tauri::command]
 async fn core_refresh(app: AppHandle, state: State<'_, AppState>) -> Result<Value, String> {
@@ -604,6 +610,36 @@ async fn core_clear_provider_key(
     .await
 }
 
+#[tauri::command]
+async fn core_remove_model(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    model: String,
+) -> Result<Value, String> {
+    admin_command(
+        app,
+        state,
+        "/admin/remove-model",
+        Some(serde_json::json!({ "model": model })),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn core_restore_model(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    model: String,
+) -> Result<Value, String> {
+    admin_command(
+        app,
+        state,
+        "/admin/restore-model",
+        Some(serde_json::json!({ "model": model })),
+    )
+    .await
+}
+
 /// 面板可以请求打开的官方站点主机名（与 `src/views/ProvidersView.vue` 的 `PLATFORM_GUIDES`
 /// 一一对应；新增平台必须同步改这两处）。
 ///
@@ -616,6 +652,11 @@ const EXTERNAL_HOSTS: &[&str] = &[
     "cloud.siliconflow.cn",
     "console.cloud.tencent.com",
     "open.bigmodel.cn",
+    "platform.agnes-ai.com",
+    "platform.sensenova.cn",
+    "build.nvidia.com",
+    "openrouter.ai",
+    "huggingface.co",
 ];
 
 /// `open_external` 的校验部分，返回 `None` 即放行。
@@ -1350,6 +1391,8 @@ pub fn run() {
             core_provider_status,
             core_set_provider_key,
             core_clear_provider_key,
+            core_remove_model,
+            core_restore_model,
             restart_core,
             core_running,
             data_dir_path,
@@ -1393,6 +1436,11 @@ mod tests {
             "https://cloud.siliconflow.cn/account/ak",
             "https://console.cloud.tencent.com/tokenhub/apikey",
             "https://open.bigmodel.cn/usercenter/apikeys",
+            "https://platform.agnes-ai.com/",
+            "https://platform.sensenova.cn/console",
+            "https://build.nvidia.com/settings/api-keys",
+            "https://openrouter.ai/settings/keys",
+            "https://huggingface.co/settings/tokens",
         ] {
             assert_eq!(external_url_rejection(url), None, "{url} 是名单内的官方页，必须放行");
         }

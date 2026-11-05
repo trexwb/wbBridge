@@ -30,23 +30,43 @@ export const DEFAULT_MODEL = AI_PRESETS[0].model
 export const AUTO_MODEL_ID = 'WB · auto'
 export const DEFAULT_SELF_MODEL = AUTO_MODEL_ID
 
-// 四家平台的官方 Key 申请页（与面板「平台」视图同一批地址）。壳侧 open_external 有
+// 注册表内平台的官方 Key 申请页（与面板「平台」视图同一批地址）。壳侧 open_external 有
 // https + 字符白名单 + EXTERNAL_HOSTS 精确主机名三重校验，名单外的域名一律拒绝，
-// 所以这里的值只可能是这四家；模型编造别的地址会在壳侧被挡下。
+// 所以这里的值只可能是注册表里的这些平台；模型编造别的地址会在壳侧被挡下。
 export const PROVIDER_PAGES = {
   modelscope: 'https://www.modelscope.cn/my/access/token',
   'siliconflow-cn': 'https://cloud.siliconflow.cn/account/ak',
   'tencent-tokenhub': 'https://console.cloud.tencent.com/tokenhub/apikey',
   zhipuai: 'https://open.bigmodel.cn/usercenter/apikeys',
+  agnes: 'https://platform.agnes-ai.com/',
+  sensenova: 'https://platform.sensenova.cn/console',
+  nvidia: 'https://build.nvidia.com/settings/api-keys',
+  openrouter: 'https://openrouter.ai/settings/keys',
+  huggingface: 'https://huggingface.co/settings/tokens',
 }
 
 // 平台注册表（与核心 providers.rs 的面板视图一致）：set/clear-provider-key 的入参白名单。
-export const PROVIDER_IDS = ['modelscope', 'siliconflow-cn', 'tencent-tokenhub', 'zhipuai']
+export const PROVIDER_IDS = [
+  'modelscope',
+  'siliconflow-cn',
+  'tencent-tokenhub',
+  'zhipuai',
+  'agnes',
+  'sensenova',
+  'nvidia',
+  'openrouter',
+  'huggingface',
+]
 export const PROVIDER_LABELS = {
   modelscope: 'ModelScope',
   'siliconflow-cn': 'SiliconFlow',
   'tencent-tokenhub': '腾讯混元 TokenHub',
   zhipuai: '智谱',
+  agnes: '爱思 Agnes',
+  sensenova: '商汤 SenseNova',
+  nvidia: 'NVIDIA NIM',
+  openrouter: 'OpenRouter',
+  huggingface: 'Hugging Face',
 }
 
 // ── 工具定义 ────────────────────────────────────────────────────────
@@ -95,7 +115,7 @@ const TOOL_DEFS = [
     name: 'provider_status',
     write: false,
     label: '读取平台配置',
-    description: '读取四个免费模型平台的 Key 配置状态（只回「是否已配置」，不回任何 Key 内容）。只读，立即执行。',
+    description: '读取各免费模型平台的 Key 配置状态（只回「是否已配置」，不回任何 Key 内容）。只读，立即执行。',
     parameters: { type: 'object', properties: {} },
   },
   {
@@ -258,14 +278,24 @@ export function phaseLabel(phase) {
 
 // ── 状态快照（system prompt 的上下文底座） ──────────────────────────
 // 全部取自壳推送的真实快照；拿不到的字段不编，宁缺勿假。
+// 已移除模型仍在目录里（面板要显示名称与恢复入口），但对助手而言它们不参与检测与发布，
+// 因此统计与模型行一律按「活跃模型」来算，并单独报出移除数量。
+function activeModelsOf(state) {
+  const models = Array.isArray(state?.models) ? state.models : []
+  const removed = new Set((Array.isArray(state?.removedModels) ? state.removedModels : []).map(String))
+  return models.filter(model => !removed.has(String(model?.id ?? '')))
+}
+
 export function buildSnapshot(state) {
   const s = state && typeof state === 'object' ? state : {}
-  const models = Array.isArray(s.models) ? s.models : []
+  const models = activeModelsOf(s)
+  const removedCount = Array.isArray(s.removedModels) ? s.removedModels.length : 0
   const available = new Set((Array.isArray(s.availableModels) ? s.availableModels : []).map(String))
   const lines = []
   lines.push(`【服务状态】阶段：${phaseLabel(s.phase)}${s.message ? `（${s.message}）` : ''}`)
   lines.push(
-    `【模型】共 ${models.length} 个；探测可用 ${available.size} 个；不可用 ${Math.max(0, models.length - available.size)} 个。`,
+    `【模型】共 ${models.length} 个；探测可用 ${available.size} 个；不可用 ${Math.max(0, models.length - available.size)} 个。` +
+      (removedCount > 0 ? `另有 ${removedCount} 个已被用户移除（不检测、不发布，可恢复）。` : ''),
   )
   // 能力位直接取自壳推送的模型条目（backend.rs::free_models_in 归一成布尔），
   // 这正是核心 WB · auto 选模型时读的同一批字段，助手据此解释「为什么带工具的请求失败了」。
@@ -316,7 +346,7 @@ export function buildSystemPrompt(snapshot = '') {
     '   装完再用 apply_update 重启生效。跳过前两步的 download_update / apply_update 一定失败，不要重试，',
     '   直接把原因告诉用户。apply_update 会立刻退出并重启本应用，必须提醒用户先保存手头工作。',
     '4. 模型 id 必须来自下方快照或 list_models 的返回，禁止编造；平台 id 只能是',
-    '   modelscope / siliconflow-cn / tencent-tokenhub / zhipuai 之一。',
+    `   ${PROVIDER_IDS.join(' / ')} 之一。`,
     '5. set_provider_key 的 apiKey 只能使用用户在本轮对话里提供的值；不要编造、不要在回复中复述完整 Key。',
     '   用户还没 Key 时可以起草 open_provider_page 打开官方申请页，但不要声称已保存任何 Key。',
     '6. 数字（模型数、可用数、请求数）一律以快照与工具返回为准，不要自行重算或编造。',
@@ -472,7 +502,7 @@ export function toolCallPreview(name, args = {}) {
 
 // ── 模型行（list_models / 快照共用） ────────────────────────────────
 function modelRows(state) {
-  const models = Array.isArray(state?.models) ? state.models : []
+  const models = activeModelsOf(state)
   const results = state?.modelResults && typeof state.modelResults === 'object' ? state.modelResults : {}
   const available = new Set((Array.isArray(state?.availableModels) ? state.availableModels : []).map(String))
   return models.map(m => {
@@ -510,8 +540,9 @@ export async function runTool(name, args = {}, ctx = {}) {
         result: {
           phase: state.phase ?? null,
           message: state.message ?? null,
-          models: Array.isArray(state.models) ? state.models.length : 0,
+          models: activeModelsOf(state).length,
           availableModels: Array.isArray(state.availableModels) ? state.availableModels.length : 0,
+          removedModels: Array.isArray(state.removedModels) ? state.removedModels.length : 0,
           probeRunning: state.probe?.running === true,
           useSystemProxy: state.useSystemProxy === true,
           sync: state.sync ?? null,

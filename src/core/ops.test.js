@@ -84,6 +84,13 @@ test('success messages exist for terminal and submit actions', () => {
   assert.ok(successMessage('probe', { started: true }).includes('检测已开始'))
   // started=false 的 probe 是核心拒收：文案为空，由 App.vue 的既有 refusal 分支负责。
   assert.equal(successMessage('probe', { started: false }), '')
+  // 移除 / 恢复：成功文案必须说清「不再检测、不再发布」与「已恢复并重新检测」。
+  assert.ok(successMessage('remove-model', { model: 'OC · demo' }).includes('不再检测'))
+  assert.ok(successMessage('remove-model', { model: 'OC · demo' }).includes('OC · demo'))
+  // 移除后模型从列表消失，文案必须给出恢复落点（顶部「回收站」）
+  assert.ok(successMessage('remove-model', { model: 'OC · demo' }).includes('回收站'))
+  assert.ok(successMessage('restore-model', { model: 'OC · demo', restored: true, started: true }).includes('重新检测'))
+  assert.ok(successMessage('restore-model', { model: 'OC · demo', restored: false }).includes('不在移除名单'))
 })
 
 test('import and provider key actions keep their view-specific feedback', () => {

@@ -107,7 +107,7 @@ pub fn free_models_in(providers: &Value, namespace: &str) -> Result<Vec<Value>, 
     // 有权威清单的平台只放行清单里的 id（见 `providers::Provider::models`）。OpenCode 是把注入段
     // 与 models.dev 的 catalog **合并**而不是替换，因此只声明不够：不过滤的话探测队列里依旧是
     // 对方实际不承接的那批过期 id，全部以 `has no provider supported` 失败。
-    // 空清单（其余三家、`opencode`、以及合成命名空间）一律放行，行为与之前逐字节一致。
+    // 空清单（其余八家、`opencode`、以及合成命名空间）一律放行，行为与之前逐字节一致。
     let served = crate::providers::served_models(namespace);
     let mut models: Vec<Value> = Vec::new();
     if let Some(entries) = provider.get("models").and_then(Value::as_object) {
