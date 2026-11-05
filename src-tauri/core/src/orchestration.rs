@@ -1629,6 +1629,41 @@ fn merge_scoped_models(old: &[Value], discovered: &[Value], scope: &Scope) -> Ve
     merged
 }
 
+/// 目录里属于「已移除」名单的条目（按全限定 id）。
+///
+/// 全量读取会先把目录清空，而读取后的列表又只由**逐个揭示**填回来；已移除的模型不探测，
+/// 因此永远不会被揭示。不把它们单独留住并接回，一次「读取免费模型」就会让回收站的行
+/// 永久消失——`settings.json` 里的 id 还在（模型依旧不检测、不发布），面板却没有任何
+/// 可恢复的条目。
+fn removed_entries(models: &[Value], removed: &[String]) -> Vec<Value> {
+    models
+        .iter()
+        .filter(|model| {
+            model
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| removed.iter().any(|removed_id| removed_id == id))
+        })
+        .cloned()
+        .collect()
+}
+
+/// 把读取前留住的已移除条目接回新目录：新目录里仍有该 id 时以新发现为准（名称 / 能力可能
+/// 变了），已下架或转收费的沿用旧条目，保证回收站里始终有可恢复的行。
+fn merge_removed_entries(merged: &mut Vec<Value>, retained: &[Value]) {
+    for entry in retained {
+        let Some(id) = entry.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !merged
+            .iter()
+            .any(|model| model.get("id").and_then(Value::as_str) == Some(id))
+        {
+            merged.push(entry.clone());
+        }
+    }
+}
+
 /// 把范围内模型的「已校验」标记摘掉：换 Key 之后这些模型必须重新探测才算可用，
 /// 而其余平台的标记不能被牵连（那正是「只重检这一家」的另一半）。全量范围就是原有的清空语义。
 fn strip_validated(validated: &mut HashSet<String>, scope: &Scope) {
@@ -1690,13 +1725,27 @@ async fn refresh(
             Ok(env) => {
                 let proxy_env = to_env_map(&env);
                 let app = global_app();
+                // 已移除的模型不参与探测，读取后的「逐个揭示」永远轮不到它们；先留住目录条目，
+                // 读取结束后接回，回收站才不会因为一次读取而清空。以面板列表（status.models）为准：
+                // 上一轮读取失败时内存目录已被清空，但已移除的条目仍在状态里。
+                let retained = if scope == Scope::All {
+                    let displayed = app
+                        .snapshot()
+                        .get("models")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    removed_entries(&displayed, &lock(&app.removed).clone())
+                } else {
+                    Vec::new()
+                };
                 if scope == Scope::All {
                     lock(&app.validated).clear();
                     *lock(&app.models) = Vec::new();
                     update_and_persist(json!({
                         "phase": "reading",
                         "message": "正在读取免费模型…",
-                        "models": [],
+                        "models": retained.clone(),
                         "availableModels": []
                     }));
                 } else {
@@ -1706,7 +1755,7 @@ async fn refresh(
                         "message": format!("正在重新读取 {} 的免费模型…", scope.labels())
                     }));
                 }
-                run_refresh(restart_runtime, enabled, proxy_env, &scope).await
+                run_refresh(restart_runtime, enabled, proxy_env, &scope, &retained).await
             }
         };
         // 对应 JS 的 `finally { refreshing = null }`：只有当前代次才有权释放链位。
@@ -1796,6 +1845,7 @@ async fn run_refresh(
     use_system_proxy: bool,
     proxy_env: Env,
     scope: &Scope,
+    retained_removed: &[Value],
 ) -> Result<Value, BackendError> {
     let app = global_app();
     if restart_runtime {
@@ -1851,7 +1901,12 @@ async fn run_refresh(
         Ok(models) => models,
     };
     // 定向范围：其余平台的目录原样留着，清单内那一段整体换成刚发现的。全量范围等价于直接用新目录。
-    let merged = merge_scoped_models(&app.models(), &discovered, scope);
+    let mut merged = merge_scoped_models(&app.models(), &discovered, scope);
+    if scope == &Scope::All {
+        // 已移除的模型不探测、不会被逐个揭示；接回读取前留住的条目（发现清单里已下架的也保留），
+        // 回收站才能在「读取免费模型」之后继续显示并可恢复。
+        merge_removed_entries(&mut merged, retained_removed);
+    }
     {
         // 清单内平台刚换过 Key，它名下的模型必须重新探测才算可用；其余平台的标记不受牵连。
         let mut validated = lock(&app.validated);
@@ -1866,6 +1921,11 @@ async fn run_refresh(
         // 全量读取的列表由随后的逐个揭示填（`start_probes(reveal = true)`）；定向读取不走那条路径，
         // 目录必须在这里整体落盘，否则面板与 status.json 里的 `models` 还停在换 Key 之前。
         patch["models"] = json!(merged);
+    } else {
+        // 全量读取同样只揭示被探测的模型，已移除的那几条必须现在写回面板列表，
+        // 否则回收站在读取完成后清空（id 还留在 settings.json，却没有任何可恢复的行）。
+        let seed = removed_entries(&merged, &lock(&app.removed).clone());
+        patch["models"] = json!(seed);
     }
     update_and_persist(patch);
     Ok(json!({ "count": merged.len() }))
@@ -3292,6 +3352,54 @@ mod tests {
 
         // 全量范围 = 既有的「整份替换」语义
         assert_eq!(merge_scoped_models(&old, &discovered, &Scope::All), discovered);
+    }
+
+    /// 全量读取会清空目录，而且只逐个揭示被探测的模型；已移除的模型必须被单独留住并接回，
+    /// 否则一次「读取免费模型」就会让回收站的行永久消失（名单仍在 `settings.json` 里）。
+    #[test]
+    fn removed_entries_survive_a_full_refresh() {
+        let models: Vec<Value> = json!([
+            { "id": "opencode/keep" },
+            { "id": "opencode/removed", "name": "旧名字" },
+            { "id": "modelscope/removed", "name": "另一家" }
+        ])
+        .as_array()
+        .unwrap()
+        .clone();
+        let removed = vec![
+            "opencode/removed".to_string(),
+            "modelscope/removed".to_string(),
+        ];
+
+        // 读取前只留住已移除的条目，参与检测的模型不在这里
+        let retained = removed_entries(&models, &removed);
+        let ids: Vec<&str> = retained
+            .iter()
+            .filter_map(|model| model.get("id").and_then(Value::as_str))
+            .collect();
+        assert_eq!(ids, vec!["opencode/removed", "modelscope/removed"]);
+
+        // 新目录里仍有它：以新发现为准，不重复追加；发现清单里没有的（已下架）沿用旧条目
+        let mut discovered: Vec<Value> = json!([
+            { "id": "opencode/removed", "name": "新名字" },
+            { "id": "opencode/keep" }
+        ])
+        .as_array()
+        .unwrap()
+        .clone();
+        merge_removed_entries(&mut discovered, &retained);
+        let ids: Vec<&str> = discovered
+            .iter()
+            .filter_map(|model| model.get("id").and_then(Value::as_str))
+            .collect();
+        assert_eq!(ids, vec!["opencode/removed", "opencode/keep", "modelscope/removed"]);
+        assert_eq!(discovered[0]["name"], "新名字");
+
+        // 缺 id 的脏条目不得被插进目录
+        let dirty = vec![json!({ "name": "no id" })];
+        let mut merged: Vec<Value> = Vec::new();
+        merge_removed_entries(&mut merged, &dirty);
+        assert!(merged.is_empty());
     }
 
     /// 换 Key 之后必须重新探测才算可用，但只摘本平台的通过标记；
