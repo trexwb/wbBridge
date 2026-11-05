@@ -462,7 +462,17 @@ fn provider_registry_is_reviewed_and_status_echoes_no_key_material() {
     ids.sort_unstable();
     assert_eq!(
         ids,
-        vec!["modelscope", "siliconflow-cn", "tencent-tokenhub", "zhipuai"],
+        vec![
+            "agnes",
+            "huggingface",
+            "modelscope",
+            "nvidia",
+            "openrouter",
+            "sensenova",
+            "siliconflow-cn",
+            "tencent-tokenhub",
+            "zhipuai",
+        ],
         "接入的平台集合是复核过的，改动 providers.rs 必须同步这条断言"
     );
     for provider in providers::PROVIDERS {

@@ -4,6 +4,10 @@
 //! 选出该用哪个模型的全限定 id」。选中之后的链路（`prepare` → `backend` → `record`）一字不改，
 //! 因此被选中模型的失败仍走既有判决（`orchestration.rs::record` 的 `validated.remove`）。
 //!
+//! 选择偏好由**速度权重**决定：探测成功时按耗时定权（[`probe_weight`]），真实请求过慢时扣分
+//! （[`decayed_weight`]），选档取同档候选里权重最高者（[`select_weighted_with`]）。权重本身存在
+//! `status.json` 的 `modelResults.<id>.weight`，本模块只提供纯函数，读写与「归零后重检」在编排层。
+//!
 //! 三条设计约束（详见 `docs/plans/2026-10-10-wb-auto-smart-router.md` §2）：
 //! 1. 返回值必须是**全限定 id**（如 `opencode/glm-4.7-flash-free`），不能是面板用的 client id
 //!    （`OC · 名称`）——记账键与实际模型必须是同一个值，否则失败判决打在假键上。
@@ -75,17 +79,83 @@ pub fn any_tool_capable(models: &[Value]) -> bool {
     models.iter().any(|model| fits(model, false, true))
 }
 
-/// 核心选择器（纯函数，选择器注入以便单测钉住「候选域是谁」）。
+/// 没有权重记录时的默认权重（满分）。旧版 `status.json` 的 `modelResults` 没有 `weight`，
+/// 沿用上次结果时按满分处理——不能因为「旧数据缺这个字段」就把整池判成权重已耗尽。
+pub const DEFAULT_WEIGHT: u32 = 100;
+
+/// 一次真实请求整条耗时超过该值算「慢」，扣一次权重。
 ///
-/// `pool` 必须是调用方**只取读一次**的 `usable_models()` 快照；`pick(len)` 返回候选集中的下标
-/// （只被调用一次，故取 `FnOnce`，测试因此能在闭包里记下候选域大小），`None` 表示放弃本次路由
-/// （交回 `prepare` 走既有 400）。候选层为空时退回全池，全池也为空则返回 `None` ——
-/// 不做静默兜底、不新增错误码。
-pub fn select_with(
-    body: &Value,
-    pool: &[Value],
-    pick: impl FnOnce(usize) -> Option<usize>,
-) -> Option<String> {
+/// 口径是**整条请求**（含生成），长回答天然更久，所以阈值取 30s：只有明显偏慢的等待才扣分。
+pub const SLOW_REQUEST_MS: i64 = 30_000;
+
+/// 每次慢请求扣掉的权重。满分 100 → 连续 5 次慢请求归零；
+/// 归零后由编排层的「全池权重为 0」判定触发一次全量重检。
+pub const SLOW_PENALTY: u32 = 20;
+
+/// 探测耗时 → 初始权重（分档，恒为正数）。
+///
+/// 探测是带工具调用的真实请求，其耗时近似「首包 + 一轮工具调用」，足以区分端点的快慢；
+/// 权重必须 > 0，否则探测刚成功就会凑满「全池为 0」而立刻再次重检。
+pub fn probe_weight(duration_ms: i64) -> u32 {
+    match duration_ms {
+        i64::MIN..=2_000 => 100,
+        2_001..=5_000 => 80,
+        5_001..=10_000 => 60,
+        10_001..=20_000 => 40,
+        20_001..=40_000 => 20,
+        _ => 10,
+    }
+}
+
+/// 模型当前权重；缺字段（旧状态、尚未探测）按 [`DEFAULT_WEIGHT`]。
+pub fn weight_of(model: &Value) -> u32 {
+    model
+        .get("weight")
+        .and_then(Value::as_u64)
+        .map(|weight| u32::try_from(weight).unwrap_or(u32::MAX))
+        .unwrap_or(DEFAULT_WEIGHT)
+}
+
+/// 慢请求扣权重，快请求不动；扣到 0 为止，不回负。
+pub fn decayed_weight(current: u32, duration_ms: i64) -> u32 {
+    if duration_ms >= SLOW_REQUEST_MS {
+        current.saturating_sub(SLOW_PENALTY)
+    } else {
+        current
+    }
+}
+
+/// 一次结果对权重的更新。**必须在状态锁内调用**（基于上一份权重计算），否则并发请求
+/// 各自读旧值再写回会丢掉扣分。
+///
+/// - 探测成功：按本次耗时重新定权（手工「重新检测」也因此能重新分配权重）；
+/// - 真实请求成功：慢请求扣分；
+/// - 失败与其它来源：保持原权重（`None` 表示该模型还没有权重记录）。
+pub fn next_weight(
+    current: Option<u32>,
+    ok: bool,
+    source: &str,
+    duration_ms: i64,
+) -> Option<u32> {
+    if !ok {
+        return current;
+    }
+    match source {
+        "probe" => Some(probe_weight(duration_ms)),
+        "request" => Some(decayed_weight(current.unwrap_or(DEFAULT_WEIGHT), duration_ms)),
+        _ => current,
+    }
+}
+
+/// 池里所有权重都已归零 → 需要重新检测并重新分配权重。
+///
+/// 空池返回 false：没有可检的模型，也避免调用方把「池空」误当成触发条件。
+pub fn all_weights_exhausted(models: &[Value]) -> bool {
+    !models.is_empty() && models.iter().all(|model| weight_of(model) == 0)
+}
+
+/// 按请求内容筛出候选集（能力档位，见模块头注释第 3 条）。候选层为空时退回全池。
+fn candidates<'a>(body: &Value, pool: &'a [Value]) -> Vec<&'a Value> {
     let messages: &[Value] = body
         .get("messages")
         .and_then(Value::as_array)
@@ -99,11 +169,25 @@ pub fn select_with(
         .filter(|model| fits(model, images, tools))
         .collect();
     // 退全池而非「报一个专用错误」：与用户手动选到能力不匹配的模型时的行为保持一致。
-    let candidates = if matching.is_empty() {
-        pool.iter().collect::<Vec<&Value>>()
+    if matching.is_empty() {
+        pool.iter().collect()
     } else {
         matching
-    };
+    }
+}
+
+/// 核心选择器（纯函数，选择器注入以便单测钉住「候选域是谁」）。
+///
+/// `pool` 必须是调用方**只取读一次**的 `usable_models()` 快照；`pick(len)` 返回候选集中的下标
+/// （只被调用一次，故取 `FnOnce`，测试因此能在闭包里记下候选域大小），`None` 表示放弃本次路由
+/// （交回 `prepare` 走既有 400）。候选层为空时退回全池，全池也为空则返回 `None` ——
+/// 不做静默兜底、不新增错误码。
+pub fn select_with(
+    body: &Value,
+    pool: &[Value],
+    pick: impl FnOnce(usize) -> Option<usize>,
+) -> Option<String> {
+    let candidates = candidates(body, pool);
     let index = pick(candidates.len())?;
     candidates
         .get(index)?
@@ -112,19 +196,56 @@ pub fn select_with(
         .map(str::to_string)
 }
 
-/// 生产入口：均匀随机（负载分散），复用既有 `random_uuid()`（uuid v4，OS CSPRNG 驱动），
-/// 取其前 4 个 hex 位（16 bit）对候选数取模。池规模 ~30 时模偏差 <0.05%，
-/// 足够分散；不为此引入 `fastrand` / `rand`。
+/// 在候选集里找出权重最高的下标；同权重时把 `pick(数量)` 交给调用方（生产入口用随机，
+/// 单测用固定值），避免同权重模型被列表顺序钉死在某一个上。
+fn highest_weight(
+    candidates: &[&Value],
+    pick: impl FnOnce(usize) -> Option<usize>,
+) -> Option<usize> {
+    let max = candidates.iter().map(|model| weight_of(model)).max()?;
+    let top: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, model)| weight_of(model) == max)
+        .map(|(index, _)| index)
+        .collect();
+    let slot = pick(top.len())?;
+    top.get(slot).copied()
+}
+
+/// 按速度权重选择：只在**能力档位候选**里取权重最高的模型，同权重随机分散。
+///
+/// `pick(len)` 与 [`select_with`] 同语义：参数是同权重候选的数量。
+pub fn select_weighted_with(
+    body: &Value,
+    pool: &[Value],
+    pick: impl FnOnce(usize) -> Option<usize>,
+) -> Option<String> {
+    let candidates = candidates(body, pool);
+    let index = highest_weight(&candidates, pick)?;
+    candidates
+        .get(index)?
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// 0..len 的随机下标：复用既有 `random_uuid()`（uuid v4，OS CSPRNG 驱动），取其前 4 个
+/// hex 位（16 bit）对数量取模。候选规模 ~30 时模偏差 <0.05%，足够分散；
+/// 不为此引入 `fastrand` / `rand`。
+fn random_index(len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let hex = random_uuid().replace('-', "");
+    let head = hex.get(..4)?;
+    let value = u32::from_str_radix(head, 16).ok()?;
+    Some((value % len as u32) as usize)
+}
+
+/// 生产入口：同档候选里取权重最高者；同权重时随机取一个（负载分散）。
 pub fn auto_select(body: &Value, pool: &[Value]) -> Option<String> {
-    select_with(body, pool, |len| {
-        if len == 0 {
-            return None;
-        }
-        let hex = random_uuid().replace('-', "");
-        let head = hex.get(..4)?;
-        let value = u32::from_str_radix(head, 16).ok()?;
-        Some((value % len as u32) as usize)
-    })
+    select_weighted_with(body, pool, random_index)
 }
 
 #[cfg(test)]
@@ -362,5 +483,137 @@ mod tests {
     fn auto_model_id_is_the_only_literal_the_surface_uses() {
         assert_eq!(AUTO_MODEL_ID, "WB · auto");
         assert!(!pool().iter().any(|m| m["id"] == json!(AUTO_MODEL_ID)));
+    }
+
+    // ------------------------------------------------------------------
+    // 速度权重
+    // ------------------------------------------------------------------
+
+    /// 权重条目：`usable_models()` 里真实条目一定带能力位，这里同时带上 `weight`。
+    fn weighted(id: &str, weight: u64, images: bool, toolcall: bool, chat_only: bool) -> Value {
+        json!({
+            "id": id,
+            "images": images,
+            "toolcall": toolcall,
+            "chatOnly": chat_only,
+            "weight": weight,
+        })
+    }
+
+    /// 探测耗时是**初始权重**的唯一来源：越快越高，且每个成功的探测都必须留下正权重，
+    /// 否则探测刚结束就会立刻凑满「全池为 0」再次触发重检。
+    #[test]
+    fn probe_speed_maps_to_a_positive_weight() {
+        assert_eq!(probe_weight(500), 100);
+        assert_eq!(probe_weight(2_000), 100);
+        assert_eq!(probe_weight(2_001), 80);
+        assert_eq!(probe_weight(5_000), 80);
+        assert_eq!(probe_weight(10_000), 60);
+        assert_eq!(probe_weight(20_000), 40);
+        assert_eq!(probe_weight(40_000), 20);
+        assert_eq!(probe_weight(40_001), 10);
+        assert!(probe_weight(60_000) > 0, "探测成功后的权重必须为正");
+    }
+
+    /// 只有「真实请求成功且整条耗时 ≥ 30s」才扣分；快请求、失败、探测路径都不走扣分。
+    #[test]
+    fn weights_decay_only_on_slow_successful_requests() {
+        assert_eq!(decayed_weight(100, SLOW_REQUEST_MS - 1), 100, "未过阈值不扣分");
+        assert_eq!(decayed_weight(100, SLOW_REQUEST_MS), 80);
+        assert_eq!(decayed_weight(20, SLOW_REQUEST_MS), 0);
+        assert_eq!(decayed_weight(10, SLOW_REQUEST_MS), 0, "扣到 0 为止，不回负");
+
+        assert_eq!(next_weight(Some(100), true, "request", 5_000), Some(100));
+        assert_eq!(next_weight(Some(100), true, "request", 45_000), Some(80));
+        assert_eq!(next_weight(None, true, "request", 45_000), Some(80), "旧数据缺权重按满分起步");
+        assert_eq!(next_weight(Some(80), false, "request", 45_000), Some(80), "失败不改变权重");
+        assert_eq!(next_weight(None, false, "request", 45_000), None, "没有历史权重就不凭空造");
+    }
+
+    /// 探测成功按本次耗时**重新定权**（即使上一份权重更高也会被覆盖），这是「重新分配权重」。
+    #[test]
+    fn a_successful_probe_reassigns_the_weight_from_its_own_latency() {
+        assert_eq!(next_weight(Some(20), true, "probe", 1_000), Some(100));
+        assert_eq!(next_weight(Some(100), true, "probe", 15_000), Some(40));
+        assert_eq!(next_weight(None, true, "probe", 12_000), Some(40));
+        // 探测失败保持原值：模型这次没通过，权重不参与选择，等下次通过再重定。
+        assert_eq!(next_weight(Some(60), false, "probe", 1_000), Some(60));
+    }
+
+    /// 「全池为 0」只在池非空时成立；缺 `weight` 的旧条目按满分处理，不能把旧状态误判成耗尽。
+    #[test]
+    fn weight_exhaustion_needs_a_non_empty_pool_and_explicit_zeros() {
+        assert!(!all_weights_exhausted(&[]), "空池不是「权重耗尽」");
+        assert!(!all_weights_exhausted(&pool()), "缺 weight 的旧数据按满分处理");
+        assert!(!all_weights_exhausted(&[
+            weighted("opencode/a", 0, false, false, false),
+            weighted("opencode/b", 20, false, false, false),
+        ]));
+        assert!(all_weights_exhausted(&[
+            weighted("opencode/a", 0, false, false, false),
+            weighted("opencode/b", 0, false, false, false),
+        ]));
+    }
+
+    /// 默认选择必须落在**权重最高**的模型上，而不是随机分散到全池。
+    #[test]
+    fn auto_select_always_takes_the_highest_weight_candidate() {
+        let pool = vec![
+            weighted("opencode/slow", 20, false, false, false),
+            weighted("opencode/fast", 100, false, false, false),
+            weighted("opencode/mid", 60, false, false, false),
+        ];
+        let body = body(AUTO_MODEL_ID, json!("hi"), Value::Null);
+        for _ in 0..50 {
+            assert_eq!(auto_select(&body, &pool).as_deref(), Some("opencode/fast"));
+        }
+    }
+
+    /// 同权重只在「并列最高」的那几个之间随机——低权重模型不该被抽中。
+    #[test]
+    fn ties_only_spread_across_the_highest_weight_models() {
+        let pool = vec![
+            weighted("opencode/a", 100, false, false, false),
+            weighted("opencode/b", 100, false, false, false),
+            weighted("opencode/low", 30, false, false, false),
+        ];
+        let body = body(AUTO_MODEL_ID, json!("hi"), Value::Null);
+        let mut distinct = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let got = auto_select(&body, &pool).expect("池非空必有选择");
+            assert_ne!(got, "opencode/low", "低权重模型不得因随机性被选中");
+            distinct.insert(got);
+        }
+        assert_eq!(distinct.len(), 2, "并列最高权重之间应当分散");
+    }
+
+    /// 权重只在能力档位**内部**比较：图片请求不得因为纯文本模型权重更高就选它。
+    #[test]
+    fn weighting_never_escapes_the_capability_tier() {
+        let pool = vec![
+            weighted("opencode/text", 100, false, false, false),
+            weighted("opencode/vision", 10, true, false, false),
+        ];
+        let content = json!([
+            { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } }
+        ]);
+        let got = select_weighted_with(&body(AUTO_MODEL_ID, content, Value::Null), &pool, first);
+        assert_eq!(got.as_deref(), Some("opencode/vision"));
+
+        let tools = json!([{ "type": "function", "function": { "name": "run" } }]);
+        let pool = vec![
+            weighted("opencode/chat", 100, false, false, true),
+            weighted("opencode/agent", 10, false, true, false),
+        ];
+        let got = select_weighted_with(&body(AUTO_MODEL_ID, json!("hi"), tools), &pool, first);
+        assert_eq!(got.as_deref(), Some("opencode/agent"), "工具档不得落到 chatOnly 上");
+    }
+
+    /// 选择器放弃时仍返回 None（交回 prepare 的既有 400），不因为有权重就兜底。
+    #[test]
+    fn a_weighted_picker_returning_none_abandons_the_route() {
+        let pool = vec![weighted("opencode/a", 100, false, false, false)];
+        let got = select_weighted_with(&body(AUTO_MODEL_ID, json!("hi"), Value::Null), &pool, |_| None);
+        assert_eq!(got, None);
     }
 }

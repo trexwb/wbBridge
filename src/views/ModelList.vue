@@ -1,10 +1,13 @@
 <script setup>
-// 模型列表：可用在前、不可用在后、检测中其次；行内徽章与耗时口径与原版一致。
+// 模型列表：可用在前、不可用在后、检测中其次；同档内按速度权重从高到低。
+// 行内徽章与耗时口径与原版一致。
 import { computed } from 'vue'
 import ModelRow from '../components/ModelRow.vue'
 
 const props = defineProps({
   models: { type: Array, default: () => [] },
+  // 已移除模型的数量：只用于空态措辞（告诉用户去上面的「回收站」恢复），列表本身不渲染它们。
+  removedCount: { type: Number, default: 0 },
   results: { type: Object, default: () => ({}) },
   available: { type: Array, default: () => [] },
   probe: { type: Object, default: null },
@@ -15,7 +18,7 @@ const props = defineProps({
 })
 
 const selected = defineModel('selected', { type: Object, default: null })
-defineEmits(['reprobe'])
+defineEmits(['reprobe', 'remove'])
 
 // 行级 props 引用稳定：无结果的行共享同一个空对象（不随父级重渲染换引用），
 // ModelRow 只在自身数据真正变化时更新，不被 usage 等无关字段的状态推送波及。
@@ -33,7 +36,15 @@ const rank = (model) => {
   return props.results[model.id]?.ok === false ? 2 : 1
 }
 
-const sorted = computed(() => [...props.models].sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name)))
+// 排序用的速度权重：缺失（旧版 status.json / 尚未探测）按满分 100 计——与核心
+// `auto::weight_of` 同一口径，列表顺序因此就是 `WB · auto` 的挑选偏好。
+const weightOf = (model) => {
+  const weight = props.results[model.id]?.weight
+  return Number.isFinite(weight) ? weight : 100
+}
+
+const sorted = computed(() => [...props.models].sort((a, b) =>
+  rank(a) - rank(b) || weightOf(b) - weightOf(a) || a.name.localeCompare(b.name)))
 
 // 键盘导航：↑ / ↓ 在列表内移动选中项（选中即展示详情；Enter / Space 沿用按钮原生行为）。
 function move(event, step) {
@@ -52,33 +63,40 @@ function move(event, step) {
 <template>
   <!-- 空态的 <p role="status"> 不是 option：listbox 的直接子元素必须是选项，
        所以列表为空时不挂 listbox 角色，读屏才不会把这句进行中的说明当成一项。 -->
-  <section
-    class="models"
-    :role="models.length ? 'listbox' : null"
-    aria-label="模型列表"
-    @keydown.down="move($event, 1)"
-    @keydown.up="move($event, -1)"
-  >
-    <!-- 逐行错峰入场：序号封顶 8 级，几十个模型一起刷新时尾部不会越等越久 -->
-    <ModelRow
-      v-for="(model, i) in sorted"
-      :key="model.id"
-      :style="{ '--i': Math.min(i, 8) }"
-      :model="model"
-      :result="resultOf(model.id)"
-      :waiting="waiting(model.id)"
-      :probing="probe?.current === model.id"
-      :in-request="activeModels.has(model.id)"
-      :available="available.includes(model.id)"
-      :selected="selected?.id === model.id"
-      :reprobing="reprobing.has(model.id)"
-      @toggle="selected = selected?.id === model.id ? null : model"
-      @reprobe="$emit('reprobe', $event)"
-    />
-    <!-- 空列表：模型还没扫出来。配 spinner 明确「正在进行」，避免被读成「就是没有模型」。 -->
-    <p v-if="!models.length" class="empty" role="status">
-      <span class="spinner" aria-hidden="true" />正在安装或扫描模型，完成后将在这里显示。
-    </p>
+  <section class="models">
+    <div
+      class="list"
+      :role="models.length ? 'listbox' : null"
+      aria-label="模型列表"
+      @keydown.down="move($event, 1)"
+      @keydown.up="move($event, -1)"
+    >
+      <!-- 逐行错峰入场：序号封顶 8 级，几十个模型一起刷新时尾部不会越等越久 -->
+      <ModelRow
+        v-for="(model, i) in sorted"
+        :key="model.id"
+        :style="{ '--i': Math.min(i, 8) }"
+        :model="model"
+        :result="resultOf(model.id)"
+        :waiting="waiting(model.id)"
+        :probing="probe?.current === model.id"
+        :in-request="activeModels.has(model.id)"
+        :available="available.includes(model.id)"
+        :selected="selected?.id === model.id"
+        :reprobing="reprobing.has(model.id)"
+        @toggle="selected = selected?.id === model.id ? null : model"
+        @reprobe="$emit('reprobe', $event)"
+        @remove="$emit('remove', $event)"
+      />
+      <!-- 空列表：模型还没扫出来。配 spinner 明确「正在进行」，避免被读成「就是没有模型」。
+           全被手动移除时指向上方的「回收站」按钮：恢复入口集中在那里，不在这里再放一份。 -->
+      <p v-if="!models.length" class="empty" role="status">
+        <span v-if="!removedCount" class="spinner" aria-hidden="true" />
+        {{ removedCount
+          ? '模型都已移除。点上方「回收站」可以恢复，或点「读取免费模型」重新发现。'
+          : '正在安装或扫描模型，完成后将在这里显示。' }}
+      </p>
+    </div>
   </section>
 </template>
 
@@ -90,6 +108,14 @@ function move(event, step) {
   flex-direction: column;
   gap: 8px;
   padding: 2px 4px 2px 2px;
+}
+/* 列表：flex-basis 取 auto（1 0 auto），内容比容器高时按内容撑开交给 .models 滚动，
+   不会被压进固定高度后溢出到别的元素上；内容短时才拉伸铺满。 */
+.list {
+  flex: 1 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 /* 空态：虚线框居中 + spinner，读起来是「还在进行」而不是「就是没有」 */
 .empty {

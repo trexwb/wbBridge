@@ -20,6 +20,9 @@ const lines = computed(() => {
   const repairs = Object.entries(r.repaired ?? {}).filter(([, v]) => v?.ok)
   if (repairs.length)
     out.push({ text: `这一轮由格式兜底救回：${repairs.map(([shape, v]) => `${shape === 'action' ? '动作转写' : '信封重排'}（${String(v.model).replace('opencode/', '')}）`).join('、')}。` })
+  out.push({ text: Number.isFinite(r.weight)
+    ? `速度权重：${r.weight} / 100 · WB · auto 优先选择权重最高的可用模型；使用中变慢会扣权，全部归零后自动重新检测。`
+    : '速度权重：尚未分配 · WB · auto 选择时暂按满分 100 计。' })
   out.push({ text: `图片输入：${props.model.images ? '支持' : '不支持'}` })
   out.push({ text: `上下文：${props.model.context ?? '未声明'} · 输入上限：${props.model.input ?? '未单独声明'} · 输出上限：${props.model.output ?? '未声明'}` })
   const variants = Object.keys(props.model.variants || {})

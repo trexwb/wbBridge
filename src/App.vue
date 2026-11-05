@@ -18,6 +18,7 @@ import {
 import { startSilentCheck } from './core/update.js'
 import SideBar from './views/SideBar.vue'
 import ModelList from './views/ModelList.vue'
+import ModelRecycleBin from './views/ModelRecycleBin.vue'
 import ModelDetails from './views/ModelDetails.vue'
 import ServiceStatus from './views/ServiceStatus.vue'
 import MetricsBar from './views/MetricsBar.vue'
@@ -32,6 +33,9 @@ import PromptView from './views/PromptView.vue'
 
 const state = ref({})
 const selected = ref(null)
+// 模型回收站：模型列表页内的一个独立面板，不是侧栏菜单项。
+// 已移除的模型只在回收站里展示与恢复，绝不和参与检测的模型混在同一列表。
+const binOpen = ref(false)
 // 详情无结果时共享同一个空对象：引用稳定，ModelDetails 不被无关状态推送触发更新。
 const EMPTY_RESULT = {}
 // 当前视图：与 SideBar 的 item.id 一一对应（'models' | 'providers' | 'logs' | 'usage' | 'workbuddy' | 'prompt' | 'assistant' | 'about'）。
@@ -39,7 +43,8 @@ const EMPTY_RESULT = {}
 // 初值来自 prefs（上次停留的视图）；非法或已删除的视图名会在读取时回落 'models'。
 const view = ref(loadView())
 // 记住视图属于界面偏好，写入即发即忘：偏好写失败（隐私模式 / 配额）绝不能影响切换本身。
-watch(view, next => { saveView(next) })
+// 切走时顺手关掉回收站：它是「模型与服务」页内的子面板，不该跟着用户跨视图漂移。
+watch(view, next => { saveView(next); binOpen.value = false })
 // 进行中的动作名（null = 空闲）：模板按动作名点亮对应按钮的 spinner。
 const busyAction = ref(null)
 const feedback = ref(null) // { text, error }
@@ -90,6 +95,19 @@ function rejectIfGuarded(name) {
   feedback.value = { text: reason, error: true }
   return true
 }
+
+// ── 手动移除的模型 ────────────────────────────────────────────────
+// 目录条目仍保留（面板要显示名称、保留恢复入口），只是不再检测、不再发布。
+// removedModels 由核心写在 status.json 顶层，随轻量快照（core-status）下发。
+const removedIds = computed(() => new Set(state.value.removedModels || []))
+const activeModels = computed(() => (state.value.models || []).filter(model => !removedIds.value.has(model.id)))
+const removedModels = computed(() => (state.value.models || []).filter(model => removedIds.value.has(model.id)))
+
+// 被移除的模型如果正被详情面板选中，立刻收起：详情里的「重新检测」对它已不成立，
+// 恢复入口在顶部的「回收站」里。
+watch(removedIds, ids => {
+  if (selected.value && ids.has(selected.value.id)) selected.value = null
+})
 
 // 单模型「重新检测」的行内挂起标记：modelId -> 'pending'（请求还在空中）| 'acked'（核心已确认开始）。
 // 它只补「点击 → 核心快照接手」之间那不到 500ms 的空档；进行中的权威来源是核心状态里的
@@ -180,6 +198,34 @@ async function run(name, value) {
   }
 }
 
+// 手动移除 / 恢复：移除后核心把该模型从探测与发布集一并排除，恢复后立刻单检一次。
+// 两者都走统一的 run()（在飞互斥 + 反馈条），失败原因不会被静默吞掉。
+async function removeModel(modelId) {
+  const response = await run('remove-model', { model: modelId })
+  if (response.ok && selected.value?.id === modelId) dismiss()
+}
+
+// 正在恢复的模型：行内 spinner 只跟这一个 id，不把整张回收站都点亮。
+const restoringId = ref('')
+
+async function restoreModel(modelId) {
+  restoringId.value = modelId
+  try {
+    await run('restore-model', { model: modelId })
+  } finally {
+    restoringId.value = ''
+  }
+}
+
+function openBin() {
+  dismiss()
+  binOpen.value = true
+}
+
+function closeBin() {
+  binOpen.value = false
+}
+
 // 单模型重新检测：只向指定模型发一次探测请求，不重跑全量。
 // 进行中的展示不在这里，而是行内的 reprobing 标记 + 核心的 singleProbes（见上方 watch）。
 async function reprobeModel(modelId) {
@@ -200,11 +246,11 @@ async function reprobeModel(modelId) {
   delete reprobeClicked.value[modelId]
 }
 
-// 检测进度：待检队列是壳推送的真实数据，已完成 = 当前模型总数 − 仍在待检的数量。
+// 检测进度：待检队列是壳推送的真实数据，已完成 = 当前参与检测的模型数 − 仍在待检的数量。
 // 只反映这一帧的快照，不做外推；拿不到总数或待检数时返回空串，宁可不显示也不猜数字。
 const probeProgress = computed(() => {
   const probe = state.value.probe
-  const total = (state.value.models || []).length
+  const total = activeModels.value.length
   const pending = probe?.pending?.length
   if (!probe?.running || !total || !Number.isFinite(pending)) return ''
   return `${Math.max(0, Math.min(total, total - pending))}/${total}`
@@ -217,6 +263,8 @@ const pendingText = computed(() => {
   if (busyAction.value === 'import') return '正在写入 WorkBuddy / CodeBuddy 配置…'
   if (busyAction.value === 'restart') return '正在重启核心服务…'
   if (busyAction.value === 'system-proxy') return '正在应用系统代理设置…'
+  if (busyAction.value === 'remove-model') return '正在移除模型（此后不再检测、不再发布）…'
+  if (busyAction.value === 'restore-model') return '正在恢复模型并重新发起检测…'
   // 单模型重新检测的请求还在空中：措辞必须区别于批量，否则一行「逐个检测」会把
   // 「只检这一个」说成整库重跑。请求返回后进度由那一行自己承担，这里不再占用反馈条。
   if (busyAction.value === 'probe' && reprobeRequest.value) {
@@ -251,10 +299,17 @@ function dismiss() {
 }
 
 function onKeydown(event) {
-  if (event.key !== 'Escape' || !selected.value) return
+  if (event.key !== 'Escape') return
   // 输入框内的 Esc 属于那个控件自己的语义（平台页的 Key 输入框就在用），不该被「收起详情」抢走。
   const tag = event.target?.tagName
   if (tag === 'INPUT' || tag === 'TEXTAREA' || event.target?.isContentEditable) return
+  // 回收站是列表页内的子面板：Esc 先退回列表，再按一次才轮到其它收起义。
+  if (binOpen.value) {
+    event.preventDefault()
+    closeBin()
+    return
+  }
+  if (!selected.value) return
   event.preventDefault()
   dismiss()
 }
@@ -307,6 +362,32 @@ onUnmounted(() => {
             >
               <span v-if="state.probe?.running" class="spinner" />检测全部<template v-if="probeProgress"> {{ probeProgress }}</template>
             </button>
+            <!-- 回收站是页面内的按钮入口，不是侧栏菜单项。它是一个切换：
+                 列表页显示「回收站（N）」，进入后变成「模型列表」，再点即返回。 -->
+            <button
+              id="recycle-bin"
+              type="button"
+              class="bin-link"
+              :class="{ 'is-open': binOpen }"
+              :aria-expanded="String(binOpen)"
+              aria-controls="model-bin"
+              :title="binOpen
+                ? '返回模型列表'
+                : (removedModels.length
+                  ? `模型回收站：${removedModels.length} 个已移除的模型，可在这里恢复`
+                  : '模型回收站：暂时没有已移除的模型')"
+              @click="binOpen ? closeBin() : openBin()"
+            >
+              <svg v-if="binOpen" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M5 7h14M5 12h14M5 17h14" />
+              </svg>
+              <svg v-else width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M4 7h16M9 7V4.6h6V7M6.4 7l.9 12.4h9.4L17.6 7" />
+                <path d="M10 10.6v5M14 10.6v5" />
+              </svg>
+              <template v-if="binOpen">模型列表</template>
+              <template v-else>回收站<template v-if="removedModels.length">（{{ removedModels.length }}）</template></template>
+            </button>
           </div>
         </header>
 
@@ -324,7 +405,7 @@ onUnmounted(() => {
         />
 
         <MetricsBar
-          :models="state.models || []"
+          :models="activeModels"
           :available="state.availableModels || []"
           :probe="state.probe"
         >
@@ -344,17 +425,20 @@ onUnmounted(() => {
         />
       </div>
 
-      <!-- 主从两栏：详情是右侧常驻列（不是浮层/遮罩），任何窗口宽度都不降级为上下堆叠 -->
-      <div v-if="view === 'models'" class="content" :class="{ 'is-split': !!selected }">
+      <!-- 主从两栏：详情是右侧常驻列（不是浮层/遮罩），任何窗口宽度都不降级为上下堆叠。
+           回收站打开时这一栏整体让位给它，已移除的模型不会和参与检测的模型同屏混排。 -->
+      <div v-if="view === 'models' && !binOpen" class="content" :class="{ 'is-split': !!selected }">
         <ModelList
           v-model:selected="selected"
-          :models="state.models || []"
+          :models="activeModels"
+          :removed-count="removedModels.length"
           :results="state.modelResults || {}"
           :available="state.availableModels || []"
           :probe="state.probe"
           :activity="state.activity"
           :reprobing="reprobing"
           @reprobe="reprobeModel"
+          @remove="removeModel"
         />
 
         <ModelDetails
@@ -365,10 +449,20 @@ onUnmounted(() => {
         />
       </div>
 
-      <footer v-if="view === 'models'">
+      <footer v-if="view === 'models' && !binOpen">
         <p id="sync">{{ syncSummary }}</p>
         <p class="note">打开应用默认沿用上次检测的模型与结果（不再每次重跑一遍探测），点「读取免费模型」才会重新获取并逐个检测，检测会向每个模型发送一次简短请求、消耗少量免费额度。耗时为完整请求用时，非首字延迟。不可用模型仅在本窗口保留，不供任何插件使用；剩余额度暂不可查询。</p>
       </footer>
+
+      <!-- 模型回收站：独立面板（填满主区、不被侧栏菜单占用），恢复后立即单检一次 -->
+      <ModelRecycleBin
+        v-if="view === 'models' && binOpen"
+        id="model-bin"
+        :models="removedModels"
+        :results="state.modelResults || {}"
+        :restoring="restoringId"
+        @restore="restoreModel"
+      />
 
       <!-- 非「模型与服务」的视图：各自填满主区并独立滚动，不改变上面两栏布局的任何约束 -->
       <LogsView v-if="view === 'logs'" />
@@ -457,6 +551,10 @@ header { display: flex; justify-content: space-between; gap: 12px; align-items: 
 h2 { font-size: 27px; letter-spacing: -.8px; margin: 0 0 6px; font-weight: 650; }
 .subtitle { margin: 0; color: var(--muted-strong); font-size: 13px; }
 .actions { display: flex; gap: 8px; }
+/* 回收站入口：工具条第三格，常驻可点（数量为 0 时也能进去看说明与恢复口径） */
+.bin-link { display: inline-flex; align-items: center; gap: 6px; }
+.bin-link svg { flex-shrink: 0; }
+.bin-link.is-open { background: var(--green-bg); border-color: color-mix(in srgb, var(--green) 40%, var(--line)); color: var(--green); }
 footer { font-size: 11px; color: var(--muted-strong); line-height: 1.7; flex-shrink: 0; }
 footer p { margin: 0; }
 .note { margin-top: 6px !important; }

@@ -336,6 +336,11 @@ mod tests {
             ("siliconflow-cn", "SF"),
             ("tencent-tokenhub", "TT"),
             ("zhipuai", "ZP"),
+            ("agnes", "AG"),
+            ("sensenova", "SN"),
+            ("nvidia", "NV"),
+            ("openrouter", "OR"),
+            ("huggingface", "HF"),
         ];
         for (id, prefix) in expected {
             let provider =

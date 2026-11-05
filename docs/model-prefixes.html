@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>WB Bridge · 模型名称前缀对照</title>
-<meta name="description" content="WB Bridge 发布给 WorkBuddy / CodeBuddy 的模型 ID 前缀约定：OC（OpenCode）、MS（ModelScope）、SF（SiliconFlow）、TT（腾讯混元 TokenHub）、ZP（智谱），以及合成路由 WB · auto。">
+<meta name="description" content="WB Bridge 发布给 WorkBuddy / CodeBuddy 的模型 ID 前缀约定：OC（OpenCode）、MS（ModelScope）、SF（SiliconFlow）、TT（腾讯混元 TokenHub）、ZP（智谱）、AG（爱思 Agnes）、SN（商汤 SenseNova）、NV（NVIDIA NIM）、OR（OpenRouter）、HF（Hugging Face），以及合成路由 WB · auto。">
 <style>
   :root {
     color-scheme: light dark;
@@ -34,6 +34,11 @@
     --sf-fg: #3f6c99; --sf-bg: #e7eff9;
     --tt-fg: #a4581a; --tt-bg: #fbefdf;
     --zp-fg: #b3261e; --zp-bg: #fbe9e7;
+    --ag-fg: #1f6f78; --ag-bg: #e2f2f4;
+    --sn-fg: #3d7a2f; --sn-bg: #eaf4e3;
+    --nv-fg: #4a7a00; --nv-bg: #eef6db;
+    --or-fg: #4b5b8c; --or-bg: #e9edf9;
+    --hf-fg: #8a6d00; --hf-bg: #fbf3d6;
   }
 
   @media (prefers-color-scheme: dark) {
@@ -55,6 +60,11 @@
       --sf-fg: #a4c9ec; --sf-bg: #293e52;
       --tt-fg: #e9ad70; --tt-bg: #45392c;
       --zp-fg: #f0a6a1; --zp-bg: #3a2a29;
+      --ag-fg: #8fd4dc; --ag-bg: #233f43;
+      --sn-fg: #a9d59a; --sn-bg: #2f4028;
+      --nv-fg: #b8d97a; --nv-bg: #33401f;
+      --or-fg: #aebbe8; --or-bg: #2c3350;
+      --hf-fg: #e8cf74; --hf-bg: #433a1d;
     }
   }
 
@@ -191,6 +201,11 @@
   .badge.sf { color: var(--sf-fg); background: var(--sf-bg); }
   .badge.tt { color: var(--tt-fg); background: var(--tt-bg); }
   .badge.zp { color: var(--zp-fg); background: var(--zp-bg); }
+  .badge.ag { color: var(--ag-fg); background: var(--ag-bg); }
+  .badge.sn { color: var(--sn-fg); background: var(--sn-bg); }
+  .badge.nv { color: var(--nv-fg); background: var(--nv-bg); }
+  .badge.or { color: var(--or-fg); background: var(--or-bg); }
+  .badge.hf { color: var(--hf-fg); background: var(--hf-bg); }
   .badge.wb { color: var(--oc-fg); background: var(--oc-bg); }
 
   /* ── 复制按钮 ─────────────────────────────────────── */
@@ -514,19 +529,69 @@
             </td>
             <td class="cell-note">智谱开放平台 bigmodel（open.bigmodel.cn），baseURL 走 <code>/api/paas/v4</code> 而非常见的 <code>/v1</code>。</td>
           </tr>
+          <tr>
+            <td class="cell-prefix"><span class="badge ag">AG</span></td>
+            <td><span class="p-name">爱思 Agnes</span></td>
+            <td><code>agnes</code>、爱思 Agnes</td>
+            <td class="cell-id">
+              <span class="id">AG · Agnes 3.0 Flash</span><br>
+              <button type="button" class="copy" data-copy="AG · Agnes 3.0 Flash" aria-label="复制 AG · Agnes 3.0 Flash">复制</button>
+            </td>
+            <td class="cell-note">爱思 Agnes 的 OpenAI 兼容网关（apihub.agnes-ai.com/v1）；推广期 flash 系列免费。</td>
+          </tr>
+          <tr>
+            <td class="cell-prefix"><span class="badge sn">SN</span></td>
+            <td><span class="p-name">商汤 SenseNova</span></td>
+            <td><code>sensenova</code>、商汤 SenseNova</td>
+            <td class="cell-id">
+              <span class="id">SN · DeepSeek V4 Pro</span><br>
+              <button type="button" class="copy" data-copy="SN · DeepSeek V4 Pro" aria-label="复制 SN · DeepSeek V4 Pro">复制</button>
+            </td>
+            <td class="cell-note">商汤日日新（token.sensenova.cn/v1）；公测期目录内多款模型标价为零。</td>
+          </tr>
+          <tr>
+            <td class="cell-prefix"><span class="badge nv">NV</span></td>
+            <td><span class="p-name">NVIDIA NIM</span></td>
+            <td><code>nvidia</code>、NVIDIA NIM</td>
+            <td class="cell-id">
+              <span class="id">NV · Kimi K3</span><br>
+              <button type="button" class="copy" data-copy="NV · Kimi K3" aria-label="复制 NV · Kimi K3">复制</button>
+            </td>
+            <td class="cell-note">NVIDIA Build 的 NIM 推理端点（integrate.api.nvidia.com/v1）；新账号含免费额度。</td>
+          </tr>
+          <tr>
+            <td class="cell-prefix"><span class="badge or">OR</span></td>
+            <td><span class="p-name">OpenRouter</span></td>
+            <td><code>openrouter</code>、OpenRouter</td>
+            <td class="cell-id">
+              <span class="id">OR · Gemma 4 31B</span><br>
+              <button type="button" class="copy" data-copy="OR · Gemma 4 31B" aria-label="复制 OR · Gemma 4 31B">复制</button>
+            </td>
+            <td class="cell-note">OpenRouter 聚合网关（openrouter.ai/api/v1）；只发布标价为零的 <code>:free</code> 模型。</td>
+          </tr>
+          <tr>
+            <td class="cell-prefix"><span class="badge hf">HF</span></td>
+            <td><span class="p-name">Hugging Face</span></td>
+            <td><code>huggingface</code>、Hugging Face</td>
+            <td class="cell-id">
+              <span class="id">HF · GLM-4.7-Flash</span><br>
+              <button type="button" class="copy" data-copy="HF · GLM-4.7-Flash" aria-label="复制 HF · GLM-4.7-Flash">复制</button>
+            </td>
+            <td class="cell-note">Hugging Face Inference Providers 的 OpenAI 兼容路由（router.huggingface.co/v1）；免费额度以平台公示为准。</td>
+          </tr>
         </tbody>
       </table>
     </div>
 
-    <p class="footnote">平台稳定 id（<code>providers.json</code> 的键名、面板动作的 <code>provider</code> 参数）依次为 <code>modelscope</code>、<code>siliconflow-cn</code>、<code>tencent-tokenhub</code>、<code>zhipuai</code>，一经发布不得改名——改了等于让用户已填的 Key 失效。</p>
-    <p class="footnote">现状说明：现行版本的客户端 ID 中，OpenCode 模型使用 <code>OC</code> 前缀；四家平台模型在现行版本里以注册表 label（ModelScope / SiliconFlow / 腾讯混元 TokenHub / 智谱）作为展示前缀，<code>MS</code> / <code>SF</code> / <code>TT</code> / <code>ZP</code> 为本文所记的短前缀口径。若与面板实际显示不一致，以面板为准。</p>
+    <p class="footnote">平台稳定 id（<code>providers.json</code> 的键名、面板动作的 <code>provider</code> 参数）依次为 <code>modelscope</code>、<code>siliconflow-cn</code>、<code>tencent-tokenhub</code>、<code>zhipuai</code>、<code>agnes</code>、<code>sensenova</code>、<code>nvidia</code>、<code>openrouter</code>、<code>huggingface</code>，一经发布不得改名——改了等于让用户已填的 Key 失效。</p>
+    <p class="footnote">现状说明：现行版本的客户端 ID 中，OpenCode 模型使用 <code>OC</code> 前缀；注册表平台模型在现行版本里以各自的短前缀（<code>MS</code> / <code>SF</code> / <code>TT</code> / <code>ZP</code> / <code>AG</code> / <code>SN</code> / <code>NV</code> / <code>OR</code> / <code>HF</code>）作为展示前缀，与本文所记口径一致。若与面板实际显示不一致，以面板为准。</p>
   </section>
 
   <section id="rules" aria-labelledby="h-rules">
     <h2 id="h-rules">命名规则</h2>
     <p class="section-lede">四条规则，适用于表中全部前缀。</p>
     <ol class="rules">
-      <li><b>前缀固定大写、一平台一枚。</b><code>OC</code> / <code>MS</code> / <code>SF</code> / <code>TT</code> / <code>ZP</code> 与平台一一对应，同一模型列表内不与其他来源复用。</li>
+      <li><b>前缀固定大写、一平台一枚。</b><code>OC</code> / <code>MS</code> / <code>SF</code> / <code>TT</code> / <code>ZP</code> / <code>AG</code> / <code>SN</code> / <code>NV</code> / <code>OR</code> / <code>HF</code> 与平台一一对应，同一模型列表内不与其他来源复用。</li>
       <li><b>分隔符逐字节为「空格 + 间隔号 + 空格」。</b>即 <code>·</code>（U+00B7）两侧各一个半角空格，形如 <code>OC · DeepSeek-V3.1</code>。手填或引用模型 ID 时必须完整保留；写错分隔符（如 <code>WB.auto</code>、缺空格）一律不被识别。</li>
       <li><b>间隔号之后保留上游模型的展示名。</b>核心内部另用「命名空间/模型」的全限定 id 做路由，对外一律只见「前缀 · 名称」形态，两套形态不会同时出现在同一个 ID 里。</li>
       <li><b>合成路由不是平台前缀。</b><code>WB</code> 只出现在 <code>WB · auto</code> 这一条合成入口上，见下节。</li>

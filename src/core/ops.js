@@ -73,5 +73,16 @@ export function successMessage(action, result = {}) {
     if (result?.started !== false) return '模型检测已开始，完成后列表自动刷新。'
     return ''
   }
+  // 文案必须告诉用户「去哪儿恢复」：模型从列表里消失后，不给落点等于让人以为删掉了。
+  if (action === 'remove-model') {
+    return result?.model
+      ? `已移除 ${result.model}：不再检测、不再发布，可在顶部「回收站」恢复。`
+      : '模型已移除：不再检测、不再发布，可在顶部「回收站」恢复。'
+  }
+  if (action === 'restore-model') {
+    if (result?.restored === false) return '该模型已不在移除名单中。'
+    if (result?.started === true) return `已恢复 ${result?.model ?? '模型'}，正在重新检测。`
+    return `已恢复 ${result?.model ?? '模型'}，下次检测时重新参与。`
+  }
   return ''
 }
