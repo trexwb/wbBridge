@@ -64,7 +64,7 @@ pub const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(20);
 /// 红线用例（`tests/red_lines.rs::routes()`）也直接从这张表取管理路由，不再各写一份。
 ///
 /// 顺序亦与 Node 版一致（Node 的 Map 保持插入序）；`provider-*` 三条是迁移后新增的，追加在尾部。
-pub const ACTION_ROUTES: [(&str, &str, &str); 10] = [
+pub const ACTION_ROUTES: [(&str, &str, &str); 11] = [
     ("probe", "POST", "/admin/probe"),
     ("system-proxy", "POST", "/admin/system-proxy"),
     ("import", "POST", "/admin/import"),
@@ -75,6 +75,7 @@ pub const ACTION_ROUTES: [(&str, &str, &str); 10] = [
     ("clear-provider-key", "POST", "/admin/clear-provider-key"),
     ("remove-model", "POST", "/admin/remove-model"),
     ("restore-model", "POST", "/admin/restore-model"),
+    ("set-paid-models", "POST", "/admin/set-paid-models"),
 ];
 
 /// `routeFor(action)`：未知动作返回 `None`（对应 JS 的 `null`）。
@@ -485,6 +486,8 @@ pub struct Handlers {
     pub remove_model: Arc<AdminFn>,
     /// `restoreModel(body)`：入参 `{ model }`，恢复后立即重新参与检测。
     pub restore_model: Arc<AdminFn>,
+    /// `setPaidModels(body)`：入参 `{ models: [<全限定 id>, …] }`，整份替换付费白名单。
+    pub set_paid_models: Arc<AdminFn>,
     /// `onResult(model, ok, message, status, code, duration, source, meta)`。
     pub on_result: Arc<ResultFn>,
     /// `onActivity(progress)`。
@@ -520,6 +523,7 @@ impl Server {
                 clear_provider_key: Arc::new(|_| Box::pin(async { Ok(json!({})) })),
                 remove_model: Arc::new(|_| Box::pin(async { Ok(json!({})) })),
                 restore_model: Arc::new(|_| Box::pin(async { Ok(json!({})) })),
+                set_paid_models: Arc::new(|_| Box::pin(async { Ok(json!({})) })),
                 on_result: Arc::new(|_| Box::pin(async {})),
                 on_activity: None,
                 on_shutdown: None,
@@ -648,6 +652,16 @@ impl Server {
         F: Fn(Value) -> BoxFuture<Result<Value, BackendError>> + Send + Sync + 'static,
     {
         self.handlers.restore_model = Arc::new(restore_model);
+        self
+    }
+
+    /// 注入 `setPaidModels(body)`（`{ models }`）。
+    #[must_use]
+    pub fn set_paid_models<F>(mut self, set_paid_models: F) -> Self
+    where
+        F: Fn(Value) -> BoxFuture<Result<Value, BackendError>> + Send + Sync + 'static,
+    {
+        self.handlers.set_paid_models = Arc::new(set_paid_models);
         self
     }
 
@@ -940,6 +954,17 @@ async fn handle(
         };
     }
 
+    if action_matches("set-paid-models", method, route) {
+        let body = match read_body(body).await {
+            Ok(body) => body,
+            Err(error) => return error_response(&error),
+        };
+        return match (handlers.set_paid_models)(body).await {
+            Ok(result) => json_response(StatusCode::OK, result),
+            Err(error) => error_response(&error),
+        };
+    }
+
     if method != "POST" || route != "/v1/chat/completions" {
         return json_response(
             StatusCode::NOT_FOUND,
@@ -982,8 +1007,11 @@ async fn chat(
     // 改写成实际模型的全限定 id。否则失败判决打在 `"WB · auto"` 这个假键上，真实模型留在通过集里
     // 被反复选中，用户要求的「受限/超时/不可用即摘除」就落空。
     if body.get("model").and_then(Value::as_str) == Some(crate::auto::AUTO_MODEL_ID) {
+        // 🔴 自动路由绝不选付费模型：白名单里的条目是用户手动点选要用的，自动挑选会让
+        // 每个普通请求都可能产生费用。池里只剩付费模型时不改写，交回 `prepare` 报既有 400。
+        let free_pool = crate::auto::free_pool(&models);
         // 选不出（池空）时**不改写**，交回 `prepare` 报既有 400 `model_not_found`——不新增错误码。
-        if let Some(selected) = crate::auto::auto_select(&body, &models) {
+        if let Some(selected) = crate::auto::auto_select(&body, &free_pool) {
             body["model"] = json!(selected);
         }
     }
@@ -1217,6 +1245,7 @@ impl Handlers {
             clear_provider_key: self.clear_provider_key.clone(),
             remove_model: self.remove_model.clone(),
             restore_model: self.restore_model.clone(),
+            set_paid_models: self.set_paid_models.clone(),
             on_result: self.on_result.clone(),
             on_activity: self.on_activity.clone(),
             on_shutdown: self.on_shutdown.clone(),
@@ -1522,7 +1551,7 @@ mod tests {
 
     #[test]
     fn action_table_is_post_admin_routes() {
-        assert_eq!(ACTION_ROUTES.len(), 10);
+        assert_eq!(ACTION_ROUTES.len(), 11);
         for (action, method, path) in ACTION_ROUTES {
             assert_eq!(method, "POST", "{action} 必须是 POST");
             assert!(path.starts_with("/admin/"), "{action} 必须挂在 /admin/ 下");

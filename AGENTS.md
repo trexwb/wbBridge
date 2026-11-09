@@ -2,7 +2,7 @@
 
 ## ⚠ 强制规范（所有 Agent 必须遵守）
 
-**本项目是「Tauri 桌面壳 + 同进程内嵌 Rust 核心」的桥接工具。核心（`src-tauri/core/`，crate 名 `wbbridge-core`）作为 `path` 依赖静态编进壳（`src-tauri/`）里，跑在壳专用 tokio 多线程运行时上，仍在 `127.0.0.1:41980`（端口被占则由壳另择端口）提供 OpenAI 兼容 API，把**隔离托管**的 OpenCode 免费模型发布给 WorkBuddy；控制面板 `src/`（Vue 3 SFC + Vite 构建，产物 `dist/`）由 Tauri WebView 加载，经 `invoke('core_refresh' | 'core_probe' | 'core_import' | 'core_system_proxy' | 'core_shutdown' | 'core_provider_status' | 'core_set_provider_key' | 'core_clear_provider_key' | 'core_remove_model' | 'core_restore_model' | 'restart_core' | 'core_running' | 'data_dir_path' | 'read_log' | 'clear_log')` 与 `core-status` / `core-activity` / `core-failed` 事件驱动。**
+**本项目是「Tauri 桌面壳 + 同进程内嵌 Rust 核心」的桥接工具。核心（`src-tauri/core/`，crate 名 `wbbridge-core`）作为 `path` 依赖静态编进壳（`src-tauri/`）里，跑在壳专用 tokio 多线程运行时上，仍在 `127.0.0.1:41980`（端口被占则由壳另择端口）提供 OpenAI 兼容 API，把**隔离托管**的 OpenCode 免费模型发布给 WorkBuddy；控制面板 `src/`（Vue 3 SFC + Vite 构建，产物 `dist/`）由 Tauri WebView 加载，经 `invoke('core_refresh' | 'core_probe' | 'core_import' | 'core_system_proxy' | 'core_shutdown' | 'core_provider_status' | 'core_set_provider_key' | 'core_clear_provider_key' | 'core_remove_model' | 'core_restore_model' | 'core_set_paid_models' | 'restart_core' | 'core_running' | 'data_dir_path' | 'read_log' | 'clear_log')` 与 `core-status` / `core-activity` / `core-failed` 事件驱动。**
 
 > 🔴 **已彻底移除 Node 运行环境**：不再有 Node sidecar、`@yao-pkg/pkg`、esbuild 预打包，不再有 `src-tauri/binaries/`（`externalBin` 为空数组）。Node 仅用于前端构建（Vite）与 `scripts/*.mjs`。原 JS 核心与其测试已归档到仓库**之外**：
 > `/Users/wbtrex/website/localServer/node/trexwb/backup/wbBridge-node-20261001/`（详见该目录 README）。
@@ -120,7 +120,7 @@ WB Bridge 是一个**跨平台托盘工具**，通过**隔离的 OpenCode 技术
 | `api-key` | 32 字节随机 hex（权限 `0600`），所有 HTTP 请求的 Bearer 令牌 |
 | `providers.json` | 用户自持的**平台 Key**（形态 `{ "<注册表里的 provider id>": "<Key>" }`，即请求体的 `apiKey` 落盘后的键是平台 id；权限 `0600`，经 `sync::atomic_write` 原子替换）。只由 `providers.rs` 读写；**绝不进日志 / `status.json` / 面板偏好 / 子进程环境 / 任何响应体**，`provider-status` 只回「是否已配置」 |
 | `service.pid` | 单实例锁；进程仍存活即视为已在运行（独立进程按退出码 2 结束） |
-| `settings.json` | 持久化 `useSystemProxy`、`workBuddyModelsFile` |
+| `settings.json` | 持久化 `useSystemProxy`、`workBuddyModelsFile`、`removedModels`（用户手动移除的模型）与 `paidModels`（付费白名单，全限定 id 数组） |
 | `status.json` | 服务状态快照（UI 与外部读取的唯一状态源），串行 + 原子写 |
 | `opencode.log` | OpenCode 子进程 stdout/stderr；超过 5MB 轮转为 `opencode.log.previous` |
 | `runtime/<version>/opencode` | 托管下载的 OpenCode 运行时 |
@@ -228,7 +228,7 @@ wbBridge/
 
 - **核心不得单方面结束进程**：嵌入壳时 `set_exit_hook` 把「退出」翻译成记录 `core_code` / `core_stopped`，真正退出只由壳的**关窗 / 托盘退出 / `RunEvent::ExitRequested`** 驱动。
 - **关闭窗口即退出应用（全平台一致）**：`on_window_event` 的 `CloseRequested` 在非退出态下 `prevent_close()` + `hide()`，随后在后台线程执行 `quit_app`（= `stop_core_bounded` → `cleanup_before_exit` → `exit(0)`）；**不再隐藏到托盘驻留**，用户无需二次退出。`show_main` 在 `quitting` 置位后直接返回，退出收尾期间不会被托盘左键唤回。
-- **壳保留回环 HTTP 调用路径**（`admin_call` + `ACTION_ROUTES`），因此鉴权、Origin 拒绝、并发上限等红线与迁移前完全一致；`core_action` 通用代理已收口为 **10 个类型化命令**（`core_refresh`/`core_probe`/`core_import`/`core_system_proxy`/`core_shutdown`/`core_provider_status`/`core_set_provider_key`/`core_clear_provider_key`/`core_remove_model`/`core_restore_model`），每条只映射一个 `/admin/*` 路由、参数经 serde 类型校验，路由与载荷语义不变。
+- **壳保留回环 HTTP 调用路径**（`admin_call` + `ACTION_ROUTES`），因此鉴权、Origin 拒绝、并发上限等红线与迁移前完全一致；`core_action` 通用代理已收口为 **11 个类型化命令**（`core_refresh`/`core_probe`/`core_import`/`core_system_proxy`/`core_shutdown`/`core_provider_status`/`core_set_provider_key`/`core_clear_provider_key`/`core_remove_model`/`core_restore_model`/`core_set_paid_models`），每条只映射一个 `/admin/*` 路由、参数经 serde 类型校验，路由与载荷语义不变。
 - 核心可重启：`restart_core` 关停现有实例后按新的 `StartOptions` 重新装入（`APP` 为可重置的进程级全局）。
 
 ### 启动时序（`src-tauri/core/src/orchestration.rs`）
@@ -351,6 +351,7 @@ start_backend
 
 - **`WB · auto` 合成路由条目只在生产发布链写入插件配置**：`sync.rs::merge_models_auto` 走 `SyncOptions.auto_route`，该字段**默认 `false`**——JS 侧从来没有这一条，`tests/js_parity.rs::sync_options` 显式钉 `false`，因此对拍路径逐字节不变（把默认值翻成 `true`，`tests/fixtures/sync.json` 会立刻失败，那是**预期护栏生效**，不是要修的测试）。条目 `id` 刻意**绕过** `client_model_id`（否则变成 `OC · WB · auto`，与 `server.rs::chat()` 的字面比较永不匹配 ⇒ 改写不生效）。`sync.rs::owned_count` **必须排除别名**，否则 `sync.count` / `status.json` 的 `sync.targets.<目标>.count` 不再是「发布的模型数」。别名只进插件文档的 `availableModels`，**不进** `status.json` 的模型列表，面板因此没有也别新增这一行。`supportsToolCall` 必须取自 `auto::any_tool_capable(models)`，不得写成固定 `true`。
 - **插件配置写入不再产生任何备份**：`sync.rs` 写路径现存的是 `sweep_old_backups(file)`——在**两条出口**都调用（`atomic_write_with` 成功之后，以及内容无变化的早退之前），按**逐段白名单**（文件名以 `<配置文件名>.buddy-bridge-` 开头、以 `.bak` 结尾、中段全是 ASCII 数字、必须是普通文件；跳过目录、`read_dir` 失败静默）只清理本工具**旧版**攒下的存量备份。不得新增备份逻辑，也不得把判定放宽成通配删除（用户自己命名的 `*.bak`、`*.tmp` 一律不碰）。写盘保护只剩三道：文件锁 + 写前二次读取 + 原子替换（同目录临时文件再 `rename`）。
+- **付费白名单（v1.3.5）只能显式逐条放行，且绝不进入任何自动路径**：`backend::models_in(providers, namespace, allowed_paid)` 是唯一放行点——白名单内的全限定 id 可绕过「标价全 0」过滤，条目带 `paid: true`；免费条目**不得**带该键（否则 `tests/js_parity.rs` 的夹具会变）。白名单来源是 `settings.json` 的 `paidModels`（`/admin/set-paid-models` 全量替换，最多 64 条、前缀必须在 `providers::PROVIDERS` 内），写入后必须同步 `Backend::set_paid_models` 与 `status.json` 的 `paidModels`。**所有会产生真实账单的自动路径都必须排除 `paid: true`**：`server.rs::chat()` 的 `WB · auto` 选择域（`auto::free_pool`）、`attach_translator` 的转写候选、`reprobe_when_weights_exhausted` 的自愈重检；新增自动选模 / 自动请求逻辑时必须沿用同一过滤，不得直接遍历 `app.models`。用户手动指定付费模型仍照常请求与计费（这是白名单授权本身）。
 
 ### 测试规范
 
@@ -374,7 +375,7 @@ start_backend
 ### UI 规范
 
 - 面板 = Vue 3 SFC + Vite 构建产物 `dist/`，由 Tauri WebView 加载；**不得引入 CDN 或任何外部请求**，必须满足 `tauri.conf.json` 的 CSP（`default-src 'self'`、`script-src 'self'`、`connect-src ipc: http://ipc.localhost`）。
-- 与壳的通信只走既有契约：`src/core/bridge.js` 的 `action(name, value)` / `onState(cb)` / `onDismiss(cb)` / `aiChat(request, onDelta)` / `aiAbort()`，底层是 `invoke` **10 个 `core_*` 管理命令**（`core_refresh` / `core_probe` / `core_import` / `core_system_proxy` / `core_shutdown` / `core_provider_status` / `core_set_provider_key` / `core_clear_provider_key` / `core_remove_model` / `core_restore_model`，替代旧 `core_action` 通用代理） + `invoke('restart_core' | 'core_running' | 'data_dir_path' | 'read_log' | 'clear_log' | 'open_external' | 'ai_chat' | 'ai_abort')` + 事件 `core-status`（轻量快照，含顶层 `usage`）/ `core-activity`（`activity` + `modelResults` 明细，面板必须与最近一次轻量快照合并后再下发，否则逐模型状态永远为空）/ `core-failed` / `ai-chunk`·`ai-done`·`ai-error`·`ai-aborted`（按 `chatId` 分发，**不做帧级合并**，流式增量必须即时上屏）。`ai_chat` 的整份请求必须挂在 **`payload` 键**下（Tauri v2 按参数名绑定，平铺传会直接报「missing required key payload」）。新增命令（只读或写入）时须同步 `src-tauri/src/lib.rs` 的 `generate_handler`；`capabilities/default.json` 对**应用自有命令无需改动**（自有命令不经 capability 授权），但**插件命令必须在此声明**——updater/process 已加 `updater:default` + `process:allow-restart`（刻意不用 `process:default`：它含 `allow-exit`，会让 WebView 绕过 `quit_app` 的优雅关停链硬杀进程）。**不得新增或改名 IPC 命令/事件**，除非同步更新 `src-tauri/src/lib.rs` 与 `src-tauri/capabilities/default.json`。
+- 与壳的通信只走既有契约：`src/core/bridge.js` 的 `action(name, value)` / `onState(cb)` / `onDismiss(cb)` / `aiChat(request, onDelta)` / `aiAbort()`，底层是 `invoke` **11 个 `core_*` 管理命令**（`core_refresh` / `core_probe` / `core_import` / `core_system_proxy` / `core_shutdown` / `core_provider_status` / `core_set_provider_key` / `core_clear_provider_key` / `core_remove_model` / `core_restore_model` / `core_set_paid_models`，替代旧 `core_action` 通用代理） + `invoke('restart_core' | 'core_running' | 'data_dir_path' | 'read_log' | 'clear_log' | 'open_external' | 'ai_chat' | 'ai_abort')` + 事件 `core-status`（轻量快照，含顶层 `usage`）/ `core-activity`（`activity` + `modelResults` 明细，面板必须与最近一次轻量快照合并后再下发，否则逐模型状态永远为空）/ `core-failed` / `ai-chunk`·`ai-done`·`ai-error`·`ai-aborted`（按 `chatId` 分发，**不做帧级合并**，流式增量必须即时上屏）。`ai_chat` 的整份请求必须挂在 **`payload` 键**下（Tauri v2 按参数名绑定，平铺传会直接报「missing required key payload」）。新增命令（只读或写入）时须同步 `src-tauri/src/lib.rs` 的 `generate_handler`；`capabilities/default.json` 对**应用自有命令无需改动**（自有命令不经 capability 授权），但**插件命令必须在此声明**——updater/process 已加 `updater:default` + `process:allow-restart`（刻意不用 `process:default`：它含 `allow-exit`，会让 WebView 绕过 `quit_app` 的优雅关停链硬杀进程）。**不得新增或改名 IPC 命令/事件**，除非同步更新 `src-tauri/src/lib.rs` 与 `src-tauri/capabilities/default.json`。
 - 面板为只读展示 + 动作触发：不得在面板内直接读写文件、直接访问网络、直接调用 OpenCode。**第一例外是自动更新**：`checkUpdate/downloadUpdate/relaunchApp`（`src/core/bridge.js`）调的是 Tauri 官方 updater/process 插件，联网发生在 **Rust 侧**（插件命令），不经 WebView `fetch`，因此 CSP 的 `default-src 'self'` 无需放宽；更新状态机集中在 `src/core/update.js`，视图只渲染与触发。**第二例外是 AI 助手**：`aiChat/aiAbort`（`src/core/bridge.js`）走的是**壳侧**的 ureq 请求（`src-tauri/src/lib.rs::ai_chat`），联网同样发生在 Rust 侧、不经 WebView `fetch`，因此 CSP 无需放宽；协议与工具语义集中在 `src/core/ai.js`，视图只负责渲染与确认。**提示词优化复用同一条 AI 通道**（同样是 `aiChat/aiAbort`），不新增第二类网络入口；壳侧只有一个 `activeChatId`，因此它与 AI 助手必须互斥。
 - 动作执行期间必须置忙（按钮禁用 + spinner + 结果反馈），失败必须显示原因。
 - **面板偏好只走 `src/core/prefs.js`**：视图不得直接碰 `localStorage`。新增一项偏好 = 在 `SANITIZERS` 里加一个键 + 加一个**只做字段投影**的 `sanitize*` 函数 + 补对应单测；**严禁**把 `api-key`、`OPENCODE_SERVER_PASSWORD`、WorkBuddy models 文件路径、完整 `status.json`、完整配置对象放进 `localStorage`（白名单是唯一的守卫点，值投影负责丢弃调用方多塞的字段）。存储不可用（WebView 禁用、配额满、抛错）时一律**静默回落默认值**，不得抛到界面。**当前范围**：持久化「当前视图」「启动后自动检查更新」开关（+ 上次成功检查时间戳，12 小时节流）与 **AI 助手的非凭据配置**（`ai` = `brain`/`baseUrl`/`model`/`selfModel`/`tools`；助手端点的 API Key **没有白名单键**，结构上落不进 `localStorage`，只存在于 `AssistantView` 的会话内存）。
@@ -395,7 +396,7 @@ start_backend
   `prefers-reduced-motion`（`base.css`）两处。收起详情有三条等价路径：`Esc`（`App.vue::onKeydown`）、详情头部「收起详情」按钮、
   窗口失焦（`onDismiss`）；收起即清空选中，列表占满主区宽度。
 - **侧栏是分组导航**：分组为「模型 / 运行 / 集成 / 其他」，底部为「运行设置」（系统代理开关 + 版本号）。**8 个入口都是已实现的视图**（视图 ID 的唯一名单是 `prefs.js` 的 `VIEW_IDS`，视图状态由 `src/App.vue` 的 `view` 持有，侧栏按 `current` 高亮并带 `aria-current="page"`）：
-  模型与服务（`.top` + `.content`，保留主从两栏；工具条的「回收站」按钮在页内切到独立回收站面板 `src/views/ModelRecycleBin.vue`，已移除模型不混进主列表）、平台（`src/views/ProvidersView.vue`，填写/清除九家平台 Key，只显示「已配置 / 未配置」）、运行日志（`src/views/LogsView.vue`，经 `read_log` 只读拉取日志尾部，另可经 `clear_log` 两段式确认后截断 `opencode.log`——文件缺失视为已清空，不动 `opencode.log.previous`）、用量与额度（`src/views/UsageView.vue`，渲染 `status.json` 顶层 `usage`）、
+  模型与服务（`.top` + `.content`，保留主从两栏；工具条的「回收站」按钮在页内切到独立回收站面板 `src/views/ModelRecycleBin.vue`，已移除模型不混进主列表）、平台（`src/views/ProvidersView.vue`，填写/清除九家平台 Key，只显示「已配置 / 未配置」；每张卡片另有付费模型白名单，逐条放行 `paid: true` 的模型并醒目提示真实计费）、运行日志（`src/views/LogsView.vue`，经 `read_log` 只读拉取日志尾部，另可经 `clear_log` 两段式确认后截断 `opencode.log`——文件缺失视为已清空，不动 `opencode.log.previous`）、用量与额度（`src/views/UsageView.vue`，渲染 `status.json` 顶层 `usage`）、
   WorkBuddy 集成（`src/views/IntegrationView.vue`，只读展示配置定位与最近发布结果，唯一动作是复用既有 `import`）、**提示词优化**（`src/views/PromptView.vue` + `src/core/prompt.js` + `src/core/promptSession.js`：固定本机 `WB · auto`；系统 / 用户提示词、7 个内置模板、版本链与迭代、占位符缺失 / 新增提示、「同一输入分别跑源提示词 / 当前版本」的对比测试；内容只存会话内存；与 AI 助手共用壳侧 AI 通道并互斥；提交有在飞互斥、500ms 前沿节流与逐次拒绝文案）、**AI 助手**（`src/views/AssistantView.vue` + `src/core/ai.js`：自然语言入口，只读工具立即执行、写入工具一律先作提案再逐条确认；大脑默认本机 `WB · auto`，也可切外部 OpenAI 兼容端点；端点 Key **只在会话内存**（见 `prefs.js` 的 `ai` 键白名单），**对话记录默认记在本机 IndexedDB**（`src/core/chatSession.js`，可在「设置」关掉、可「清空」；工具入参不落盘）；**模型就位前输入区整块禁用**，横幅给出原因与出路）、关于与更新（`src/views/AboutView.vue`，版本与数据目录只读 + **自动更新区**：启动后静默检查、发现新版本才出现更新条、由用户点「下载并安装」，进度百分比只在上游给出 `contentLength` 时显示，装完点「重启应用」经 `process.relaunch` 走 `ExitRequested` 的有界停止）。
   **禁止**再出现「规划中」标签、禁用占位或可点击却无响应的假入口。
 - **`usage` 口径（`status.json` 顶层字段）**：`{"since": ISO, "total": {requests, ok, failed}, "models": {"<clientModelId>": {requests, ok, failed, lastMs, avgMs}}}`；只累计 `source == "request"` 的真实客户端请求——探测（`probe`）不计；客户端取消（连接断开）走 `server.rs` 的两条早退路径，**整条不计入**（`requests` 也不 +1，不是记为失败）；启动时从上一份 `status.json` 读回，与 `modelResults` 同法跨重启延续。
@@ -477,6 +478,7 @@ start_backend
 3. `service.pid` 单实例锁不得删除或绕过；重复启动必须失败（独立进程 `exit(2)`）而不是抢占端口。
 4. 格式类上游失败（`invalid_model_output` / `invalid_tool_call` / `native_tool_activity` / `output_truncated`）**不得撤销已发布模型**；探测路径**不得启用辅助模型转写**；转写候选**不得包含刚失败的模型本身**。
 5. 客户端取消的请求不得记录为成功。
+6. 付费白名单（`paid: true`）不得进入任何**自动**选模 / 自动请求路径（`WB · auto`、辅助转写、权重耗尽自愈重检）；白名单只由用户显式写入，核心不得自行放行任何标价非 0 的模型。
 
 ### 工程红线
 
@@ -492,9 +494,9 @@ start_backend
 
 | 项 | 值 | 来源 |
 |---|---|---|
-| 版本单一来源 | **1.3.4** | 根 `package.json` 的 `version` |
-| 壳工程同步落点 | **1.3.4** | `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `[package] version` |
-| 核心 crate 版本 | **1.3.4** | `src-tauri/core/Cargo.toml`（`wbbridge-core --version` 输出；随产品版本同步，`version:set`/`version:check` 均覆盖） |
+| 版本单一来源 | **1.3.5** | 根 `package.json` 的 `version` |
+| 壳工程同步落点 | **1.3.5** | `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `[package] version` |
+| 核心 crate 版本 | **1.3.5** | `src-tauri/core/Cargo.toml`（`wbbridge-core --version` 输出；随产品版本同步，`version:set`/`version:check` 均覆盖） |
 
 > `status.json` 内写入的 `version` 是历史沿革值 `0.2.0`，**不属版本落点**，不得在无用户指令的情况下静默改动（见「关键常量」）。
 

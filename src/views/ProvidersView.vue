@@ -4,12 +4,14 @@
 // provider-status 也只回「是否已配置」。保存 / 清除后自动触发**该平台的定向重新检测**
 // （`probe { providers: [id] }`）：隔离的 OpenCode 子进程重启时重读 providers.json 并重新注入
 // 声明段，所以无需重启整个应用，其余平台的条目与探测结果一概不动。
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { action, openExternal } from '../core/bridge.js'
 import { successMessage } from '../core/ops.js'
 
 const props = defineProps({
   busy: { type: Boolean, default: false },
+  // status.json 顶层 paidModels：付费白名单的全量列表（核心已排序去重）。
+  paidModels: { type: Array, default: () => [] },
 })
 
 // 静态平台清单（与核心 providers.rs 注册表的 id/label 一致，不含 Key）：
@@ -135,6 +137,21 @@ const clearing = ref({})
 // 正在应用（定向重取 + 重检中）的平台：按钮置忙，防连续保存叠加两轮子进程重启。
 const applying = ref({})
 const applyingBusy = computed(() => Object.values(applying.value).some(Boolean))
+
+// ── 付费模型白名单 ────────────────────────────────────────────────────────
+// 免费发现按「标价全 0」过滤，付费模型永远进不来；白名单是显式例外，按**全限定 id**
+// （`<provider>/<model>`）逐条放行。写入是全量替换（核心侧 set-paid-models），
+// 因此本地必须握有完整列表：以 status.json 的 paidModels 为准，保存成功后立刻用
+// 自己算出的下一版覆盖，避免等下一帧快照的这段时间里界面显示旧状态。
+const paid = ref([...props.paidModels])
+watch(() => props.paidModels, next => { paid.value = [...(next || [])] })
+const paidDrafts = ref(Object.fromEntries(PLATFORMS.map(p => [p.id, { model: '', feedback: null }])))
+const paidSaving = ref({})
+// 每个平台只展示自己命名空间下的条目；跨平台条目仍由对应卡片管理。
+function paidFor(provider) {
+  return paid.value.filter(id => id.startsWith(`${provider.id}/`))
+}
+
 // 「重新应用」的成功反馈：成功 5 秒后自动消隐，失败走上方 error 展示。
 const applyFeedback = ref(null)
 let applyFeedbackTimer = 0
@@ -208,14 +225,14 @@ async function load({ silent = false } = {}) {
 // 该端点无论成败都是 2xx（202），拒绝信息藏在 body 里，必须自己拆开：
 // `{ error: { message } }` = 核心正在忙别的（不叠第二轮），`{ started: false, message }`
 // = 探测闸门拒绝，两者都不能当成「已应用」报给用户。
-async function applyScoped(provider) {
+async function applyScoped(provider, appliedLabel = 'Key 已写入') {
   applying.value[provider.id] = true
   const response = await action('probe', { providers: [provider.id] })
   applying.value[provider.id] = false
   if (!response.ok) return { error: true, text: `应用失败：${response.error}。` }
   const refusal = response.result?.error?.message
     || (response.result?.started === false ? response.result?.message : '')
-  if (refusal) return { error: true, text: `Key 已写入 ✓，但这一家没能重新检测：${refusal}。` }
+  if (refusal) return { error: true, text: `${appliedLabel} ✓，但这一家没能重新检测：${refusal}。` }
   return { error: false, text: '' }
 }
 
@@ -281,6 +298,72 @@ async function clear(provider) {
     : { error: false, text: `已清除并应用 ✓ ${provider.label} 的模型已从「模型与服务」中移除，其余平台不受影响。` }
 }
 
+// 白名单写入：核心按全量替换（空数组即清空），所以每次都要把**整张表**发过去。
+// 保存成功后立刻触发本平台的定向重新检测：新放行的付费模型在下一轮发现里才会出现，
+// 不重启整个应用、也不碰其余平台的目录与探测结果。
+async function writePaid(provider, next, successText) {
+  const draft = paidDrafts.value[provider.id]
+  if (applyingBusy.value) {
+    draft.feedback = { error: true, text: '另一次应用还在进行中，请等它结束后再改白名单。' }
+    return
+  }
+  paidSaving.value[provider.id] = true
+  draft.feedback = null
+  const response = await action('set-paid-models', { models: next })
+  paidSaving.value[provider.id] = false
+  if (!response.ok) {
+    draft.feedback = { error: true, text: `白名单保存失败：${response.error}` }
+    return
+  }
+  // 核心回的是同一份列表（已排序）；缺失时用本地算出的值，界面不等下一帧快照。
+  paid.value = [...(response.result?.paidModels || next)]
+  draft.feedback = { error: false, text: `${successText} 正在只重新检测 ${provider.label} 的模型…` }
+  const applied = await applyScoped(provider, '白名单已保存')
+  draft.feedback = applied.error
+    ? { error: true, text: `${applied.text}可点下方「读取免费模型（重新应用）」重试。` }
+    : { error: false, text: `${successText} 已应用 ✓ 只重新检测 ${provider.label}，其余平台不受影响。切到「模型与服务」查看。` }
+}
+
+// 输入既可以是完整 `provider/model`，也可以只写模型 id（按当前卡片的平台补前缀）；
+// 前缀指向别家一律拒绝——否则用户会在 A 卡片里静默改到 B 平台的白名单。
+function normalizePaidInput(provider, raw) {
+  const typed = (raw || '').trim()
+  if (!typed) return { error: '请输入模型 id（例如 hy4），或完整的 provider/model。' }
+  const slash = typed.indexOf('/')
+  if (slash < 0) return { error: null, id: `${provider.id}/${typed}`, key: typed }
+  const namespace = typed.slice(0, slash)
+  const key = typed.slice(slash + 1).trim()
+  if (namespace !== provider.id) {
+    return { error: `这里只能添加 ${provider.label} 的模型：前缀必须是 ${provider.id}/。` }
+  }
+  if (!key) return { error: '模型 id 不能为空：标识形如 provider/model。' }
+  return { error: null, id: `${namespace}/${key}`, key }
+}
+
+async function addPaidModel(provider) {
+  const draft = paidDrafts.value[provider.id]
+  const parsed = normalizePaidInput(provider, draft.model)
+  if (parsed.error) {
+    draft.feedback = { error: true, text: parsed.error }
+    return
+  }
+  if (paid.value.includes(parsed.id)) {
+    draft.feedback = { error: true, text: `${parsed.id} 已在白名单中。` }
+    return
+  }
+  if (paid.value.length >= 64) {
+    draft.feedback = { error: true, text: '白名单最多 64 条，请先移除不再使用的条目。' }
+    return
+  }
+  draft.model = ''
+  await writePaid(provider, [...paid.value, parsed.id].sort(), `已加入白名单 ✓（${parsed.id}）`)
+}
+
+async function removePaidModel(provider, id) {
+  if (!paid.value.includes(id)) return
+  await writePaid(provider, paid.value.filter(item => item !== id), `已移出白名单 ✓（${id}）`)
+}
+
 onMounted(() => {
   // 首次进入页面用静默探测：核心未运行时（最典型 = 全新安装还没配过 Key）不弹连接失败。
   // 之后任何显式动作（刷新按钮 / 保存 / 清除后的自动应用失败）都走非静默路径，照常报错。
@@ -298,7 +381,7 @@ onUnmounted(() => {
     <header>
       <div>
         <h2>平台</h2>
-        <p class="subtitle">配置自有平台 Key，免费模型随注册表扩展。Key 只保存在本机数据目录，不回显。</p>
+        <p class="subtitle">配置自有平台 Key，免费模型随注册表扩展；付费模型需逐条加入白名单。Key 只保存在本机数据目录，不回显。</p>
       </div>
       <button id="reload-providers" :disabled="loading" @click="load()">
         <span v-if="loading" class="spinner" />刷新
@@ -407,6 +490,60 @@ onUnmounted(() => {
         >
           {{ drafts[provider.id].feedback.text }}
         </p>
+
+        <!-- 付费白名单：免费发现按标价全 0 过滤，付费模型只能由用户逐条显式放行。
+             放行后与免费模型同路发布，代价是真实账单——警示必须与入口同屏。 -->
+        <div class="paid">
+          <div class="paid-head">
+            <span class="paid-title">付费模型白名单</span>
+            <span v-if="paidFor(provider).length" class="badge paid">{{ paidFor(provider).length }} 个已放行</span>
+          </div>
+          <p class="paid-warning">
+            放行后会被发现、检测并发布给 WorkBuddy；<strong>探测与对话都按平台标价真实扣费</strong>，且这些模型不会进入 WB · auto 自动选择。
+          </p>
+          <p v-if="!provider.configured" class="paid-hint">先保存 Key，放行的模型才会被发现。</p>
+          <ul v-if="paidFor(provider).length" class="paid-list">
+            <li v-for="id in paidFor(provider)" :key="id">
+              <code>{{ id }}</code>
+              <button
+                type="button"
+                class="ghost paid-remove"
+                :disabled="busy || paidSaving[provider.id] || applyingBusy"
+                :aria-busy="String(!!(paidSaving[provider.id] || applying[provider.id]))"
+                @click="removePaidModel(provider, id)"
+              >
+                <span v-if="paidSaving[provider.id] || applying[provider.id]" class="spinner" />{{ applying[provider.id] ? '应用中' : '移出' }}
+              </button>
+            </li>
+          </ul>
+          <form class="paid-form" @submit.prevent="addPaidModel(provider)">
+            <input
+              v-model="paidDrafts[provider.id].model"
+              type="text"
+              autocomplete="off"
+              spellcheck="false"
+              :placeholder="`模型 id，例如 hy4 或 ${provider.id}/hy4`"
+              :aria-label="`${provider.label} 的付费模型 id`"
+              :disabled="busy || !provider.configured || paidSaving[provider.id] || applyingBusy"
+            >
+            <button
+              type="submit"
+              class="ghost"
+              :disabled="busy || !provider.configured || paidSaving[provider.id] || applyingBusy || !paidDrafts[provider.id].model.trim()"
+              :aria-busy="String(!!(paidSaving[provider.id] || applying[provider.id]))"
+            >
+              <span v-if="paidSaving[provider.id] || applying[provider.id]" class="spinner" />{{ applying[provider.id] ? '应用中' : '加入白名单' }}
+            </button>
+          </form>
+          <p
+            v-if="paidDrafts[provider.id].feedback"
+            class="feedback"
+            :class="{ error: paidDrafts[provider.id].feedback.error }"
+            role="status"
+          >
+            {{ paidDrafts[provider.id].feedback.text }}
+          </p>
+        </div>
       </li>
     </ul>
 
@@ -485,6 +622,39 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   user-select: all; cursor: text;
 }
+/* 付费放行 = 真实账单：用高危写入的语义色对，和「已配置」的绿色徽章分属两个色相 */
+.badge.paid { background: var(--danger-bg); color: var(--danger); }
+.paid {
+  border: 1px solid color-mix(in srgb, var(--danger) 30%, var(--line));
+  border-radius: var(--radius-s);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.paid-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.paid-title { font-size: 12px; font-weight: 600; color: var(--muted-strong); }
+.paid-warning { margin: 0; font-size: 12px; line-height: 1.7; color: var(--danger); }
+.paid-hint { margin: 0; font-size: 11px; color: var(--muted-strong); }
+.paid-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.paid-list li { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.paid-list code {
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.paid-remove { font-size: 11px; padding: 4px 10px; }
+.paid-form { display: flex; gap: 8px; flex-wrap: wrap; }
+.paid-form input {
+  flex: 1; min-width: 180px;
+  font-size: 13px; padding: 7px 10px;
+  border: 1px solid var(--line); border-radius: var(--radius-s);
+  background: var(--panel); color: var(--text);
+}
+.paid-form input:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-offset); }
+.paid-form input:disabled { opacity: .5; cursor: not-allowed; }
+.paid-form button { font-size: 12px; padding: 6px 12px; }
 .key-form { display: flex; gap: 8px; flex-wrap: wrap; }
 .key-input-wrap { position: relative; flex: 1; min-width: 200px; display: flex; }
 .key-form input {

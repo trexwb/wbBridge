@@ -154,6 +154,18 @@ pub fn all_weights_exhausted(models: &[Value]) -> bool {
     !models.is_empty() && models.iter().all(|model| weight_of(model) == 0)
 }
 
+/// `WB · auto` 的选择域：把付费白名单条目（`paid: true`）剔掉。
+///
+/// 付费模型只能由用户在客户端显式选中——自动路由与翻译模型候选都不得替用户产生费用。
+/// 池里只剩付费模型时返回空集，调用方按既有「选不出不改写」处理。
+pub fn free_pool(models: &[Value]) -> Vec<Value> {
+    models
+        .iter()
+        .filter(|model| model.get("paid") != Some(&json!(true)))
+        .cloned()
+        .collect()
+}
+
 /// 按请求内容筛出候选集（能力档位，见模块头注释第 3 条）。候选层为空时退回全池。
 fn candidates<'a>(body: &Value, pool: &'a [Value]) -> Vec<&'a Value> {
     let messages: &[Value] = body

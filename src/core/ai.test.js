@@ -249,6 +249,26 @@ test('已移除模型不计入助手的活跃统计，并单独报出数量', as
   assert.equal(status.result.removedModels, 1)
 })
 
+test('付费白名单：快照与模型行如实标注，说明真实计费且不进 WB · auto', async () => {
+  const state = {
+    phase: 'ready',
+    models: [{ id: 'a', toolcall: true }, { id: 'tencent-tokenhub/hy4', paid: true }],
+    availableModels: ['a', 'tencent-tokenhub/hy4'],
+  }
+  const snapshot = buildSnapshot(state)
+  assert.ok(snapshot.includes('【付费白名单】1 个'))
+  assert.ok(snapshot.includes('tencent-tokenhub/hy4'))
+  assert.ok(snapshot.includes('按平台标价真实扣费'))
+  assert.ok(snapshot.includes(`合成路由 ${AUTO_MODEL_ID}`))
+
+  const list = await runTool('list_models', { filter: 'all' }, { state })
+  assert.equal(list.result.models.find(model => model.id === 'tencent-tokenhub/hy4').paid, true)
+  assert.equal(list.result.models.find(model => model.id === 'a').paid, false)
+
+  // 提示词把维护入口与计费后果讲死，避免模型建议用户把付费模型当免费替代品。
+  assert.ok(buildSystemPrompt('').includes('付费白名单'))
+})
+
 test('phaseLabel：已知阶段给中文，未知阶段原样回显不编造', () => {
   assert.equal(phaseLabel('ready'), '就绪')
   assert.equal(phaseLabel('starting'), '启动中')
@@ -376,6 +396,7 @@ test('runTool 只读工具：直接取面板快照，不发请求', async () => 
     toolcall: true,
     images: true,
     chatOnly: false,
+    paid: false,
     lastOk: null,
     note: undefined,
   })

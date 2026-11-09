@@ -2,7 +2,7 @@
 
 > 本文件是「面板动作 → 核心路由」唯一的人工可读契约。以下三处实现必须保持一致：
 > 1. `src-tauri/src/lib.rs` 的 `ADMIN_ROUTES` 与 `admin_route()`（壳侧动作表；托盘 pick 分支仍经
->    `admin_route("import")`，面板入口已收口为 10 个类型化命令，见下节）
+>    `admin_route("import")`，面板入口已收口为 11 个类型化命令，见下节）
 > 2. `src-tauri/core/src/server.rs` 的 `ACTION_ROUTES` 与 `route_for()`（核心侧路由表）
 > 3. 本文件的表格
 >
@@ -31,6 +31,16 @@
 | `clear-provider-key` | `/admin/clear-provider-key` | POST | `{ "provider": string }` | 删除一个平台的 Key（未配置过也返回成功，幂等）；同样返回新状态 |
 | `remove-model` | `/admin/remove-model` | POST | `{ "model": string }` | 用户手动移除一个模型：持久化到 `settings.json` 的 `removedModels`，此后**不再探测、不再发布**（从 `/v1/models`、插件配置与 `WB · auto` 选择域中排除）。目录条目保留以便恢复；模型不在目录中返回 400 `model_not_found`；重复移除幂等 |
 | `restore-model` | `/admin/restore-model` | POST | `{ "model": string }` | 从移除名单恢复并立即对该模型发起一次单模型探测；恢复不等于可用，探测通过后才重新进入发布集。模型不在当前目录中返回 400 `model_not_found`；未在移除名单中时幂等返回 `restored: false` |
+| `set-paid-models` | `/admin/set-paid-models` | POST | `{ "models": string[] }` | **全量替换**付费白名单：数组元素是 `<注册表平台 id>/<模型 id>`（最多 64 条，平台命名空间必须在 `providers.rs::PROVIDERS` 内）。写入 `settings.json` 的 `paidModels`，放行的付费模型绕过「标价全 0」过滤进入发现 / 探测 / 发布集；空数组 = 清空。核心正在读取或探测时返回 409 `busy`。返回 `{ "paidModels": string[] }`（已排序去重） |
+
+> **付费白名单语义（v1.3.5 新增，加法式变更）**：`status.json` 顶层新增 `paidModels`（全限定 id
+> 数组），发现入口（`backend::models_in`）对白名单内的条目放行，并在该条目上带 `paid: true`；
+> 免费条目的字段集不变（不带 `paid`），因此 JS↔Rust 对拍夹具逐字节不变。`paid: true` 的模型
+> **不进入 `WB · auto` 的选择域**（`auto::free_pool`）、也不作辅助转写候选（`attach_translator`
+> 先经 `auto::free_pool` 过滤可用池），
+> 权重耗尽的自愈重检同样跳过——这些自动路径会让用户在不经意间产生真实账单。用户仍可手动
+> 指定该模型发起请求（此时按平台标价计费）。白名单只改「是否放行」，不改变探测判定与发布归属。
+> 平台面板在保存后对该平台触发一次定向 `probe`，新放行的模型在下一轮发现里出现。
 
 > 移除语义是「不再检测、不再发布」，不是从目录删除：`status.json` 的 `models` 仍含该条目，
 > 面板靠顶层 `removedModels`（全限定 id 数组）把它归入「模型回收站」面板。该字段是加法式变更
@@ -46,12 +56,14 @@
 > 的单测、`server.rs::provider_actions_take_whole_body_and_never_echo_the_key`、
 > `tests/red_lines.rs::provider_registry_is_reviewed_and_status_echoes_no_key_material`。
 > 平台 id 只认 `providers.rs::PROVIDERS` 这张随版本发布的常量表，注册表外的一律 400。
-> ⚠ **Stage 1 状态（2026-10-03）**：这三条只有核心 + 壳侧链路，**面板还没有入口视图**（Stage 5 才接），
-> 且写入的 Key 目前**没有消费者**（`isolated_config()` 注入属 Stage 3）——按它们做动作不会多发布一个模型。
+> ⚠ **当前状态**：平台视图（`src/views/ProvidersView.vue`）已接入这三条动作；Key 经
+> `OPENCODE_CONFIG_CONTENT` 注入隔离运行时的 `provider` 声明段（`providers.rs` 是唯一读者），
+> 保存后对该平台触发一次定向 `probe` 即可发现其模型，无需重启应用。
 
 面板侧链路：`src/core/bridge.js` 的 `action(name, value)`（前端内核，不是后端）先把动作分发到
-**10 个类型化 Tauri 命令**（`core_refresh`/`core_probe`/`core_import`/`core_system_proxy`/`core_shutdown`/
-`core_provider_status`/`core_set_provider_key`/`core_clear_provider_key`/`core_remove_model`/`core_restore_model`，
+**11 个类型化 Tauri 命令**（`core_refresh`/`core_probe`/`core_import`/`core_system_proxy`/`core_shutdown`/
+`core_provider_status`/`core_set_provider_key`/`core_clear_provider_key`/`core_remove_model`/`core_restore_model`/
+`core_set_paid_models`，
 取代旧 `core_action(action, payload)`
 通用代理：动作名不再是任意字符串，每条只映射一个 `/admin/*` 路由，参数经 serde 类型校验，路由与载荷语义不变）
 → `admin_route()`/`admin_call()`；例外是面板的 `restart` 动作，它不经 `/admin/*`，直接映射为壳命令
@@ -82,7 +94,7 @@
 `ai_chat` 的入参结构（`AiChatRequest`，键名逐字）：`chatId` / `baseUrl` / `apiKey` / `selfHosted` / `model` /
 `messages` / `tools` / `toolChoice`；除 `model` 与 `messages` 外都带 serde `default`，`tools` 缺省空数组即本轮不启用工具。
 
-**面板的第二条边界：Tauri 官方插件命令（自动更新）**，它**不经**上面的 10 个 `core_*` 管理命令 / `/admin/*`，因此不在上面的动作表里：
+**面板的第二条边界：Tauri 官方插件命令（自动更新）**，它**不经**上面的 11 个 `core_*` 管理命令 / `/admin/*`，因此不在上面的动作表里：
 
 | 面板调用（`src/core/bridge.js`） | 底层插件命令 | 说明 |
 |---|---|---|

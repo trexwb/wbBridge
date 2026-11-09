@@ -110,6 +110,7 @@ function invokeCoreAction(name, value) {
     case 'clear-provider-key': return invoke('core_clear_provider_key', { provider: value?.provider })
     case 'remove-model': return invoke('core_remove_model', { model: value?.model })
     case 'restore-model': return invoke('core_restore_model', { model: value?.model })
+    case 'set-paid-models': return invoke('core_set_paid_models', { models: value?.models })
     default: throw new Error(`未知操作：${name}`)
   }
 }

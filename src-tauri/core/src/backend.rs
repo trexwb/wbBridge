@@ -94,6 +94,19 @@ pub fn free_models(providers: &Value) -> Result<Vec<Value>, BridgeError> {
 /// `freeModels(providers, namespace)`：从 `/provider` 响应里取指定命名空间的免费模型。
 /// 免费判定（输入/输出/缓存全 0、输出支持文本、未下线）与 id 拼法对所有平台共用。
 pub fn free_models_in(providers: &Value, namespace: &str) -> Result<Vec<Value>, BridgeError> {
+    models_in(providers, namespace, &[])
+}
+
+/// 与 [`free_models_in`] 相同，但**额外放行**白名单里的付费模型（全限定 id `namespace/key`）。
+///
+/// 白名单只改变价格闸门，不改变其他条件：输出仍须支持文本、仍须未下线、仍要过权威清单。
+/// 放行条目带 `paid: true` 标记，发布集 / 面板 / `WB · auto` 据此把它与免费模型区分开；
+/// 免费条目**不带**该键，默认路径因此与只收免费模型时逐字节一致。
+pub fn models_in(
+    providers: &Value,
+    namespace: &str,
+    allowed_paid: &[String],
+) -> Result<Vec<Value>, BridgeError> {
     let provider = providers
         .get("all")
         .and_then(Value::as_array)
@@ -126,7 +139,9 @@ pub fn free_models_in(providers: &Value, namespace: &str) -> Result<Vec<Value>, 
                 && cost.and_then(|c| c.get("output")) == Some(&json!(0))
                 && cache_cost(cost, "read") == Some(json!(0))
                 && cache_cost(cost, "write") == Some(json!(0));
-            if !free {
+            let qualified = join_namespace(namespace, key);
+            let allowed_paid = !free && allowed_paid.iter().any(|id| id == &qualified);
+            if !free && !allowed_paid {
                 continue;
             }
             if model
@@ -169,6 +184,10 @@ pub fn free_models_in(providers: &Value, namespace: &str) -> Result<Vec<Value>, 
                     _ => json!({}),
                 },
             );
+            // 只有白名单放行的付费条目带标记：免费模型的键集（因而对拍输出）保持不变。
+            if !free {
+                entry.insert("paid".to_string(), json!(true));
+            }
             models.push(Value::Object(entry));
         }
     }
@@ -325,6 +344,9 @@ struct Inner {
     translator: Mutex<Option<TranslatorHook>>,
     /// 多平台发现闸门：已配置 Key 的注册表平台 id（启动时由编排层注入，不含 Key）。
     configured_providers: Mutex<Vec<String>>,
+    /// 用户显式放行的付费模型全限定 id（`settings.json` 的 `paidModels`）。
+    /// 默认空 = 只发现零价模型；非空时**只**放行名单里的条目，其余付费模型仍被挡在外面。
+    paid_models: Mutex<Vec<String>>,
 }
 
 /// watch promise 一旦落定就永远返回同一结果（对应 JS 里可被反复 `Promise.race` 的 promise）。
@@ -462,6 +484,7 @@ impl Backend {
                 password: password.into(),
                 log: Arc::new(log),
                 configured_providers: Mutex::new(Vec::new()),
+                paid_models: Mutex::new(Vec::new()),
                 state: Mutex::new(BackendState::default()),
                 events: Mutex::new(None),
                 translator: Mutex::new(None),
@@ -1107,7 +1130,7 @@ impl Backend {
         Ok(None)
     }
 
-    /// `models()`：拉取 /provider 并筛选免费模型。
+    /// `models()`：拉取 /provider 并筛选免费模型（外加付费白名单放行的条目）。
     ///
     /// 多平台接入后的聚合发现：`opencode` 命名空间（判定与错误文案一字不动）+ 每个**已配置**
     /// 注册表平台的同名调用。单平台失败不丢其他平台：失败只记日志，聚合照常返回。
@@ -1115,14 +1138,17 @@ impl Backend {
     /// 只有 id、不含 Key），**只在子进程启动与 `/admin/refresh` 两个时点更新**：单独调
     /// `clear-provider-key` 不会立刻改变它，要等下一次 refresh/重启。未配置平台即使出现在
     /// `/provider` 的 catalog 里也不发现——避免对无 Key 平台探测 401。
+    /// 付费白名单（[`Backend::set_paid_models`]）只作用于已配置平台的命名空间；`opencode`
+    /// 命名空间保持「只收免费」不变（那是本机已登录账号的目录，不属于本工具的平台 Key 体系）。
     /// 聚合顺序、单平台失败的容忍与空聚合的错误都由本模块的 `models_*` 三个测试直接钉住。
     pub async fn models(&self) -> Result<Vec<Value>, BackendError> {
         let providers = self.request("/provider", "GET", None, None, None).await?;
         let mut models = free_models(&providers)
             .map_err(|error| BackendError::bridge(&error))?;
         let configured = lock(&self.inner.configured_providers).clone();
+        let allowed_paid = lock(&self.inner.paid_models).clone();
         for namespace in configured {
-            match free_models_in(&providers, &namespace) {
+            match models_in(&providers, &namespace, &allowed_paid) {
                 Ok(found) => models.extend(found),
                 Err(error) => {
                     // 单平台不可用只记日志：catalog 缺该平台属于上游目录事实，不是本服务故障；
@@ -1145,6 +1171,12 @@ impl Backend {
     /// 注入「已配置平台 id 集合」（多平台发现的收敛闸门）。只收 id，不收 Key。
     pub fn set_configured_providers(&self, ids: Vec<String>) {
         *lock(&self.inner.configured_providers) = ids;
+    }
+
+    /// 注入「用户放行的付费模型全限定 id」集合（`settings.json` 的 `paidModels`）。
+    /// 只影响下一次 `models()` 的价格闸门，不触发重新发现。
+    pub fn set_paid_models(&self, ids: Vec<String>) {
+        *lock(&self.inner.paid_models) = ids;
     }
 
     /// `translate(...)`：交给辅助模型的一次有界转写；探测路径不会走到这里。
@@ -2090,6 +2122,63 @@ mod tests {
 
         let error = free_models_in(&providers, "modelscope").unwrap_err();
         assert_eq!(error.message, "OpenCode provider missing");
+    }
+
+    /// 付费白名单只按**全限定 id** 放行点名的条目：其余付费模型仍被价格闸门挡住，
+    /// 免费条目的输出（键集）不受影响——默认路径的对拍因此逐字节不变。
+    #[test]
+    fn models_in_admits_only_the_allowlisted_paid_entries() {
+        let providers = json!({ "all": [
+            { "id": "tencent-tokenhub", "models": {
+                "free-one": { "name": "Free", "cost": { "input": 0, "output": 0 }, "capabilities": { "output": { "text": true } } },
+                "hy4": { "name": "HY4", "cost": { "input": 0.834, "output": 2.501, "cache": { "read": 0.042, "write": 0 } }, "capabilities": { "output": { "text": true } } },
+                "hy4-pro": { "name": "HY4 Pro", "cost": { "input": 1.2, "output": 3 }, "capabilities": { "output": { "text": true } } },
+            } },
+        ] });
+
+        // 默认（空白名单）：只剩免费模型，且免费条目不带 `paid` 键。
+        let plain = models_in(&providers, "tencent-tokenhub", &[]).unwrap();
+        assert_eq!(
+            plain.iter().map(|m| m["id"].clone()).collect::<Vec<_>>(),
+            vec![json!("tencent-tokenhub/free-one")]
+        );
+        assert!(plain[0].get("paid").is_none(), "免费条目不得带付费标记");
+
+        // 点名 hy4：它被放行并带 `paid: true`，未点名的 hy4-pro 仍被挡住。
+        let allowed = vec!["tencent-tokenhub/hy4".to_string()];
+        let models = models_in(&providers, "tencent-tokenhub", &allowed).unwrap();
+        let ids: Vec<&str> = models.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["tencent-tokenhub/free-one", "tencent-tokenhub/hy4"]);
+        assert!(models[0].get("paid").is_none());
+        assert_eq!(models[1]["paid"], json!(true));
+        assert_eq!(models[1]["name"], json!("HY4"));
+
+        // 白名单是全限定 id：同一模型名配在别的平台前缀下不得被放行。
+        let other = vec!["zhipuai/hy4".to_string()];
+        let models = models_in(&providers, "tencent-tokenhub", &other).unwrap();
+        assert_eq!(models.len(), 1, "跨平台的 id 不得放行");
+    }
+
+    /// 价格闸门之外的三个条件对白名单条目同样生效：非文本输出、已下线、权威清单外一律不放行。
+    #[test]
+    fn allowlisted_paid_entries_still_obey_the_other_discovery_gates() {
+        let providers = json!({ "all": [
+            { "id": "tencent-tokenhub", "models": {
+                "image-only": { "cost": { "input": 1, "output": 1 }, "capabilities": { "output": { "text": false } } },
+                "deprecated": { "cost": { "input": 1, "output": 1 }, "status": "deprecated" },
+                "ok": { "cost": { "input": 1, "output": 1 }, "capabilities": { "output": { "text": true } } },
+            } },
+        ] });
+        let allowed = vec![
+            "tencent-tokenhub/image-only".to_string(),
+            "tencent-tokenhub/deprecated".to_string(),
+            "tencent-tokenhub/ok".to_string(),
+        ];
+        let models = models_in(&providers, "tencent-tokenhub", &allowed).unwrap();
+        assert_eq!(
+            models.iter().map(|m| m["id"].clone()).collect::<Vec<_>>(),
+            vec![json!("tencent-tokenhub/ok")]
+        );
     }
 
     /// `{providerID, modelID}` 由 id 的命名空间决定；OpenCode 路径与旧的定长截串逐字节等价，
