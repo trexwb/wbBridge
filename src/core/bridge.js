@@ -55,6 +55,18 @@ function publish(next) {
   listeners.state.forEach(cb => cb(next))
 }
 
+// 面板也常被 `npm run vite:dev` 在普通浏览器里打开（只为看界面）：那里没有壳注入的
+// Tauri IPC，@tauri-apps/api 的 invoke 会直接抛「Cannot read properties of undefined
+// (reading 'invoke')」，界面上只剩一句看不懂的 TypeError。这里统一拦成可操作的原因。
+// 真实应用窗口内 __TAURI_INTERNALS__ 必然存在，因此这条分支只在浏览器预览里生效。
+const NO_TAURI_IPC = '当前不在 WB Bridge 应用窗口内（浏览器里没有 Tauri IPC），无法与核心通信。请用 npm run tauri:dev 启动，或使用安装后的应用。'
+
+function tauriMissing() {
+  if (typeof window === 'undefined') return true
+  const internals = window.__TAURI_INTERNALS__
+  return !internals || typeof internals.invoke !== 'function'
+}
+
 function ensureBridge() {
   if (started) return
   started = true
@@ -108,13 +120,16 @@ function invokeCoreAction(name, value) {
     case 'provider-status': return invoke('core_provider_status')
     case 'set-provider-key': return invoke('core_set_provider_key', { provider: value?.provider, apiKey: value?.apiKey })
     case 'clear-provider-key': return invoke('core_clear_provider_key', { provider: value?.provider })
+    case 'reveal-provider-key': return invoke('core_reveal_provider_key', { provider: value?.provider })
     case 'remove-model': return invoke('core_remove_model', { model: value?.model })
     case 'restore-model': return invoke('core_restore_model', { model: value?.model })
+    case 'set-paid-models': return invoke('core_set_paid_models', { models: value?.models })
     default: throw new Error(`未知操作：${name}`)
   }
 }
 
 export async function action(name, value) {
+  if (tauriMissing()) return { ok: false, error: NO_TAURI_IPC }
   ensureBridge()
   try {
     if (name === 'restart') {
@@ -149,6 +164,7 @@ export async function action(name, value) {
 
 // 运行日志尾部：由壳读数据目录下的日志文件，截断上限在壳侧常量里（不在前端拼接路径）。
 export async function readLog() {
+  if (tauriMissing()) return { ok: false, error: NO_TAURI_IPC }
   ensureBridge()
   try {
     return { ok: true, result: await invoke('read_log') }
@@ -160,6 +176,7 @@ export async function readLog() {
 // 清空运行日志：壳把数据目录下的日志文件截断为空（固定文件名，不接受路径参数，
 // 不碰 opencode.log.previous 轮转存档）。这是运行日志页唯一的写入口。
 export async function clearLog() {
+  if (tauriMissing()) return { ok: false, error: NO_TAURI_IPC }
   ensureBridge()
   try {
     return { ok: true, result: await invoke('clear_log') }
@@ -172,6 +189,7 @@ export async function clearLog() {
 // 必须经壳的 open_external 命令转发（壳侧有 https + 字符白名单 + 精确主机名名单 EXTERNAL_HOSTS
 // 三重校验，名单外的域名一律拒绝）。只收 URL、不做任何 IO。
 export async function openExternal(url) {
+  if (tauriMissing()) return { ok: false, error: NO_TAURI_IPC }
   ensureBridge()
   try {
     await invoke('open_external', { url })
@@ -216,6 +234,7 @@ function aiEvents(listen, chatId, handlers) {
 //   { ok: false, aborted: true, content }           用户点了「停止」
 //   { ok: false, error, partial }                   请求失败（partial 是已生成部分）
 export async function aiChat(request, onDelta) {
+  if (tauriMissing()) return { ok: false, error: NO_TAURI_IPC }
   ensureBridge()
   const chatId = `ai-${++aiSeq}-${Date.now().toString(36)}`
   activeChatId = chatId
@@ -274,6 +293,7 @@ export async function aiAbort() {
 
 // 壳实际使用的数据目录（status.json / 运行日志都在这里）。
 export async function dataDir() {
+  if (tauriMissing()) return { ok: false, error: NO_TAURI_IPC }
   ensureBridge()
   try {
     return { ok: true, result: await invoke('data_dir_path') }
@@ -297,6 +317,7 @@ function updateError(error) {
 
 // 发现新版本时返回 { version, notes }；已是最新返回 result = null。
 export async function checkUpdate() {
+  if (tauriMissing()) return { ok: false, error: NO_TAURI_IPC }
   ensureBridge()
   try {
     const update = await checkForUpdate()
@@ -341,6 +362,7 @@ export async function downloadUpdate(onProgress) {
 // 壳的 RunEvent::ExitRequested 分支里已有 graceful_stop + cleanup_before_exit，
 // 所以这条路径同样会先停核心、收掉 OpenCode 子进程，不为更新另开一条退出链路。
 export async function relaunchApp() {
+  if (tauriMissing()) return { ok: false, error: NO_TAURI_IPC }
   ensureBridge()
   try {
     await relaunch()

@@ -2,7 +2,7 @@
 //!
 //! 逐条对齐 Node 版的可见行为：
 //! - 路由集合：`GET /health`、`GET /v1/models`、`POST /v1/chat/completions`、
-//!   10 条 `POST /admin/*`（动作表见 [`ACTION_ROUTES`]，是这张表的唯一真相；壳的
+//!   12 条 `POST /admin/*`（动作表见 [`ACTION_ROUTES`]，是这张表的唯一真相；壳的
 //!   `src-tauri/src/lib.rs::ADMIN_ROUTES` 由壳侧契约测试逐项对齐，`docs/contract.md` 记录对外口径）；
 //! - 鉴权：`Authorization: Bearer <key>`，缺失/不匹配 → 401 `{message, type}`；
 //! - 浏览器 Origin 一律 403 `{message}`；
@@ -63,8 +63,8 @@ pub const REQUEST_BODY_TIMEOUT: Duration = Duration::from_secs(20);
 /// `src-tauri/src/lib.rs` 的 `shell_action_routes_match_the_core_contract` 逐项对齐，
 /// 红线用例（`tests/red_lines.rs::routes()`）也直接从这张表取管理路由，不再各写一份。
 ///
-/// 顺序亦与 Node 版一致（Node 的 Map 保持插入序）；`provider-*` 三条是迁移后新增的，追加在尾部。
-pub const ACTION_ROUTES: [(&str, &str, &str); 10] = [
+/// 顺序亦与 Node 版一致（Node 的 Map 保持插入序）；`provider-*` 四条是迁移后新增的，追加在尾部。
+pub const ACTION_ROUTES: [(&str, &str, &str); 12] = [
     ("probe", "POST", "/admin/probe"),
     ("system-proxy", "POST", "/admin/system-proxy"),
     ("import", "POST", "/admin/import"),
@@ -73,8 +73,10 @@ pub const ACTION_ROUTES: [(&str, &str, &str); 10] = [
     ("provider-status", "POST", "/admin/provider-status"),
     ("set-provider-key", "POST", "/admin/set-provider-key"),
     ("clear-provider-key", "POST", "/admin/clear-provider-key"),
+    ("reveal-provider-key", "POST", "/admin/reveal-provider-key"),
     ("remove-model", "POST", "/admin/remove-model"),
     ("restore-model", "POST", "/admin/restore-model"),
+    ("set-paid-models", "POST", "/admin/set-paid-models"),
 ];
 
 /// `routeFor(action)`：未知动作返回 `None`（对应 JS 的 `null`）。
@@ -481,10 +483,16 @@ pub struct Handlers {
     pub set_provider_key: Arc<AdminFn>,
     /// `clearProviderKey(body)`：入参 `{ provider }`。
     pub clear_provider_key: Arc<AdminFn>,
+    /// `revealProviderKey(body)`：入参 `{ provider }`，返回该平台已存的 Key。
+    /// 🔴 唯一允许把凭据放进响应体的动作：只在用户显式点「眼睛」时调用，一次一平台；
+    /// 不得并进 `provider-status`（它在进入页面时自动拉取，会把全部凭据交给 WebView）。
+    pub reveal_provider_key: Arc<AdminFn>,
     /// `removeModel(body)`：入参 `{ model }`，把模型移出探测与发布集（可恢复）。
     pub remove_model: Arc<AdminFn>,
     /// `restoreModel(body)`：入参 `{ model }`，恢复后立即重新参与检测。
     pub restore_model: Arc<AdminFn>,
+    /// `setPaidModels(body)`：入参 `{ models: [<全限定 id>, …] }`，整份替换付费白名单。
+    pub set_paid_models: Arc<AdminFn>,
     /// `onResult(model, ok, message, status, code, duration, source, meta)`。
     pub on_result: Arc<ResultFn>,
     /// `onActivity(progress)`。
@@ -518,8 +526,10 @@ impl Server {
                 provider_status: Arc::new(|_| Box::pin(async { Ok(json!({ "providers": [] })) })),
                 set_provider_key: Arc::new(|_| Box::pin(async { Ok(json!({})) })),
                 clear_provider_key: Arc::new(|_| Box::pin(async { Ok(json!({})) })),
+                reveal_provider_key: Arc::new(|_| Box::pin(async { Ok(json!({})) })),
                 remove_model: Arc::new(|_| Box::pin(async { Ok(json!({})) })),
                 restore_model: Arc::new(|_| Box::pin(async { Ok(json!({})) })),
+                set_paid_models: Arc::new(|_| Box::pin(async { Ok(json!({})) })),
                 on_result: Arc::new(|_| Box::pin(async {})),
                 on_activity: None,
                 on_shutdown: None,
@@ -631,6 +641,16 @@ impl Server {
         self
     }
 
+    /// 注入 `revealProviderKey(body)`（`{ provider }`）。
+    #[must_use]
+    pub fn reveal_provider_key<F>(mut self, reveal_provider_key: F) -> Self
+    where
+        F: Fn(Value) -> BoxFuture<Result<Value, BackendError>> + Send + Sync + 'static,
+    {
+        self.handlers.reveal_provider_key = Arc::new(reveal_provider_key);
+        self
+    }
+
     /// 注入 `removeModel(body)`（`{ model }`）。
     #[must_use]
     pub fn remove_model<F>(mut self, remove_model: F) -> Self
@@ -648,6 +668,16 @@ impl Server {
         F: Fn(Value) -> BoxFuture<Result<Value, BackendError>> + Send + Sync + 'static,
     {
         self.handlers.restore_model = Arc::new(restore_model);
+        self
+    }
+
+    /// 注入 `setPaidModels(body)`（`{ models }`）。
+    #[must_use]
+    pub fn set_paid_models<F>(mut self, set_paid_models: F) -> Self
+    where
+        F: Fn(Value) -> BoxFuture<Result<Value, BackendError>> + Send + Sync + 'static,
+    {
+        self.handlers.set_paid_models = Arc::new(set_paid_models);
         self
     }
 
@@ -918,6 +948,19 @@ async fn handle(
         };
     }
 
+    if action_matches("reveal-provider-key", method, route) {
+        // 🔴 这是唯一会把平台凭据放进响应体的动作。只由用户点「眼睛」显式触发、
+        // 一次一平台；`provider-status` 不承担这件事（见 `providers.rs::reveal_key`）。
+        let body = match read_body(body).await {
+            Ok(body) => body,
+            Err(error) => return error_response(&error),
+        };
+        return match (handlers.reveal_provider_key)(body).await {
+            Ok(result) => json_response(StatusCode::OK, result),
+            Err(error) => error_response(&error),
+        };
+    }
+
     if action_matches("remove-model", method, route) {
         let body = match read_body(body).await {
             Ok(body) => body,
@@ -935,6 +978,17 @@ async fn handle(
             Err(error) => return error_response(&error),
         };
         return match (handlers.restore_model)(body).await {
+            Ok(result) => json_response(StatusCode::OK, result),
+            Err(error) => error_response(&error),
+        };
+    }
+
+    if action_matches("set-paid-models", method, route) {
+        let body = match read_body(body).await {
+            Ok(body) => body,
+            Err(error) => return error_response(&error),
+        };
+        return match (handlers.set_paid_models)(body).await {
             Ok(result) => json_response(StatusCode::OK, result),
             Err(error) => error_response(&error),
         };
@@ -982,8 +1036,11 @@ async fn chat(
     // 改写成实际模型的全限定 id。否则失败判决打在 `"WB · auto"` 这个假键上，真实模型留在通过集里
     // 被反复选中，用户要求的「受限/超时/不可用即摘除」就落空。
     if body.get("model").and_then(Value::as_str) == Some(crate::auto::AUTO_MODEL_ID) {
+        // 🔴 自动路由绝不选付费模型：白名单里的条目是用户手动点选要用的，自动挑选会让
+        // 每个普通请求都可能产生费用。池里只剩付费模型时不改写，交回 `prepare` 报既有 400。
+        let free_pool = crate::auto::free_pool(&models);
         // 选不出（池空）时**不改写**，交回 `prepare` 报既有 400 `model_not_found`——不新增错误码。
-        if let Some(selected) = crate::auto::auto_select(&body, &models) {
+        if let Some(selected) = crate::auto::auto_select(&body, &free_pool) {
             body["model"] = json!(selected);
         }
     }
@@ -1215,8 +1272,10 @@ impl Handlers {
             provider_status: self.provider_status.clone(),
             set_provider_key: self.set_provider_key.clone(),
             clear_provider_key: self.clear_provider_key.clone(),
+            reveal_provider_key: self.reveal_provider_key.clone(),
             remove_model: self.remove_model.clone(),
             restore_model: self.restore_model.clone(),
+            set_paid_models: self.set_paid_models.clone(),
             on_result: self.on_result.clone(),
             on_activity: self.on_activity.clone(),
             on_shutdown: self.on_shutdown.clone(),
@@ -1522,7 +1581,7 @@ mod tests {
 
     #[test]
     fn action_table_is_post_admin_routes() {
-        assert_eq!(ACTION_ROUTES.len(), 10);
+        assert_eq!(ACTION_ROUTES.len(), 12);
         for (action, method, path) in ACTION_ROUTES {
             assert_eq!(method, "POST", "{action} 必须是 POST");
             assert!(path.starts_with("/admin/"), "{action} 必须挂在 /admin/ 下");

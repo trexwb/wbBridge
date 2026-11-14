@@ -302,10 +302,19 @@ export function buildSnapshot(state) {
   const toolCapable = models.filter(m => m?.toolcall === true).length
   const imageCapable = models.filter(m => m?.images === true).length
   const chatOnly = models.filter(m => m?.chatOnly === true).length
+  const paidModels = models.filter(m => m?.paid === true)
   lines.push(
     `【能力】支持工具调用 ${toolCapable} 个、支持图片输入 ${imageCapable} 个、仅对话（不能带工具）${chatOnly} 个。` +
       `合成路由 ${AUTO_MODEL_ID} 按请求内容在这些模型里选：带 tools 的请求只会落到支持工具调用的模型。`,
   )
+  // 付费白名单条目按用户显式放行才被发布：它们真实计费，且被合成路由刻意排除，
+  // 助手必须能解释「为什么 WB · auto 从不选这个付费模型」。
+  if (paidModels.length) {
+    lines.push(
+      `【付费白名单】${paidModels.length} 个模型由用户放行（${paidModels.map(m => m.id).join('、')}）：` +
+        `探测与对话都按平台标价真实扣费，${AUTO_MODEL_ID} 不会自动选择它们。`,
+    )
+  }
   if (s.probe?.running) {
     const total = models.length
     const pending = Array.isArray(s.probe.pending) ? s.probe.pending.length : null
@@ -351,6 +360,8 @@ export function buildSystemPrompt(snapshot = '') {
     '   用户还没 Key 时可以起草 open_provider_page 打开官方申请页，但不要声称已保存任何 Key。',
     '6. 数字（模型数、可用数、请求数）一律以快照与工具返回为准，不要自行重算或编造。',
     '7. 做不到的事（如提高上游免费额度、修改 OpenCode 侧策略、切换面板视图）如实说明，不要假装执行。',
+    '   付费白名单（「平台」页逐条放行的付费模型）也只能由用户在面板维护：它们按平台标价真实扣费，',
+    `   且 ${AUTO_MODEL_ID} 不会自动选择；不要建议用户把它们当作免费替代品。`,
     '8. 回复用简体中文，结论先行，措辞简洁；可用简单 Markdown（加粗、列表、代码块）。',
     '',
     '【当前状态快照】',
@@ -517,6 +528,8 @@ function modelRows(state) {
       toolcall: m?.toolcall === true,
       images: m?.images === true,
       chatOnly: m?.chatOnly === true || r?.chatOnly === true,
+      // 付费白名单放行的条目标了 paid：真实计费，且被 WB · auto 排除。
+      paid: m?.paid === true,
       lastOk: r && typeof r.ok === 'boolean' ? r.ok : null,
       note: r && r.ok === false && typeof r.message === 'string' ? r.message.slice(0, 120) : undefined,
     }

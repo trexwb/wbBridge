@@ -12,6 +12,8 @@ defineEmits(['collapse'])
 const lines = computed(() => {
   const r = props.result || {}
   const out = []
+  if (props.model.paid)
+    out.push({ text: '付费白名单放行：探测与对话都按平台标价真实扣费，WB · auto 不会自动选择它。', error: true })
   if (r.chatOnly) out.push({ text: '已自动关闭工具调用；导入后仅支持普通对话。' })
   if (Number.isInteger(r.nativeAttempts) && r.nativeAttempts > 0)
     out.push({ text: `最近一次调用拦截了 ${r.nativeAttempts} 次本地执行尝试，动作必须由客户端（WorkBuddy / CodeBuddy）执行。`, error: true })

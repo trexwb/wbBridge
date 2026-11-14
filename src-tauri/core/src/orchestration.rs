@@ -82,6 +82,12 @@ const TRANSLATOR_ORDER: [&str; 4] = [
 /// （须与壳侧 `src-tauri/src/lib.rs` 的 `STATUS_SCHEMA_VERSION` 同步）。
 const STATUS_SCHEMA_VERSION: u32 = 1;
 
+/// 付费白名单的规模上限：够覆盖「几家平台各点几个模型」，又不至于让一份被手改的
+/// `settings.json` 把发现与探测拖成全量扫描。
+const MAX_PAID_MODELS: usize = 64;
+/// 单条白名单 id 的字符上限（形如 `tencent-tokenhub/hy4`，实际远小于此）。
+const MAX_PAID_MODEL_CHARS: usize = 200;
+
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
@@ -303,6 +309,10 @@ struct App {
     /// 目录条目照旧保留（面板的「已移除」分组要靠它显示名称与恢复入口），但探测、
     /// 发布集与 `WB · auto` 的选择域一律排除——「移除」的语义就是不再检测、不再发布。
     removed: Arc<Mutex<Vec<String>>>,
+    /// 用户显式放行的付费模型全限定 id（持久化在 `settings.json` 的 `paidModels`）。
+    /// 只改变模型发现的价格闸门；发布集照常收录（用户点名要付费用），但 `WB · auto`
+    /// 与翻译模型候选一律排除——自动路径不得替用户花钱。
+    paid_models: Arc<Mutex<Vec<String>>>,
     binary: Arc<Mutex<Option<String>>>,
     runtime: Arc<Mutex<Option<Arc<Started>>>>,
     stopping: Arc<AtomicBool>,
@@ -350,6 +360,10 @@ impl App {
 
     fn models(&self) -> Vec<Value> {
         lock(&self.models).clone()
+    }
+
+    fn paid_models(&self) -> Vec<String> {
+        lock(&self.paid_models).clone()
     }
 
     fn workbuddy_models_file(&self) -> Option<String> {
@@ -558,6 +572,43 @@ fn restored_removed_models(settings: &Value) -> Vec<String> {
     ids
 }
 
+/// 用户显式放行的付费模型（`settings.json` 的 `paidModels`）。
+///
+/// 白名单元素必须是 `<注册表平台 id>/<模型 key>`：注册表之外的命名空间（尤其 `opencode`）
+/// 一律丢弃——白名单的语义是「用户点名要为这家平台上的这个模型付费」，而 `opencode`
+/// 是本机已登录账号的目录、没有本工具管理的平台 Key，放行它只会绕过价格闸门而不产生任何收益。
+/// 上限 64 条 / 每条 200 字符：`settings.json` 是用户可见的普通文件，坏数据不能让启动失败。
+fn restored_paid_models(settings: &Value) -> Vec<String> {
+    let mut ids: Vec<String> = settings
+        .get("paidModels")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .filter_map(normalize_paid_model)
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort();
+    ids.dedup();
+    ids.truncate(MAX_PAID_MODELS);
+    ids
+}
+
+/// 单个白名单条目的归一：去首尾空白（面板输入框粘贴常带空白），校验形态与平台已注册。
+/// 模型 key 内部空格原样保留——全限定 id 是上游 key 拼出来的，改一个字节就永远匹配不上。
+fn normalize_paid_model(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().count() > MAX_PAID_MODEL_CHARS {
+        return None;
+    }
+    let (namespace, model) = value.split_once('/')?;
+    if model.is_empty() || providers::find(namespace).is_none() {
+        return None;
+    }
+    Some(value.to_string())
+}
+
 /// 从沿用的目录与历史结果重建「已通过校验」集合：只认 `ok === true` 且带字符串 `id` 的条目。
 ///
 /// 判定与 `usable_models()` 用的是同一个表达式，所以「沿用上次结果」与「重新探测」不会有两套口径；
@@ -721,7 +772,13 @@ fn reprobe_when_weights_exhausted(source: &str) {
     {
         return;
     }
-    if !crate::auto::all_weights_exhausted(&usable_models()) {
+    let usable = usable_models();
+    // 全量重检会对目录里每个模型发一次真实请求，其中包括白名单放行的付费条目。自动路径
+    // 不得替用户花钱，有付费条目时就不做自愈——需要重检时用户自己点「读取免费模型」。
+    if usable.iter().any(|model| model.get("paid") == Some(&json!(true))) {
+        return;
+    }
+    if !crate::auto::all_weights_exhausted(&usable) {
         return;
     }
     log_line("WB · auto 的模型权重已全部归零，重新检测全部模型并重新分配权重");
@@ -735,7 +792,8 @@ fn reprobe_when_weights_exhausted(source: &str) {
 /// `failed` 为当前请求失败的模型 id —— 与 JS 一致，绝不把失败模型选为自己的转写器。
 fn attach_translator(started: &Started) {
     started.backend.set_translator(move |failed: &str, _shape: &str| {
-        let ids = usable_models()
+        // 转写是对用户请求的自动重跑，付费条目不得进入候选（同 `WB · auto`）。
+        let ids = crate::auto::free_pool(&usable_models())
             .iter()
             .filter_map(|model| model.get("id").and_then(Value::as_str))
             .filter(|id| *id != failed)
@@ -1629,6 +1687,41 @@ fn merge_scoped_models(old: &[Value], discovered: &[Value], scope: &Scope) -> Ve
     merged
 }
 
+/// 目录里属于「已移除」名单的条目（按全限定 id）。
+///
+/// 全量读取会先把目录清空，而读取后的列表又只由**逐个揭示**填回来；已移除的模型不探测，
+/// 因此永远不会被揭示。不把它们单独留住并接回，一次「读取免费模型」就会让回收站的行
+/// 永久消失——`settings.json` 里的 id 还在（模型依旧不检测、不发布），面板却没有任何
+/// 可恢复的条目。
+fn removed_entries(models: &[Value], removed: &[String]) -> Vec<Value> {
+    models
+        .iter()
+        .filter(|model| {
+            model
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| removed.iter().any(|removed_id| removed_id == id))
+        })
+        .cloned()
+        .collect()
+}
+
+/// 把读取前留住的已移除条目接回新目录：新目录里仍有该 id 时以新发现为准（名称 / 能力可能
+/// 变了），已下架或转收费的沿用旧条目，保证回收站里始终有可恢复的行。
+fn merge_removed_entries(merged: &mut Vec<Value>, retained: &[Value]) {
+    for entry in retained {
+        let Some(id) = entry.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !merged
+            .iter()
+            .any(|model| model.get("id").and_then(Value::as_str) == Some(id))
+        {
+            merged.push(entry.clone());
+        }
+    }
+}
+
 /// 把范围内模型的「已校验」标记摘掉：换 Key 之后这些模型必须重新探测才算可用，
 /// 而其余平台的标记不能被牵连（那正是「只重检这一家」的另一半）。全量范围就是原有的清空语义。
 fn strip_validated(validated: &mut HashSet<String>, scope: &Scope) {
@@ -1690,13 +1783,27 @@ async fn refresh(
             Ok(env) => {
                 let proxy_env = to_env_map(&env);
                 let app = global_app();
+                // 已移除的模型不参与探测，读取后的「逐个揭示」永远轮不到它们；先留住目录条目，
+                // 读取结束后接回，回收站才不会因为一次读取而清空。以面板列表（status.models）为准：
+                // 上一轮读取失败时内存目录已被清空，但已移除的条目仍在状态里。
+                let retained = if scope == Scope::All {
+                    let displayed = app
+                        .snapshot()
+                        .get("models")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    removed_entries(&displayed, &lock(&app.removed).clone())
+                } else {
+                    Vec::new()
+                };
                 if scope == Scope::All {
                     lock(&app.validated).clear();
                     *lock(&app.models) = Vec::new();
                     update_and_persist(json!({
                         "phase": "reading",
                         "message": "正在读取免费模型…",
-                        "models": [],
+                        "models": retained.clone(),
                         "availableModels": []
                     }));
                 } else {
@@ -1706,7 +1813,7 @@ async fn refresh(
                         "message": format!("正在重新读取 {} 的免费模型…", scope.labels())
                     }));
                 }
-                run_refresh(restart_runtime, enabled, proxy_env, &scope).await
+                run_refresh(restart_runtime, enabled, proxy_env, &scope, &retained).await
             }
         };
         // 对应 JS 的 `finally { refreshing = null }`：只有当前代次才有权释放链位。
@@ -1796,6 +1903,7 @@ async fn run_refresh(
     use_system_proxy: bool,
     proxy_env: Env,
     scope: &Scope,
+    retained_removed: &[Value],
 ) -> Result<Value, BackendError> {
     let app = global_app();
     if restart_runtime {
@@ -1818,6 +1926,7 @@ async fn run_refresh(
         }
         next.backend
             .set_configured_providers(configured_provider_ids(&app.data_dir));
+        next.backend.set_paid_models(app.paid_models());
         attach_translator(&next);
         let old = {
             let mut guard = lock(&app.runtime);
@@ -1851,7 +1960,12 @@ async fn run_refresh(
         Ok(models) => models,
     };
     // 定向范围：其余平台的目录原样留着，清单内那一段整体换成刚发现的。全量范围等价于直接用新目录。
-    let merged = merge_scoped_models(&app.models(), &discovered, scope);
+    let mut merged = merge_scoped_models(&app.models(), &discovered, scope);
+    if scope == &Scope::All {
+        // 已移除的模型不探测、不会被逐个揭示；接回读取前留住的条目（发现清单里已下架的也保留），
+        // 回收站才能在「读取免费模型」之后继续显示并可恢复。
+        merge_removed_entries(&mut merged, retained_removed);
+    }
     {
         // 清单内平台刚换过 Key，它名下的模型必须重新探测才算可用；其余平台的标记不受牵连。
         let mut validated = lock(&app.validated);
@@ -1866,6 +1980,11 @@ async fn run_refresh(
         // 全量读取的列表由随后的逐个揭示填（`start_probes(reveal = true)`）；定向读取不走那条路径，
         // 目录必须在这里整体落盘，否则面板与 status.json 里的 `models` 还停在换 Key 之前。
         patch["models"] = json!(merged);
+    } else {
+        // 全量读取同样只揭示被探测的模型，已移除的那几条必须现在写回面板列表，
+        // 否则回收站在读取完成后清空（id 还留在 settings.json，却没有任何可恢复的行）。
+        let seed = removed_entries(&merged, &lock(&app.removed).clone());
+        patch["models"] = json!(seed);
     }
     update_and_persist(patch);
     Ok(json!({ "count": merged.len() }))
@@ -2162,6 +2281,7 @@ fn bootstrap(options: &StartOptions) -> Result<Arc<App>, String> {
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_else(|| json!({}));
     let removed_models = restored_removed_models(&settings);
+    let paid_models = restored_paid_models(&settings);
 
     // 6. status.json 的上一次快照（modelResults 需要延续）。
     let previous: Value = std::fs::read_to_string(join_host(&[&data_dir, "status.json"]))
@@ -2213,7 +2333,16 @@ fn bootstrap(options: &StartOptions) -> Result<Arc<App>, String> {
     // 太费时间）。三份数据必须一起恢复：目录决定「有哪些模型」，modelResults 决定「面板显示
     // 什么」，validated 决定「请求能过哪个」—— 只恢复其中一份都会得到「面板有模型、实际全 404」。
     // 「读取免费模型」仍然走完整的重新发现 + 重新探测，是唯一的刷新入口。
-    let previous_models = restored_models(&previous);
+    // 上一轮在册、这一轮已不在白名单里的付费条目：目录与通过集一起摘掉。免费条目不受影响；
+    // 否则「取消放行」只会在下一次重新发现后生效，重启后它仍会显示并被发布。
+    let mut previous_models = restored_models(&previous);
+    previous_models.retain(|model| {
+        model.get("paid") != Some(&json!(true))
+            || model
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| paid_models.iter().any(|allowed| allowed == id))
+    });
     let previous_results = restored_model_results(&previous);
     let mut previous_validated = validated_from_results(&previous_models, &previous_results);
     // 已移除的模型即使上一轮判过「通过」也不再算通过：启动的沿用判定与发布集都以
@@ -2243,6 +2372,9 @@ fn bootstrap(options: &StartOptions) -> Result<Arc<App>, String> {
         // 面板按这份名单把目录里的模型分到「已移除」分组；探测 / 发布 / WB · auto
         // 的选择域由 core 侧过滤，面板只负责显示与恢复入口。
         "removedModels": removed_models.clone(),
+        // 用户显式放行的付费模型（全限定 id）；面板据此在平台卡片里回显名单与「付费」徽章，
+        // 发现 / 发布 / `WB · auto` 的过滤都由 core 侧执行。
+        "paidModels": paid_models.clone(),
         "probe": { "running": false },
         "singleProbes": [],
     });
@@ -2264,6 +2396,7 @@ fn bootstrap(options: &StartOptions) -> Result<Arc<App>, String> {
         models: Arc::new(Mutex::new(previous_models)),
         validated: Arc::new(Mutex::new(previous_validated)),
         removed: Arc::new(Mutex::new(removed_models)),
+        paid_models: Arc::new(Mutex::new(paid_models)),
         binary: Arc::new(Mutex::new(None)),
         runtime: Arc::new(Mutex::new(None)),
         stopping: Arc::new(AtomicBool::new(false)),
@@ -2393,6 +2526,7 @@ async fn startup_sequence(app: &App) -> Result<String, BackendError> {
     started
         .backend
         .set_configured_providers(configured_provider_ids(&app.data_dir));
+    started.backend.set_paid_models(app.paid_models());
     attach_translator(&started);
     *lock(&app.runtime) = Some(started.clone());
     update_and_persist(json!({ "opencodeVersion": started.version.clone() }));
@@ -2508,6 +2642,10 @@ fn build_server(app: &App) -> (axum::Router, ServerControl) {
         .clear_provider_key(move |body| {
             Box::pin(async move { clear_provider_key(body).await })
         })
+        .reveal_provider_key(move |body| {
+            Box::pin(async move { reveal_provider_key(body).await })
+        })
+        .set_paid_models(move |body| Box::pin(async move { set_paid_models(body).await }))
         .on_result(|outcome| {
             Box::pin(async move {
                 // 客户端取消的请求绝不记为成功（server.rs 已按 JS 语义过滤，这里兜一层）。
@@ -2790,6 +2928,105 @@ async fn restore_model(body: Value) -> Result<Value, BackendError> {
     }))
 }
 
+/// 从 `{ models: [...] }` 解析白名单：整份替换语义，校验后排序去重。
+/// 错误统一 400 + `invalid_paid_model`，拒绝文案只回显用户提交的那个 id（不含任何 Key）。
+fn paid_model_input(body: &Value) -> Result<Vec<String>, BackendError> {
+    let Some(items) = body.get("models").and_then(Value::as_array) else {
+        return Err(BackendError::with(
+            "models 必须是字符串数组",
+            400,
+            "invalid_paid_model",
+        ));
+    };
+    let mut next: Vec<String> = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(text) = item.as_str() else {
+            return Err(BackendError::with(
+                "models 只能包含字符串",
+                400,
+                "invalid_paid_model",
+            ));
+        };
+        let Some(id) = normalize_paid_model(text) else {
+            return Err(BackendError::with(
+                format!("「{text}」不是有效的付费模型 id（形如 tencent-tokenhub/hy4，平台须已注册）"),
+                400,
+                "invalid_paid_model",
+            ));
+        };
+        if !next.iter().any(|kept| kept == &id) {
+            next.push(id);
+        }
+    }
+    if next.len() > MAX_PAID_MODELS {
+        return Err(BackendError::with(
+            format!("付费模型最多 {MAX_PAID_MODELS} 个"),
+            400,
+            "invalid_paid_model",
+        ));
+    }
+    next.sort();
+    Ok(next)
+}
+
+/// `POST /admin/set-paid-models`：`{ models: [<全限定 id>, …] }`（整份替换，空数组合法 = 全部收回）。
+///
+/// 只持久化白名单并立刻修正内存目录，**不**触发模型发现——面板随后走既有的
+/// `/admin/probe`（`providers` 形态）定向重取，只有那一步才会把新放行的条目读进目录。
+async fn set_paid_models(body: Value) -> Result<Value, BackendError> {
+    let app = global_app();
+    if app.stopping.load(Ordering::Relaxed) {
+        return Err(BackendError::plain("服务正在停止"));
+    }
+    if app.probing.load(Ordering::Relaxed) || lock(&app.refresh).is_some() {
+        return Err(BackendError::with("请等待模型读取或检测完成", 409, "busy"));
+    }
+    let next = paid_model_input(&body)?;
+    let revoked: Vec<String> = app
+        .paid_models()
+        .into_iter()
+        .filter(|id| !next.iter().any(|kept| kept == id))
+        .collect();
+    let next_settings = with_field(&app.read_settings(), "paidModels", json!(next.clone()));
+    app.write_settings(next_settings)
+        .await
+        .map_err(BackendError::plain)?;
+    *lock(&app.paid_models) = next.clone();
+    if let Some(started) = app.runtime() {
+        started.backend.set_paid_models(next.clone());
+    }
+    // 收回的条目立刻从目录与通过集摘掉：不必等下一次读取，也不给发布集留一条
+    // 「已不再放行付费、却仍被当成可用」的缝隙。只摘带 `paid` 标记的条目——白名单里
+    // 混进一个本来就免费的 id 时，收回它不该把免费模型一起删掉。
+    let dropped: Vec<String> = app
+        .models()
+        .into_iter()
+        .filter(|model| model.get("paid") == Some(&json!(true)))
+        .filter_map(|model| model.get("id").and_then(Value::as_str).map(str::to_string))
+        .filter(|id| revoked.iter().any(|gone| gone == id))
+        .collect();
+    if !dropped.is_empty() {
+        lock(&app.models).retain(|model| {
+            model
+                .get("id")
+                .and_then(Value::as_str)
+                .is_none_or(|id| !dropped.iter().any(|gone| gone == id))
+        });
+        let mut validated = lock(&app.validated);
+        for id in &dropped {
+            validated.remove(id);
+        }
+    }
+    let ids: Vec<Value> = usable_models()
+        .iter()
+        .map(|model| model.get("id").cloned().unwrap_or(Value::Null))
+        .collect();
+    update_and_persist(json!({ "paidModels": next.clone(), "availableModels": ids }));
+    // 用户显式收回时允许发布集变空（与 remove-model 同一语义：插件配置里必须真的删掉）。
+    sync_published(None, true);
+    Ok(json!({ "paidModels": next }))
+}
+
 async fn set_system_proxy(enabled: Value) -> Result<Value, BackendError> {
     let app = global_app();
     let Some(enabled) = enabled.as_bool() else {
@@ -2891,6 +3128,24 @@ async fn clear_provider_key(body: Value) -> Result<Value, BackendError> {
         Ok(providers::status(data_dir))
     })
     .await
+}
+
+/// `POST /admin/reveal-provider-key`：`{ provider }` → `{ provider, apiKey }`。
+///
+/// 🔴 全仓唯一会把平台凭据回传给面板的路径：只由用户在平台卡片上点「眼睛」时显式触发，
+/// 一次只取一个平台；`provider-status` 仍然只回「是否已配置」。返回的 Key 不写日志、
+/// 不进 `status.json`、不落任何 WebView 存储——面板只把它放进当前组件的内存。
+async fn reveal_provider_key(body: Value) -> Result<Value, BackendError> {
+    let provider = provider_id(&body)?;
+    let id = provider.clone();
+    let api_key = providers_io(move |data_dir| providers::reveal_key(data_dir, &id))
+        .await
+        .map_err(|error| {
+            // reveal_key 只有「未配置」一类业务错误（IO 失败在 read_keys 里按未配置处理），
+            // 映射 400 而不是默认 500：缺 Key 是正常的用户状态，不是核心故障。
+            BackendError::with(error.message(), 400, "provider_not_configured")
+        })?;
+    Ok(json!({ "provider": provider, "apiKey": api_key }))
 }
 
 fn install_signal_handlers() {
@@ -3071,6 +3326,109 @@ mod tests {
                 "opencode/c".to_string()
             ]
         );
+    }
+
+    /// `paid_model_input` 的边界：整份替换、排序去重、上限 64，非法条目回 400 而不是静默丢弃
+    /// （静默丢一条会让人以为「保存成功但模型没出现」是发现环节的问题）。
+    #[test]
+    fn paid_model_input_validates_and_normalizes_the_whole_list() {
+        assert_eq!(
+            paid_model_input(&json!({ "models": ["tencent-tokenhub/hy4", " tencent-tokenhub/hy4 ", "zhipuai/glm-4.6"] }))
+                .unwrap(),
+            vec!["tencent-tokenhub/hy4".to_string(), "zhipuai/glm-4.6".to_string()]
+        );
+        assert_eq!(paid_model_input(&json!({ "models": [] })).unwrap(), Vec::<String>::new(), "空数组合法");
+        for body in [
+            json!({}),
+            json!({ "models": "hy4" }),
+            json!({ "models": [7] }),
+            json!({ "models": ["opencode/free"] }),
+            json!({ "models": ["tencent-tokenhub/"] }),
+            json!({ "models": ["no-slash"] }),
+        ] {
+            let error = paid_model_input(&body).unwrap_err();
+            assert_eq!(error.status, Some(400), "非法形态必须当场拒绝：{body}");
+            assert_eq!(error.code.as_deref(), Some("invalid_paid_model"));
+        }
+        let too_many: Vec<String> = (0..=MAX_PAID_MODELS)
+            .map(|index| format!("tencent-tokenhub/model-{index}"))
+            .collect();
+        let error = paid_model_input(&json!({ "models": too_many })).unwrap_err();
+        assert_eq!(error.status, Some(400));
+    }
+
+    /// `settings.json` 的 `paidModels` 同样是可手改字段：只收「注册表平台/模型」形态，
+    /// 平台未注册（尤其 `opencode`）与不成形的条目一律丢弃，并排序去重。
+    #[test]
+    fn restored_paid_models_keeps_only_registered_namespaced_ids() {
+        assert_eq!(restored_paid_models(&json!({})), Vec::<String>::new());
+        let settings = json!({
+            "paidModels": [
+                "tencent-tokenhub/hy4",
+                "tencent-tokenhub/hy4",
+                "  zhipuai/glm-4.6  ",
+                "opencode/some-free-model",
+                "unknown-platform/model",
+                "tencent-tokenhub/",
+                "/model",
+                "no-slash",
+                "",
+                7,
+                null,
+            ],
+        });
+        assert_eq!(
+            restored_paid_models(&settings),
+            vec![
+                "tencent-tokenhub/hy4".to_string(),
+                "zhipuai/glm-4.6".to_string()
+            ]
+        );
+        // 形状不对（不是数组）同样回落空名单，启动不失败。
+        assert_eq!(restored_paid_models(&json!({ "paidModels": "hy4" })), Vec::<String>::new());
+    }
+
+    /// 用户放行的付费模型进入发布集（可被客户端显式选中），但 `WB · auto` 的选择域必须
+    /// 把它们剔掉——自动路由不得替用户产生费用。
+    #[test]
+    fn paid_models_publish_but_never_enter_the_auto_pool() {
+        let models = vec![
+            json!({ "id": "opencode/free", "name": "Free" }),
+            json!({ "id": "tencent-tokenhub/hy4", "name": "HY4", "paid": true }),
+        ];
+        let validated: HashSet<String> = models
+            .iter()
+            .filter_map(|model| model["id"].as_str().map(str::to_string))
+            .collect();
+        let results = json!({
+            "opencode/free": { "ok": true, "source": "probe" },
+            "tencent-tokenhub/hy4": { "ok": true, "source": "probe" },
+        });
+        let publishable = publishable_models(&models, &validated, &results, &[]);
+        let ids: Vec<&str> = publishable
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["opencode/free", "tencent-tokenhub/hy4"],
+            "放行的付费模型要能被客户端显式选中"
+        );
+
+        let pool = crate::auto::free_pool(&publishable);
+        assert_eq!(pool.len(), 1);
+        let body = json!({
+            "model": crate::auto::AUTO_MODEL_ID,
+            "messages": [{ "role": "user", "content": "hi" }],
+        });
+        for _ in 0..200 {
+            assert_eq!(crate::auto::auto_select(&body, &pool).as_deref(), Some("opencode/free"));
+        }
+        // 只剩付费模型时自动路由选不出东西（调用方据此交回 prepare 的既有 400）。
+        let paid_only = crate::auto::free_pool(&[json!({
+            "id": "tencent-tokenhub/hy4", "paid": true
+        })]);
+        assert!(paid_only.is_empty());
     }
 
     /// 失败/超时模型必须在探测收尾与真实请求失败后都触发一次配置重发：否则过滤只存在于
@@ -3292,6 +3650,54 @@ mod tests {
 
         // 全量范围 = 既有的「整份替换」语义
         assert_eq!(merge_scoped_models(&old, &discovered, &Scope::All), discovered);
+    }
+
+    /// 全量读取会清空目录，而且只逐个揭示被探测的模型；已移除的模型必须被单独留住并接回，
+    /// 否则一次「读取免费模型」就会让回收站的行永久消失（名单仍在 `settings.json` 里）。
+    #[test]
+    fn removed_entries_survive_a_full_refresh() {
+        let models: Vec<Value> = json!([
+            { "id": "opencode/keep" },
+            { "id": "opencode/removed", "name": "旧名字" },
+            { "id": "modelscope/removed", "name": "另一家" }
+        ])
+        .as_array()
+        .unwrap()
+        .clone();
+        let removed = vec![
+            "opencode/removed".to_string(),
+            "modelscope/removed".to_string(),
+        ];
+
+        // 读取前只留住已移除的条目，参与检测的模型不在这里
+        let retained = removed_entries(&models, &removed);
+        let ids: Vec<&str> = retained
+            .iter()
+            .filter_map(|model| model.get("id").and_then(Value::as_str))
+            .collect();
+        assert_eq!(ids, vec!["opencode/removed", "modelscope/removed"]);
+
+        // 新目录里仍有它：以新发现为准，不重复追加；发现清单里没有的（已下架）沿用旧条目
+        let mut discovered: Vec<Value> = json!([
+            { "id": "opencode/removed", "name": "新名字" },
+            { "id": "opencode/keep" }
+        ])
+        .as_array()
+        .unwrap()
+        .clone();
+        merge_removed_entries(&mut discovered, &retained);
+        let ids: Vec<&str> = discovered
+            .iter()
+            .filter_map(|model| model.get("id").and_then(Value::as_str))
+            .collect();
+        assert_eq!(ids, vec!["opencode/removed", "opencode/keep", "modelscope/removed"]);
+        assert_eq!(discovered[0]["name"], "新名字");
+
+        // 缺 id 的脏条目不得被插进目录
+        let dirty = vec![json!({ "name": "no id" })];
+        let mut merged: Vec<Value> = Vec::new();
+        merge_removed_entries(&mut merged, &dirty);
+        assert!(merged.is_empty());
     }
 
     /// 换 Key 之后必须重新探测才算可用，但只摘本平台的通过标记；

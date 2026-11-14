@@ -116,6 +116,11 @@ const weight = computed(() => {
       <span v-if="model.reasoning" class="badge reasoning">推理</span>
       <span v-if="model.images" class="badge images">图片</span>
       <span
+        v-if="model.paid"
+        class="badge paid"
+        title="付费白名单放行：探测与对话按平台标价真实扣费，不进入 WB · auto"
+      >付费</span>
+      <span
         v-if="weight !== null"
         class="badge weight"
         :title="`速度权重 ${weight}：WB · auto 优先选择权重最高的可用模型`"
@@ -227,6 +232,8 @@ const weight = computed(() => {
 }
 .reasoning { color: var(--badge-reason-fg); background: var(--badge-reason-bg); }
 .images { color: var(--badge-image-fg); background: var(--badge-image-bg); }
+/* 付费放行 = 真实账单：与「写入」的橙棕、可用的绿色都拉开色相，扫读时一眼能挑出来 */
+.paid { color: var(--danger); background: var(--danger-bg); }
 /* 权重是排序依据而非能力，用中性底；tabular-nums 让 100 / 80 这种位数变化时徽章不抖动 */
 .weight {
   color: var(--muted-strong);
