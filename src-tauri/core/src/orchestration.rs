@@ -2642,6 +2642,9 @@ fn build_server(app: &App) -> (axum::Router, ServerControl) {
         .clear_provider_key(move |body| {
             Box::pin(async move { clear_provider_key(body).await })
         })
+        .reveal_provider_key(move |body| {
+            Box::pin(async move { reveal_provider_key(body).await })
+        })
         .set_paid_models(move |body| Box::pin(async move { set_paid_models(body).await }))
         .on_result(|outcome| {
             Box::pin(async move {
@@ -3125,6 +3128,24 @@ async fn clear_provider_key(body: Value) -> Result<Value, BackendError> {
         Ok(providers::status(data_dir))
     })
     .await
+}
+
+/// `POST /admin/reveal-provider-key`：`{ provider }` → `{ provider, apiKey }`。
+///
+/// 🔴 全仓唯一会把平台凭据回传给面板的路径：只由用户在平台卡片上点「眼睛」时显式触发，
+/// 一次只取一个平台；`provider-status` 仍然只回「是否已配置」。返回的 Key 不写日志、
+/// 不进 `status.json`、不落任何 WebView 存储——面板只把它放进当前组件的内存。
+async fn reveal_provider_key(body: Value) -> Result<Value, BackendError> {
+    let provider = provider_id(&body)?;
+    let id = provider.clone();
+    let api_key = providers_io(move |data_dir| providers::reveal_key(data_dir, &id))
+        .await
+        .map_err(|error| {
+            // reveal_key 只有「未配置」一类业务错误（IO 失败在 read_keys 里按未配置处理），
+            // 映射 400 而不是默认 500：缺 Key 是正常的用户状态，不是核心故障。
+            BackendError::with(error.message(), 400, "provider_not_configured")
+        })?;
+    Ok(json!({ "provider": provider, "apiKey": api_key }))
 }
 
 fn install_signal_handlers() {

@@ -472,6 +472,7 @@ onUnmounted(() => {
         v-if="view === 'providers'"
         :busy="!!busyAction"
         :paid-models="state.paidModels || []"
+        :models="state.models || []"
       />
       <!-- 非「模型与服务」的视图都要有反馈落点：侧栏的代理开关在任何视图都能按下，
            只把横幅留在 workbuddy 里，其他视图点坏了就什么都不显示（模型视图的横幅在 .top 内）。

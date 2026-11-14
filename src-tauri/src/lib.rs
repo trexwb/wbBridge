@@ -472,7 +472,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 /// 面板动作 → 核心路由的映射表。与 src-tauri/core/src/server.rs 的 ACTION_ROUTES 逐项一致
 /// （由本文件的 `shell_action_routes_match_the_core_contract` 断言）；docs/contract.md 的契约表
 /// 是同一份内容的文字版，改动时仍需人工同步。
-const ADMIN_ROUTES: [(&str, &str); 11] = [
+const ADMIN_ROUTES: [(&str, &str); 12] = [
     ("refresh", "/admin/refresh"),
     ("probe", "/admin/probe"),
     ("import", "/admin/import"),
@@ -481,6 +481,7 @@ const ADMIN_ROUTES: [(&str, &str); 11] = [
     ("provider-status", "/admin/provider-status"),
     ("set-provider-key", "/admin/set-provider-key"),
     ("clear-provider-key", "/admin/clear-provider-key"),
+    ("reveal-provider-key", "/admin/reveal-provider-key"),
     ("remove-model", "/admin/remove-model"),
     ("restore-model", "/admin/restore-model"),
     ("set-paid-models", "/admin/set-paid-models"),
@@ -519,14 +520,15 @@ async fn admin_command(
 }
 
 /// 面板动作一律以**类型化命令**暴露（替换旧的 `core_action` 通用代理）：
-/// - 动作名不再是任意字符串：十一个动作各对应一条命令（即 [`ADMIN_ROUTES`] / 核心
-///   `ACTION_ROUTES` 的十一条路由），未知命令在 IPC 层根本不存在，无法再拼任意动作名；
+/// - 动作名不再是任意字符串：十二个动作各对应一条命令（即 [`ADMIN_ROUTES`] / 核心
+///   `ACTION_ROUTES` 的十二条路由），未知命令在 IPC 层根本不存在，无法再拼任意动作名；
 /// - 每个命令的参数都是强类型字段，serde 反序列化即完成校验：字段名或类型错误在 IPC 层
 ///   直接拒绝；payload 由壳侧按该动作的契约组装后再转发，调用方不再能送任意请求体；
 /// - 与既往前端契约保持形状兼容：`refresh / shutdown / provider-status` 无参数，
 ///   `probe` 收可选 `model / providers`，`import` 收可选 `modelsFile`，
 ///   `system-proxy` 必填 `enabled`，`set-provider-key` 必填 `provider + apiKey`，
-///   `clear-provider-key` 必填 `provider`，`remove-model` / `restore-model` 必填 `model`，
+///   `clear-provider-key` / `reveal-provider-key` 必填 `provider`，
+///   `remove-model` / `restore-model` 必填 `model`，
 ///   `set-paid-models` 必填 `models`（字符串数组，整份替换）
 ///   （provider 与 model 的合法性仍由核心裁决，壳层不重复业务校验，保持单一真相）。
 
@@ -607,6 +609,23 @@ async fn core_clear_provider_key(
         app,
         state,
         "/admin/clear-provider-key",
+        Some(serde_json::json!({ "provider": provider })),
+    )
+    .await
+}
+
+/// 取回一个平台已保存的 Key。🔴 唯一会把凭据交给 WebView 的命令：只在用户点「眼睛」时
+/// 由面板显式调用，一次一平台；面板只把它放进当前组件的内存，不写偏好 / 存储。
+#[tauri::command]
+async fn core_reveal_provider_key(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    provider: String,
+) -> Result<Value, String> {
+    admin_command(
+        app,
+        state,
+        "/admin/reveal-provider-key",
         Some(serde_json::json!({ "provider": provider })),
     )
     .await
@@ -1410,6 +1429,7 @@ pub fn run() {
             core_provider_status,
             core_set_provider_key,
             core_clear_provider_key,
+            core_reveal_provider_key,
             core_remove_model,
             core_restore_model,
             core_set_paid_models,

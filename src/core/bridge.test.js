@@ -64,7 +64,7 @@ function deliver(event, payload) {
   }
 }
 
-const { aiChat, clearLog } = await import('./bridge.js')
+const { action, aiChat, clearLog, readLog } = await import('./bridge.js')
 
 // 回归保险：Promise 若不落定，测试在 1.5s 内失败（而不是把整个套件挂死）。
 function withTimeout(promise, label) {
@@ -150,4 +150,23 @@ test('clearLog 命令失败时映射为 { ok:false, error }，不抛出', async 
   const result = await withTimeout(clearLog(), 'clearLog 失败')
   assert.equal(result.ok, false)
   assert.match(result.error, /clear_log/)
+})
+
+test('没有 Tauri IPC（浏览器预览）时返回可读原因，不是 TypeError', async () => {
+  resetIpc()
+  // `npm run vite:dev` 直接在浏览器打开时没有壳注入的 __TAURI_INTERNALS__：
+  // 若照常调 invoke，@tauri-apps/api 会抛「Cannot read properties of undefined
+  // (reading 'invoke')」，面板上只剩这句看不懂的 TypeError。
+  const saved = globalThis.window.__TAURI_INTERNALS__
+  delete globalThis.window.__TAURI_INTERNALS__
+  try {
+    const saved2 = await withTimeout(action('set-provider-key', { provider: 'modelscope', apiKey: 'k' }), '无 IPC action')
+    assert.equal(saved2.ok, false)
+    assert.match(saved2.error, /Tauri IPC/)
+    const log = await withTimeout(readLog(), '无 IPC readLog')
+    assert.equal(log.ok, false)
+    assert.match(log.error, /Tauri IPC/)
+  } finally {
+    globalThis.window.__TAURI_INTERNALS__ = saved
+  }
 })

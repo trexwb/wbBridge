@@ -454,8 +454,10 @@ async fn runtime_downloads_never_leave_the_registry_allow_list() {
 ///
 /// 1. 注册表是**复核过的集合**：往 `providers.rs` 里加一家平台，等于把一个没人审过的上游
 ///    接进「用户的 Key 会随请求头发出去」这条链路，必须同步改这里才允许通过。
-/// 2. `provider-status` 是面板唯一能读到的平台信息：即使数据目录里真的存着 Key，它的输出也
+/// 2. `provider-status` 是面板**自动拉取**的平台信息：即使数据目录里真的存着 Key，它的输出也
 ///    不得含任何 Key 材料、凭据文件名或 `apiKey` 字段。
+/// 3. 唯一允许回传凭据的是显式入口 `reveal-provider-key`（用户点眼睛时一次一平台）：
+///    它只认注册表内、已配置的平台，未配置不得返回空串冒充成功。
 #[test]
 fn provider_registry_is_reviewed_and_status_echoes_no_key_material() {
     let mut ids: Vec<&str> = providers::PROVIDERS.iter().map(|provider| provider.id).collect();
@@ -494,6 +496,20 @@ fn provider_registry_is_reviewed_and_status_echoes_no_key_material() {
     providers::set_key(&dir.to_string_lossy(), "modelscope", SECRET).expect("写入测试 Key");
     let status = providers::status(&dir.to_string_lossy());
     let text = serde_json::to_string(&status).expect("状态可序列化");
+
+    // 唯一允许回传凭据的入口：显式、一平台、已配置才回。
+    assert_eq!(
+        providers::reveal_key(&dir.to_string_lossy(), "modelscope").expect("显式回显已配置平台"),
+        SECRET
+    );
+    assert!(
+        providers::reveal_key(&dir.to_string_lossy(), "zhipuai").is_err(),
+        "未配置的平台不得回显（也不得回空串冒充成功）"
+    );
+    assert!(
+        providers::reveal_key(&dir.to_string_lossy(), "opencode").is_err(),
+        "注册表外的命名空间不得回显"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(

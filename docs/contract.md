@@ -2,7 +2,7 @@
 
 > 本文件是「面板动作 → 核心路由」唯一的人工可读契约。以下三处实现必须保持一致：
 > 1. `src-tauri/src/lib.rs` 的 `ADMIN_ROUTES` 与 `admin_route()`（壳侧动作表；托盘 pick 分支仍经
->    `admin_route("import")`，面板入口已收口为 11 个类型化命令，见下节）
+>    `admin_route("import")`，面板入口已收口为 12 个类型化命令，见下节）
 > 2. `src-tauri/core/src/server.rs` 的 `ACTION_ROUTES` 与 `route_for()`（核心侧路由表）
 > 3. 本文件的表格
 >
@@ -29,6 +29,7 @@
 | `provider-status` | `/admin/provider-status` | POST | 无（不读请求体，同 `refresh`） | 平台注册表 + 每个平台「是否已配置」；**返回体不含任何 Key 材料** |
 | `set-provider-key` | `/admin/set-provider-key` | POST | `{ "provider": string, "apiKey": string }` | 写入/更新一个平台的用户自持 Key（落 `<数据目录>/providers.json`，`0600`）；成功返回新的 `provider-status` 形态 |
 | `clear-provider-key` | `/admin/clear-provider-key` | POST | `{ "provider": string }` | 删除一个平台的 Key（未配置过也返回成功，幂等）；同样返回新状态 |
+| `reveal-provider-key` | `/admin/reveal-provider-key` | POST | `{ "provider": string }` | **显式回传一个已配置平台的 Key**，形态 `{ "provider": string, "apiKey": string }`；这是全契约**唯一**会把凭据写进响应体的入口，只在面板打开某平台弹窗（掩码回填，一次一条）或用户点眼睛时调用，值只留在组件内存（不落 prefs / 日志 / status.json）。未配置或注册表外的平台返回 400 `provider_not_configured` |
 | `remove-model` | `/admin/remove-model` | POST | `{ "model": string }` | 用户手动移除一个模型：持久化到 `settings.json` 的 `removedModels`，此后**不再探测、不再发布**（从 `/v1/models`、插件配置与 `WB · auto` 选择域中排除）。目录条目保留以便恢复；模型不在目录中返回 400 `model_not_found`；重复移除幂等 |
 | `restore-model` | `/admin/restore-model` | POST | `{ "model": string }` | 从移除名单恢复并立即对该模型发起一次单模型探测；恢复不等于可用，探测通过后才重新进入发布集。模型不在当前目录中返回 400 `model_not_found`；未在移除名单中时幂等返回 `restored: false` |
 | `set-paid-models` | `/admin/set-paid-models` | POST | `{ "models": string[] }` | **全量替换**付费白名单：数组元素是 `<注册表平台 id>/<模型 id>`（最多 64 条，平台命名空间必须在 `providers.rs::PROVIDERS` 内）。写入 `settings.json` 的 `paidModels`，放行的付费模型绕过「标价全 0」过滤进入发现 / 探测 / 发布集；空数组 = 清空。核心正在读取或探测时返回 409 `busy`。返回 `{ "paidModels": string[] }`（已排序去重） |
@@ -49,20 +50,23 @@
 > 全量「读取免费模型」会清空并重建目录，但核心会在读取前留住已移除的条目、读取后接回
 > （发现清单里已下架的沿用旧条目），因此回收站不会因为一次读取而清空。
 
-> 🔴 凭据口径（这三条动作是本契约里**唯一**允许把用户凭据带进核心的入口）：
-> `apiKey` 只经请求体进入，只落 `providers.json`；不出现在响应体、`status.json`、日志、面板偏好
-> （`src/core/prefs.js` 的键白名单）与子进程环境（`runtime::ENV_ALLOW`）里。校验失败只回文案与
-> `invalid_provider` / `invalid_provider_key`，**不回显入参**。守卫点：`src-tauri/core/src/providers.rs`
-> 的单测、`server.rs::provider_actions_take_whole_body_and_never_echo_the_key`、
+> 🔴 凭据口径（这四条动作是本契约里**唯一**允许让用户凭据进出核心的入口）：
+> `apiKey` 只经请求体进入，只落 `providers.json`；不出现在 `provider-status` 响应体、`status.json`、日志、
+> 面板偏好（`src/core/prefs.js` 的键白名单）与子进程环境（`runtime::ENV_ALLOW`）里。校验失败只回文案与
+> `invalid_provider` / `invalid_provider_key`，**不回显入参**。唯一例外是 `reveal-provider-key`：它按用户
+> **显式**请求回传**一个**已配置平台的 Key（未配置 / 注册表外 400 `provider_not_configured`），面板只在
+> 弹窗组件内存里展示、关闭即清掉。守卫点：`src-tauri/core/src/providers.rs`
+> 的单测（含 `reveal_returns_only_configured_registered_keys`）、`server.rs::provider_actions_take_whole_body_and_never_echo_the_key`、
 > `tests/red_lines.rs::provider_registry_is_reviewed_and_status_echoes_no_key_material`。
 > 平台 id 只认 `providers.rs::PROVIDERS` 这张随版本发布的常量表，注册表外的一律 400。
-> ⚠ **当前状态**：平台视图（`src/views/ProvidersView.vue`）已接入这三条动作；Key 经
+> ⚠ **当前状态**：平台视图（`src/views/ProvidersView.vue`）已接入这四条动作——每家平台一行，
+> 点「管理配置」进入弹窗（申请指引 + Key 管理 + 付费白名单）；Key 经
 > `OPENCODE_CONFIG_CONTENT` 注入隔离运行时的 `provider` 声明段（`providers.rs` 是唯一读者），
 > 保存后对该平台触发一次定向 `probe` 即可发现其模型，无需重启应用。
 
 面板侧链路：`src/core/bridge.js` 的 `action(name, value)`（前端内核，不是后端）先把动作分发到
-**11 个类型化 Tauri 命令**（`core_refresh`/`core_probe`/`core_import`/`core_system_proxy`/`core_shutdown`/
-`core_provider_status`/`core_set_provider_key`/`core_clear_provider_key`/`core_remove_model`/`core_restore_model`/
+**12 个类型化 Tauri 命令**（`core_refresh`/`core_probe`/`core_import`/`core_system_proxy`/`core_shutdown`/
+`core_provider_status`/`core_set_provider_key`/`core_clear_provider_key`/`core_reveal_provider_key`/`core_remove_model`/`core_restore_model`/
 `core_set_paid_models`，
 取代旧 `core_action(action, payload)`
 通用代理：动作名不再是任意字符串，每条只映射一个 `/admin/*` 路由，参数经 serde 类型校验，路由与载荷语义不变）
@@ -94,7 +98,7 @@
 `ai_chat` 的入参结构（`AiChatRequest`，键名逐字）：`chatId` / `baseUrl` / `apiKey` / `selfHosted` / `model` /
 `messages` / `tools` / `toolChoice`；除 `model` 与 `messages` 外都带 serde `default`，`tools` 缺省空数组即本轮不启用工具。
 
-**面板的第二条边界：Tauri 官方插件命令（自动更新）**，它**不经**上面的 11 个 `core_*` 管理命令 / `/admin/*`，因此不在上面的动作表里：
+**面板的第二条边界：Tauri 官方插件命令（自动更新）**，它**不经**上面的 12 个 `core_*` 管理命令 / `/admin/*`，因此不在上面的动作表里：
 
 | 面板调用（`src/core/bridge.js`） | 底层插件命令 | 说明 |
 |---|---|---|

@@ -327,6 +327,22 @@ pub fn status(data_dir: &str) -> Value {
     })
 }
 
+/// 读取一个平台的已存 Key。**这是唯一会把凭据回传给面板的入口**，只由
+/// `POST /admin/reveal-provider-key` 调用（用户点眼睛时显式触发）。
+///
+/// 刻意不并进 [`status`]：状态在进入平台页时自动拉取，若 Key 随状态下发，
+/// 等于每次打开页面就把全部凭据交给 WebView；这里要求一次只取一个平台、
+/// 且由用户显式点击。返回值不得进日志、`status.json` 或任何持久层。
+pub fn reveal_key(data_dir: &str, id: &str) -> Result<String, String> {
+    let Some(provider) = find(id) else {
+        return Err(format!("未知平台：{id}"));
+    };
+    match read_keys(data_dir).get(provider.id).and_then(Value::as_str) {
+        Some(key) => Ok(key.to_string()),
+        None => Err(format!("{} 尚未配置 Key", provider.label)),
+    }
+}
+
 fn persist(data_dir: &str, keys: &Map<String, Value>) -> Result<(), String> {
     let text = serde_json::to_string(&Value::Object(keys.clone())).map_err(|error| error.to_string())?;
     // `atomic_write` 的临时文件走 `0600` 独占创建再 rename，凭据不会有一瞬间落在可读文件里。
@@ -582,6 +598,26 @@ mod tests {
             let mode = std::fs::metadata(file(&dir)).expect("凭据文件可 stat").permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "凭据文件必须 0600");
         }
+    }
+
+    /// 🔴 回显入口（`reveal_key`）只认注册表内、已配置的平台；未配置报错而不是回空串，
+    /// 面板据此给出「尚未配置」而不是把空值填进输入框。测试名钉住「只回已存的那一条」。
+    #[test]
+    fn reveal_returns_only_configured_registered_keys() {
+        let dir = temp_dir();
+        assert!(reveal_key(&dir, "zhipuai").is_err(), "未配置必须报错");
+        assert!(reveal_key(&dir, "not-registered").is_err(), "注册表外必须拒绝");
+
+        set_key(&dir, "zhipuai", "glm-secret").expect("写入成功");
+        set_key(&dir, "modelscope", "ms-secret").expect("写入成功");
+        assert_eq!(reveal_key(&dir, "zhipuai").expect("已配置可取回"), "glm-secret");
+        assert_eq!(
+            reveal_key(&dir, "modelscope").expect("一次只取一个平台"),
+            "ms-secret"
+        );
+        // 回显不改变状态口径：status 仍然只有「是否已配置」。
+        let text = serde_json::to_string(&status(&dir)).expect("状态可序列化");
+        assert!(!text.contains("glm-secret") && !text.contains("ms-secret"));
     }
 
     #[test]
