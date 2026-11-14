@@ -229,7 +229,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          # macos-14 镜像已于 2026-11-02 被 GitHub 彻底退役（brownout 后直接拒绝作业），
+          # aarch64 构建迁移到 macos-15（同为 arm64 原生 runner）。
+          - os: macos-15
             arch: aarch64-apple-darwin
           - os: macos-15
             arch: x86_64-apple-darwin
