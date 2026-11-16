@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
 
-use wbbridge_core::{backend, platform, probe, providers, runtime, server, sync};
+use wbbridge_core::{backend, dsh, platform, probe, providers, runtime, server, sync};
 
 const KEY: &str = "red-line-test-key";
 
@@ -291,8 +291,8 @@ fn injected_provider_key_only_reaches_the_config_content_channel() {
     let (section, configured) = runtime::providers_section_for(&data_dir);
     assert_eq!(
         configured,
-        vec!["zhipuai".to_string()],
-        "发现闸门的输入只能是平台 id，不含 Key"
+        vec!["zhipuai".to_string(), "kilo".to_string()],
+        "发现闸门的输入只能是平台 id，不含 Key；免密平台恒常在内"
     );
 
     let mut host = HashMap::new();
@@ -340,6 +340,66 @@ fn injected_provider_key_only_reaches_the_config_content_channel() {
 
     // 断言中途 panic 会跳过这一步，但入口处的 remove_dir_all 会在下一次运行回收，
     // 目录里只有本用例自己写入的合成 Key，不含任何真实凭据。
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn dsh_credentials_file_is_the_only_place_the_bridge_key_lands() {
+    // 红线 7 的第三处允许位（2026-11-16 DSH 写入目标）：DSH 的 pi-ai 路由只能经
+    // `apiKeyEnv` 引用解析凭据，而本服务的每条路由都要求 Bearer，所以只能把**本服务
+    // 自己的 api-key**写进 `$DSH_HOME/.credentials.yaml`。写入面仅限该文件、值仅限
+    // 本服务令牌、返回给状态机的报告里不得出现它、目录里其它文件不得出现它。
+    const SECRET: &str = "sk-redline-bridge-token-0123456789abcdef";
+    let dir = std::env::temp_dir().join(format!(
+        "wbbridge-redline-dsh-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let patch = dir.join("profiles/desktop/cordis.patch.yml");
+    std::fs::create_dir_all(patch.parent().expect("有父目录")).expect("临时 profile");
+    std::fs::write(&patch, "# mine\n").expect("写 patch");
+
+    let mut env: HashMap<String, String> = HashMap::new();
+    env.insert("DSH_HOME".to_string(), dir.to_string_lossy().to_string());
+    let models = vec![json!({ "id": "opencode/free", "name": "Free" })];
+    let report = dsh::sync_all(&env, "/nonexistent-home", "http://127.0.0.1:41980/v1", SECRET, &models);
+
+    assert_eq!(report["status"], json!("ok"), "{report}");
+    assert!(
+        !report.to_string().contains(SECRET),
+        "同步报告会进 status.json，绝不能带令牌：{report}"
+    );
+
+    let patch_text = std::fs::read_to_string(&patch).expect("patch 可读");
+    assert!(patch_text.contains("apiKeyEnv: WB_BRIDGE_API_KEY"));
+    assert!(!patch_text.contains(SECRET), "patch 里只放引用，不放令牌");
+
+    let credentials = dir.join(dsh::CREDENTIALS_FILENAME);
+    let credentials_text = std::fs::read_to_string(&credentials).expect("凭据文件必须写入");
+    assert!(credentials_text.contains(SECRET));
+    assert!(credentials_text.contains("version: 1"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&credentials).expect("有元数据").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "凭据文件必须是 0600");
+    }
+
+    // DSH_HOME 里除凭据文件外的任何文件都不得出现令牌。
+    let mut stack = vec![dir.clone()];
+    while let Some(current) = stack.pop() {
+        for entry in std::fs::read_dir(&current).expect("目录可读").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path != credentials {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    assert!(!text.contains(SECRET), "令牌泄漏到 {}", path.display());
+                }
+            }
+        }
+    }
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -467,8 +527,10 @@ fn provider_registry_is_reviewed_and_status_echoes_no_key_material() {
         vec![
             "agnes",
             "huggingface",
+            "kilo",
             "modelscope",
             "nvidia",
+            "opencode",
             "openrouter",
             "sensenova",
             "siliconflow-cn",
@@ -478,6 +540,18 @@ fn provider_registry_is_reviewed_and_status_echoes_no_key_material() {
         "接入的平台集合是复核过的，改动 providers.rs 必须同步这条断言"
     );
     for provider in providers::PROVIDERS {
+        if !provider.injected() {
+            // 内建命名空间只上「平台」页：不注入、也不得带任何端点或 SDK 声明，
+            // 否则一旦被误接进注入链就有把流量 / 凭据导向错误上游的风险。
+            assert_eq!(provider.id, "opencode", "只有内建命名空间可以不注入");
+            assert!(provider.keyless, "不注入的条目只可能是免密平台");
+            assert!(
+                provider.base_url.is_empty() && provider.npm.is_empty(),
+                "{} 不得带端点或 SDK 声明",
+                provider.id
+            );
+            continue;
+        }
         assert!(
             provider.base_url.starts_with("https://"),
             "{} 的 baseURL 必须是 HTTPS：平台 Key 会作为 Bearer 头发出去",
@@ -508,7 +582,7 @@ fn provider_registry_is_reviewed_and_status_echoes_no_key_material() {
     );
     assert!(
         providers::reveal_key(&dir.to_string_lossy(), "opencode").is_err(),
-        "注册表外的命名空间不得回显"
+        "免密的内建命名空间没有可回显的 Key"
     );
     let _ = std::fs::remove_dir_all(&dir);
 
@@ -521,9 +595,21 @@ fn provider_registry_is_reviewed_and_status_echoes_no_key_material() {
     assert_eq!(
         listed
             .iter()
-            .filter(|item| item["configured"] == json!(true))
+            .filter(|item| item["configured"] == json!(true) && item["keyless"] != json!(true))
             .count(),
         1,
-        "只应有一个平台显示为已配置"
+        "只有 modelscope 是靠 Key 配置的；免密平台不得冒充「已配置」"
     );
+    let kilo = listed
+        .iter()
+        .find(|item| item["id"] == json!("kilo"))
+        .expect("注册表含 kilo");
+    assert_eq!(kilo["keyless"], json!(true), "kilo 必须标记为免密直连");
+    assert_eq!(kilo["configured"], json!(true), "免密平台恒常可用");
+    let opencode = listed
+        .iter()
+        .find(|item| item["id"] == json!("opencode"))
+        .expect("注册表含 opencode");
+    assert_eq!(opencode["keyless"], json!(true), "opencode 必须标记为免密直连");
+    assert_eq!(opencode["configured"], json!(true), "内建命名空间恒常可用");
 }

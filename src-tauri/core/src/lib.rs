@@ -37,6 +37,7 @@
 //! |---|---|---|
 //! | [`providers`] | — | 多平台接入的注册表（id/标签/npm/baseURL）与 `providers.json` 凭据通道 |
 //! | [`auto`] | — | WB · auto 合成模型名的纯函数路由（按请求内容在可用池里选实际模型 id） |
+//! | [`dsh`] | — | DSH（DeepSeek Harness）写入目标：profile 用户 patch 的 `id: llm-pi-ai` 行 + `.credentials.yaml` 凭据引用 |
 //!
 //! 正确性由两层测试保证：
 //! 1. 各模块内的 Rust 单测（`#[cfg(test)]`）锁定行为；
@@ -45,6 +46,7 @@
 pub mod atomic;
 pub mod auto;
 pub mod backend;
+pub mod dsh;
 pub mod handoff;
 pub mod json;
 pub mod model_status;

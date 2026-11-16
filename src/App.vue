@@ -159,10 +159,12 @@ async function run(name, value) {
       } else if (r.changed === false) {
         showTimedFeedback(`配置已是最新，共 ${r.count} 个模型，无需重复写入。`)
       } else {
-        // 逐目标如实汇报：count 是各成功目标之和，只有在拿到 targets 时才知道写进了几家。
+        // 逐目标如实汇报：count 是插件目标条数之和（DSH 的同一批模型不重复计入），
+        // 只有在拿到 targets 时才知道写进了几家；DSH 随发布自动写入，也算一家。
         const targets = r.targets || {}
-        const okNames = ['workBuddy', 'codeBuddy']
-          .map(key => ({ key, label: key === 'workBuddy' ? 'WorkBuddy' : 'CodeBuddy' }))
+        const labels = { workBuddy: 'WorkBuddy', codeBuddy: 'CodeBuddy', dsh: 'DSH' }
+        const okNames = ['workBuddy', 'codeBuddy', 'dsh']
+          .map(key => ({ key, label: labels[key] }))
           .filter(item => targets[item.key]?.status === 'ok' && targets[item.key].changed)
           .map(item => item.label)
         const scope = okNames.length ? `导入 ${okNames.join(' 与 ')}` : '导入已完成'

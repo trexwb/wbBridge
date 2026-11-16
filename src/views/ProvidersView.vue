@@ -1,7 +1,9 @@
 <script setup>
 // 平台视图：多平台免费模型的 Key 与付费白名单管理入口。
 // 列表保持精简：一行一家平台（名称 / 注册表 id / 状态徽章 / 管理入口）；申请引导、
-// Key 表单与付费白名单全部收进同一张弹窗，九家平台不再各占一大块。
+// Key 表单与付费白名单全部收进同一张弹窗，十家平台不再各占一大块。
+// Kilo 与 OpenCode 是免密平台（`keyless`）：不显示 Key 表单，弹窗只给使用说明与隐私提示。
+// 两者实现不同：Kilo 由核心恒常注入隔离运行时；OpenCode 是运行时内建命名空间，只登记不注入。
 // 凭据纪律：Key 只经 set-provider-key 的请求体进入核心；回显只有**显式**一途——打开
 // 已配置平台的弹窗时，经 reveal-provider-key 取回**当前这一家**的已存 Key 并回填输入框
 // （默认掩码，点眼睛切明文），值只留在组件内存（drafts，不写偏好 / localStorage /
@@ -33,6 +35,26 @@ const PLATFORMS = [
   { id: 'nvidia', label: 'NVIDIA NIM' },
   { id: 'openrouter', label: 'OpenRouter' },
   { id: 'huggingface', label: 'Hugging Face' },
+  // 免密直连：不读 providers.json、不接受 Key；徽章与弹窗据此换成说明文案。
+  // Kilo 由核心作为额外 provider 恒常注入；OpenCode 是隔离运行时自带的命名空间，只登记不注入。
+  {
+    id: 'kilo',
+    label: 'Kilo',
+    keyless: true,
+    keylessNote: {
+      effect: '该平台无需账号或 Key：核心把它作为额外 provider 注入隔离的 OpenCode 运行时，每次启动都会自动发现并探测它标价为零的免费模型（客户端 ID 以 KL 开头）。这里不需要任何操作。',
+      privacy: '隐私提示：上游公示其免费池的提示词可能被记录用于服务改进，请勿在对话里发送敏感或机密内容；额度、速率限制与可用模型以上游公示为准，本应用不做缓存或承诺。',
+    },
+  },
+  {
+    id: 'opencode',
+    label: 'OpenCode',
+    keyless: true,
+    keylessNote: {
+      effect: '这是 OpenCode 运行时自带的命名空间（客户端 ID 以 OC 开头）：模型来自运行时内置的目录，无需任何账号 Key；本应用不额外注入它的配置，每次启动照常发现并探测其中标价为零的免费模型。这里不需要任何操作。',
+      privacy: '提示：免费模型的额度、速率与数据处理政策以 OpenCode 官方公示为准（部分免费池可能记录提示词用于服务改进），请勿发送敏感或机密内容。',
+    },
+  },
 ]
 
 // 每家平台的申请引导：官方入口（已核实）+ 步骤指引。链接经壳的 open_external 用系统浏览器
@@ -164,7 +186,8 @@ function openDialog(provider, event) {
   // 草稿里已有用户输入（关弹窗时不会清掉）则保留草稿，不拿核心里的旧值覆盖。
   // 不按 `configured` 徽章决定是否取回：徽章来自某一次 provider-status 快照，
   // 核心未就绪或刷新失败时会是 false，而 providers.json 里其实已经有 Key。
-  if (!(drafts.value[provider.id].key || '').trim()) {
+  // 免密平台没有 Key 可回显，跳过取回（核心对该平台的 reveal 会直接拒绝）。
+  if (!provider.keyless && !(drafts.value[provider.id].key || '').trim()) {
     revealSavedKey(provider, { auto: true })
   }
   // 弹窗是可聚焦容器（tabindex=-1）：打开即取焦点，Tab 从内容开始走。
@@ -573,7 +596,7 @@ onUnmounted(() => {
     <header>
       <div>
         <h2>平台</h2>
-        <p class="subtitle">配置自有平台 Key，免费模型随注册表扩展；付费模型需逐条加入白名单。每家平台点「管理配置」进入弹窗，Key 只保存在本机数据目录。</p>
+        <p class="subtitle">配置自有平台 Key，或直接使用免密平台；免费模型随注册表扩展，付费模型需逐条加入白名单。每家平台点「管理配置」查看说明与配置，Key 只保存在本机数据目录。</p>
       </div>
       <button id="reload-providers" :disabled="loading" @click="load()">
         <span v-if="loading" class="spinner" />刷新
@@ -597,7 +620,8 @@ onUnmounted(() => {
           <span class="provider-label">{{ provider.label }}<span class="provider-id">（{{ provider.id }}）</span></span>
           <div class="provider-tags">
             <span v-if="paidFor(provider).length" class="badge paid">{{ paidFor(provider).length }} 个付费已放行</span>
-            <span class="badge" :class="provider.configured ? 'ok' : 'off'">
+            <span v-if="provider.keyless" class="badge ok">免密直连</span>
+            <span v-else class="badge" :class="provider.configured ? 'ok' : 'off'">
               {{ provider.configured ? '已配置' : '未配置' }}
             </span>
             <button type="button" class="manage-btn primary" aria-haspopup="dialog" @click="openDialog(provider, $event)">
@@ -621,7 +645,8 @@ onUnmounted(() => {
         <header class="dialog-head">
           <h3 id="providerDialogTitle">
             {{ openProvider.label }}<span class="provider-id">（{{ openProvider.id }}）</span>
-            <span class="badge" :class="openProvider.configured ? 'ok' : 'off'">
+            <span v-if="openProvider.keyless" class="badge ok">免密直连</span>
+            <span v-else class="badge" :class="openProvider.configured ? 'ok' : 'off'">
               {{ openProvider.configured ? '已配置' : '未配置' }}
             </span>
           </h3>
@@ -633,7 +658,14 @@ onUnmounted(() => {
         </header>
 
         <div class="dialog-body">
-          <div class="guide">
+          <!-- 免密平台没有 Key / 申请引导 / 付费白名单：只交代它如何生效以及隐私边界 -->
+          <section v-if="openProvider.keyless" class="section">
+            <h4 class="section-title">免密直连</h4>
+            <p class="key-hint">{{ openProvider.keylessNote.effect }}</p>
+            <p class="key-hint warn">{{ openProvider.keylessNote.privacy }}</p>
+          </section>
+
+          <div v-if="!openProvider.keyless" class="guide">
             <p class="guide-title">申请 Key</p>
             <ol class="guide-steps">
               <li v-for="(step, i) in PLATFORM_GUIDES[openProvider.id]?.steps || []" :key="i">{{ step }}</li>
@@ -649,7 +681,7 @@ onUnmounted(() => {
             <p v-if="openError" class="feedback error" role="alert">打开浏览器失败（{{ openError }}）。单击上方网址可全选复制，再到浏览器打开。</p>
           </div>
 
-          <section class="section">
+          <section v-if="!openProvider.keyless" class="section">
             <h4 class="section-title">平台 Key</h4>
             <form class="key-form" @submit.prevent="save(openProvider)">
               <div class="key-input-wrap">
@@ -720,7 +752,7 @@ onUnmounted(() => {
           </section>
 
           <!-- 付费白名单：免费发现按标价全 0 过滤，付费模型只能由用户逐条显式放行。 -->
-          <section class="section paid">
+          <section v-if="!openProvider.keyless" class="section paid">
             <div class="paid-head">
               <h4 class="section-title">付费模型白名单</h4>
               <span v-if="paidFor(openProvider).length" class="badge paid">{{ paidFor(openProvider).length }} 个已放行</span>
@@ -792,7 +824,7 @@ onUnmounted(() => {
       {{ applyFeedback.text }}
     </p>
 
-    <p class="note">额度与可用性由各平台决定，本应用不缓存额度；探测与对话都会消耗平台侧额度（免费模型的额度为 0 标价，仍受平台限额约束）。模型发现只覆盖注册表内的平台；上游新增免费模型需随本应用更新出现。</p>
+    <p class="note">额度与可用性由各平台决定，本应用不缓存额度；探测与对话都会消耗平台侧额度（免费模型的额度为 0 标价，仍受平台限额约束）。Kilo 与 OpenCode 是免密直连平台：其免费池可能被上游记录提示词，请勿发送敏感内容。模型发现只覆盖注册表内的平台；上游新增免费模型需随本应用更新出现。</p>
   </section>
 </template>
 
@@ -893,6 +925,7 @@ header { display: flex; justify-content: space-between; gap: var(--sp-3); align-
   user-select: all; cursor: text;
 }
 .key-hint { margin: 0; font-size: 11px; line-height: 1.7; color: var(--muted-strong); }
+.key-hint.warn { margin-top: 8px; color: var(--badge-unavailable-fg); }
 .paid {
   border: 1px solid color-mix(in srgb, var(--danger) 30%, var(--line));
   border-radius: var(--radius-s);

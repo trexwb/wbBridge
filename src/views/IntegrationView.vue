@@ -1,6 +1,7 @@
 <script setup>
-// 集成视图：只读展示核心与各写入目标（WorkBuddy / CodeBuddy）的连接状况。
-// 唯一动作是复用既有的「导入」（action('import')，同时写入所有已检测到的插件），面板不直接改 models.json。
+// 集成视图：只读展示核心与各写入目标（WorkBuddy / CodeBuddy / DSH）的连接状况。
+// 唯一动作是复用既有的「导入」（action('import')，同时写入所有已检测到的插件）；DSH 没有
+// 导入入口，检测到 profile 就随每次发布自动写入。面板不直接改任何目标配置文件。
 import { computed } from 'vue'
 
 const props = defineProps({
@@ -14,8 +15,9 @@ defineEmits(['import'])
 
 const sync = computed(() => props.state.sync || null)
 const targets = computed(() => sync.value?.targets || null)
-const codeBuddy = computed(() => targets.value?.codeBuddy || null)
 const available = computed(() => props.state.availableModels || [])
+// DSH 可能装有多个 profile，状态里是 patch 路径数组；逐个展示，未检测到时给原因。
+const dshPatches = computed(() => props.state.dshPatchFiles || [])
 const canImport = computed(
   () => !props.busy && !props.state.probe?.running && props.state.phase === 'ready',
 )
@@ -25,6 +27,7 @@ const targetRows = computed(() => {
   return [
     { key: 'workBuddy', label: 'WorkBuddy', file: props.state.modelsFile },
     { key: 'codeBuddy', label: 'CodeBuddy', file: props.state.codeBuddyModelsFile },
+    { key: 'dsh', label: 'DSH', file: dshPatches.value[0] },
   ]
 })
 </script>
@@ -34,7 +37,7 @@ const targetRows = computed(() => {
     <header>
       <div>
         <h2>插件集成</h2>
-        <p class="subtitle">本服务如何接入 WorkBuddy 与 CodeBuddy，以及当前发布结果。</p>
+        <p class="subtitle">本服务如何接入 WorkBuddy、CodeBuddy 与 DSH，以及当前发布结果。</p>
       </div>
       <!-- 灰按钮旁边补一条 title：可视的原因在下方「核心阶段」一栏，这里只做就近提示 -->
       <button
@@ -42,7 +45,7 @@ const targetRows = computed(() => {
         class="primary"
         :disabled="!canImport"
         :aria-busy="String(importing)"
-        :title="canImport ? '把本服务的可用模型写入所有已检测到的插件配置（WorkBuddy / CodeBuddy）' : '核心未就绪或正在检测，暂时无法导入'"
+        :title="canImport ? '把本服务的可用模型写入所有已检测到的插件配置（WorkBuddy / CodeBuddy；DSH 随发布自动写入）' : '核心未就绪或正在检测，暂时无法导入'"
         @click="$emit('import')"
       >
         <span v-if="importing" class="spinner" />导入 WorkBuddy / CodeBuddy
@@ -67,6 +70,13 @@ const targetRows = computed(() => {
         <dd class="mono">{{ state.codeBuddyModelsFile || '未检测到（写入时自动跳过；可用 BUDDY_CODEBUDDY_MODELS_FILE 指定）' }}</dd>
       </div>
       <div>
+        <dt>DSH 配置</dt>
+        <dd class="mono">
+          <template v-if="dshPatches.length">{{ dshPatches.join('、') }}</template>
+          <template v-else>未检测到 profile（写入时自动跳过；可用 DSH_HOME 指定）</template>
+        </dd>
+      </div>
+      <div>
         <dt>最近一次发布</dt>
         <dd>
           <template v-if="sync?.error"><span class="error-text">{{ sync.error }}</span></template>
@@ -81,7 +91,7 @@ const targetRows = computed(() => {
         <dd>
           <template v-if="!targets || !targets[row.key]">未上报</template>
           <template v-else-if="targets[row.key].status === 'ok'">
-            已写入 {{ targets[row.key].count ?? 0 }} 个<template v-if="!targets[row.key].changed">（无变化）</template>
+            已写入 {{ targets[row.key].count ?? 0 }} 个<template v-if="row.key === 'dsh' && targets[row.key].profiles">（{{ targets[row.key].profiles }} 个 profile）</template><template v-if="!targets[row.key].changed">（无变化）</template>
           </template>
           <template v-else-if="targets[row.key].status === 'missing'">
             <span class="muted-text">未检测到{{ row.file ? '（路径已定位但未通过校验）' : '' }}：{{ targets[row.key].reason }}</span>
@@ -104,6 +114,8 @@ const targetRows = computed(() => {
     <p class="note">
       写入范围：同时向所有已检测到的插件写入，只维护本应用（buddy-bridge-v1）名下的条目，手动添加的模型原样保留；
       未检测到的插件自动跳过并在上方说明原因。检测为不可用的模型只在本窗口展示，不会写入配置。再次检测后需要重新点「导入」才会更新。
+      DSH 没有导入入口：检测到 profile 就随每次发布自动写入其「模型」插件（@deepseek-ai/dsh-llm-pi-ai）的 wbbridge
+      路由，只覆盖本服务自己的 provider，其它 provider 与注释原样保留；本服务令牌以凭据引用写入 ~/.dsh/.credentials.yaml。
     </p>
   </section>
 </template>

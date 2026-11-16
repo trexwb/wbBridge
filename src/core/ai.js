@@ -115,7 +115,7 @@ const TOOL_DEFS = [
     name: 'provider_status',
     write: false,
     label: '读取平台配置',
-    description: '读取各免费模型平台的 Key 配置状态（只回「是否已配置」，不回任何 Key 内容）。只读，立即执行。',
+    description: '读取各免费模型平台的配置状态（是否已配置 / 是否免密直连，不回任何 Key 内容）。只读，立即执行。',
     parameters: { type: 'object', properties: {} },
   },
   {
@@ -123,7 +123,7 @@ const TOOL_DEFS = [
     write: false,
     label: '读取运行环境',
     description:
-      '读取本机运行环境：数据目录、应用与核心版本、WorkBuddy / CodeBuddy 配置文件定位结果、最近一次发布状态。只读，立即执行；不回显任何凭据。',
+      '读取本机运行环境：数据目录、应用与核心版本、WorkBuddy / CodeBuddy 配置文件与 DSH profile 的定位结果、最近一次发布状态。只读，立即执行；不回显任何凭据。',
     parameters: { type: 'object', properties: {} },
   },
   {
@@ -157,7 +157,7 @@ const TOOL_DEFS = [
     name: 'import_models',
     write: true,
     label: '导入模型到插件',
-    description: '把探测通过的模型写入 WorkBuddy / CodeBuddy 配置。写入类提案，需用户确认后执行。',
+    description: '把探测通过的模型写入 WorkBuddy / CodeBuddy 配置，并同步已检测到的 DSH profile。写入类提案，需用户确认后执行。',
     parameters: { type: 'object', properties: {} },
   },
   {
@@ -340,8 +340,8 @@ export function buildSnapshot(state) {
 // ── system prompt ───────────────────────────────────────────────────
 export function buildSystemPrompt(snapshot = '') {
   return [
-    '你是 WB Bridge 控制面板的 AI 助手。WB Bridge 通过隔离的 OpenCode 运行时为 WorkBuddy / CodeBuddy',
-    '提供免费模型：自动发现免费模型 → 逐模型探测 → 只把可用的导入插件配置。你既可以回答使用问题，',
+    '你是 WB Bridge 控制面板的 AI 助手。WB Bridge 通过隔离的 OpenCode 运行时为 WorkBuddy / CodeBuddy /',
+    'DSH 提供免费模型：自动发现免费模型 → 逐模型探测 → 只把可用的导入插件配置。你既可以回答使用问题，',
     '也可以通过工具帮用户管理它。',
     '',
     '【工具纪律】',
@@ -356,6 +356,8 @@ export function buildSystemPrompt(snapshot = '') {
     '   直接把原因告诉用户。apply_update 会立刻退出并重启本应用，必须提醒用户先保存手头工作。',
     '4. 模型 id 必须来自下方快照或 list_models 的返回，禁止编造；平台 id 只能是',
     `   ${PROVIDER_IDS.join(' / ')} 之一。`,
+    '   kilo / opencode 是免密直连平台（无需也没有 Key，客户端 ID 前缀 KL / OC）：不要对它们调用',
+    '   set_provider_key / clear_provider_key / open_provider_page；其免费池提示词可能被上游记录，提醒用户勿发送敏感内容。',
     '5. set_provider_key 的 apiKey 只能使用用户在本轮对话里提供的值；不要编造、不要在回复中复述完整 Key。',
     '   用户还没 Key 时可以起草 open_provider_page 打开官方申请页，但不要声称已保存任何 Key。',
     '6. 数字（模型数、可用数、请求数）一律以快照与工具返回为准，不要自行重算或编造。',
@@ -468,7 +470,7 @@ export function summarizeToolCall(name, args = {}) {
     case 'probe_models':
       return source.model ? `检测模型 ${source.model}` : '检测全部模型（消耗少量免费额度）'
     case 'import_models':
-      return '导入可用模型到 WorkBuddy / CodeBuddy'
+      return '导入可用模型到 WorkBuddy / CodeBuddy / DSH'
     case 'set_provider_key':
       return `保存 ${PROVIDER_LABELS[source.provider] || source.provider} 的 Key（${maskKey(source.apiKey)}）`
     case 'clear_provider_key':
@@ -585,7 +587,7 @@ export async function runTool(name, args = {}, ctx = {}) {
       const providers = Array.isArray(response.result?.providers) ? response.result.providers : []
       return {
         ok: true,
-        result: providers.map(p => ({ id: p.id, label: p.label, configured: p.configured === true })),
+        result: providers.map(p => ({ id: p.id, label: p.label, configured: p.configured === true, keyless: p.keyless === true })),
       }
     }
     case 'get_environment': {
@@ -603,6 +605,7 @@ export async function runTool(name, args = {}, ctx = {}) {
           endpoint: state.endpoint ?? null,
           workBuddyModelsFile: state.modelsFile ?? null,
           codeBuddyModelsFile: state.codeBuddyModelsFile ?? null,
+          dshPatchFiles: state.dshPatchFiles ?? [],
           sync: state.sync ?? null,
           dirError: response.ok ? null : String(response.error),
         },

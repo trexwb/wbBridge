@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>WB Bridge · 模型名称前缀对照</title>
-<meta name="description" content="WB Bridge 发布给 WorkBuddy / CodeBuddy 的模型 ID 前缀约定：OC（OpenCode）、MS（ModelScope）、SF（SiliconFlow）、TT（腾讯混元 TokenHub）、ZP（智谱）、AG（爱思 Agnes）、SN（商汤 SenseNova）、NV（NVIDIA NIM）、OR（OpenRouter）、HF（Hugging Face），以及合成路由 WB · auto。">
+<meta name="description" content="WB Bridge 发布给 WorkBuddy / CodeBuddy 的模型 ID 前缀约定：OC（OpenCode）、MS（ModelScope）、SF（SiliconFlow）、TT（腾讯混元 TokenHub）、ZP（智谱）、AG（爱思 Agnes）、SN（商汤 SenseNova）、NV（NVIDIA NIM）、OR（OpenRouter）、HF（Hugging Face）、KL（Kilo 免密直连），以及合成路由 WB · auto。">
 <style>
   :root {
     color-scheme: light dark;
@@ -39,6 +39,7 @@
     --nv-fg: #4a7a00; --nv-bg: #eef6db;
     --or-fg: #4b5b8c; --or-bg: #e9edf9;
     --hf-fg: #8a6d00; --hf-bg: #fbf3d6;
+    --kl-fg: #0f6f6a; --kl-bg: #dff3f1;
   }
 
   @media (prefers-color-scheme: dark) {
@@ -65,6 +66,7 @@
       --nv-fg: #b8d97a; --nv-bg: #33401f;
       --or-fg: #aebbe8; --or-bg: #2c3350;
       --hf-fg: #e8cf74; --hf-bg: #433a1d;
+      --kl-fg: #8fd9d3; --kl-bg: #123b39;
     }
   }
 
@@ -206,6 +208,7 @@
   .badge.nv { color: var(--nv-fg); background: var(--nv-bg); }
   .badge.or { color: var(--or-fg); background: var(--or-bg); }
   .badge.hf { color: var(--hf-fg); background: var(--hf-bg); }
+  .badge.kl { color: var(--kl-fg); background: var(--kl-bg); }
   .badge.wb { color: var(--oc-fg); background: var(--oc-bg); }
 
   /* ── 复制按钮 ─────────────────────────────────────── */
@@ -579,19 +582,29 @@
             </td>
             <td class="cell-note">Hugging Face Inference Providers 的 OpenAI 兼容路由（router.huggingface.co/v1）；免费额度以平台公示为准。</td>
           </tr>
+          <tr>
+            <td class="cell-prefix"><span class="badge kl">KL</span></td>
+            <td><span class="p-name">Kilo</span></td>
+            <td><code>kilo</code>、Kilo（免密直连）</td>
+            <td class="cell-id">
+              <span class="id">KL · Nemotron 3.5 Lightning</span><br>
+              <button type="button" class="copy" data-copy="KL · Nemotron 3.5 Lightning" aria-label="复制 KL · Nemotron 3.5 Lightning">复制</button>
+            </td>
+            <td class="cell-note">Kilo 公开推理网关（api.kilo.ai/api/gateway）；无需账号或 Key，只发布其免费池中标价为零的模型；上游公示提示词可能被记录，请勿发送敏感内容。</td>
+          </tr>
         </tbody>
       </table>
     </div>
 
-    <p class="footnote">平台稳定 id（<code>providers.json</code> 的键名、面板动作的 <code>provider</code> 参数）依次为 <code>modelscope</code>、<code>siliconflow-cn</code>、<code>tencent-tokenhub</code>、<code>zhipuai</code>、<code>agnes</code>、<code>sensenova</code>、<code>nvidia</code>、<code>openrouter</code>、<code>huggingface</code>，一经发布不得改名——改了等于让用户已填的 Key 失效。</p>
-    <p class="footnote">现状说明：现行版本的客户端 ID 中，OpenCode 模型使用 <code>OC</code> 前缀；注册表平台模型在现行版本里以各自的短前缀（<code>MS</code> / <code>SF</code> / <code>TT</code> / <code>ZP</code> / <code>AG</code> / <code>SN</code> / <code>NV</code> / <code>OR</code> / <code>HF</code>）作为展示前缀，与本文所记口径一致。若与面板实际显示不一致，以面板为准。</p>
+    <p class="footnote">平台稳定 id（<code>providers.json</code> 的键名、面板动作的 <code>provider</code> 参数）依次为 <code>modelscope</code>、<code>siliconflow-cn</code>、<code>tencent-tokenhub</code>、<code>zhipuai</code>、<code>agnes</code>、<code>sensenova</code>、<code>nvidia</code>、<code>openrouter</code>、<code>huggingface</code>、<code>kilo</code>，一经发布不得改名——改了等于让用户已填的 Key 失效。<code>kilo</code> 与 <code>opencode</code> 是免密平台：不读也不接受 <code>providers.json</code> 里的 Key（<code>opencode</code> 是 OpenCode 运行时自带命名空间，只登记不注入）。</p>
+    <p class="footnote">现状说明：现行版本的客户端 ID 中，OpenCode 模型使用 <code>OC</code> 前缀；注册表平台模型在现行版本里以各自的短前缀（<code>MS</code> / <code>SF</code> / <code>TT</code> / <code>ZP</code> / <code>AG</code> / <code>SN</code> / <code>NV</code> / <code>OR</code> / <code>HF</code> / <code>KL</code>）作为展示前缀，与本文所记口径一致。若与面板实际显示不一致，以面板为准。</p>
   </section>
 
   <section id="rules" aria-labelledby="h-rules">
     <h2 id="h-rules">命名规则</h2>
     <p class="section-lede">四条规则，适用于表中全部前缀。</p>
     <ol class="rules">
-      <li><b>前缀固定大写、一平台一枚。</b><code>OC</code> / <code>MS</code> / <code>SF</code> / <code>TT</code> / <code>ZP</code> / <code>AG</code> / <code>SN</code> / <code>NV</code> / <code>OR</code> / <code>HF</code> 与平台一一对应，同一模型列表内不与其他来源复用。</li>
+      <li><b>前缀固定大写、一平台一枚。</b><code>OC</code> / <code>MS</code> / <code>SF</code> / <code>TT</code> / <code>ZP</code> / <code>AG</code> / <code>SN</code> / <code>NV</code> / <code>OR</code> / <code>HF</code> / <code>KL</code> 与平台一一对应，同一模型列表内不与其他来源复用。</li>
       <li><b>分隔符逐字节为「空格 + 间隔号 + 空格」。</b>即 <code>·</code>（U+00B7）两侧各一个半角空格，形如 <code>OC · DeepSeek-V3.1</code>。手填或引用模型 ID 时必须完整保留；写错分隔符（如 <code>WB.auto</code>、缺空格）一律不被识别。</li>
       <li><b>间隔号之后保留上游模型的展示名。</b>核心内部另用「命名空间/模型」的全限定 id 做路由，对外一律只见「前缀 · 名称」形态，两套形态不会同时出现在同一个 ID 里。</li>
       <li><b>合成路由不是平台前缀。</b><code>WB</code> 只出现在 <code>WB · auto</code> 这一条合成入口上，见下节。</li>

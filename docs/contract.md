@@ -26,10 +26,10 @@
 | `import` | `/admin/import` | POST | `{ "modelsFile"?: string }` | 导入 / 切换 WorkBuddy 配置路径 |
 | `system-proxy` | `/admin/system-proxy` | POST | `{ "enabled": boolean }` | 切换系统代理并重读模型 |
 | `shutdown` | `/admin/shutdown` | POST | 无 | 先响应、再触发一次优雅退出 |
-| `provider-status` | `/admin/provider-status` | POST | 无（不读请求体，同 `refresh`） | 平台注册表 + 每个平台「是否已配置」；**返回体不含任何 Key 材料** |
-| `set-provider-key` | `/admin/set-provider-key` | POST | `{ "provider": string, "apiKey": string }` | 写入/更新一个平台的用户自持 Key（落 `<数据目录>/providers.json`，`0600`）；成功返回新的 `provider-status` 形态 |
-| `clear-provider-key` | `/admin/clear-provider-key` | POST | `{ "provider": string }` | 删除一个平台的 Key（未配置过也返回成功，幂等）；同样返回新状态 |
-| `reveal-provider-key` | `/admin/reveal-provider-key` | POST | `{ "provider": string }` | **显式回传一个已配置平台的 Key**，形态 `{ "provider": string, "apiKey": string }`；这是全契约**唯一**会把凭据写进响应体的入口，只在面板打开某平台弹窗（掩码回填，一次一条）或用户点眼睛时调用，值只留在组件内存（不落 prefs / 日志 / status.json）。未配置或注册表外的平台返回 400 `provider_not_configured` |
+| `provider-status` | `/admin/provider-status` | POST | 无（不读请求体，同 `refresh`） | 平台注册表（十一家，含免密平台 kilo 与内建命名空间 opencode）+ 每个平台「是否已配置 / 是否免密直连」：`{ providers: [{ id, label, configured, keyless }] }`（`keyless` 为加法式字段；免密平台恒 `configured: true`）；**返回体不含任何 Key 材料** |
+| `set-provider-key` | `/admin/set-provider-key` | POST | `{ "provider": string, "apiKey": string }` | 写入/更新一个平台的用户自持 Key（落 `<数据目录>/providers.json`，`0600`）；成功返回新的 `provider-status` 形态。**免密平台（kilo / opencode）一律拒绝**（它们不读也不接受 Key） |
+| `clear-provider-key` | `/admin/clear-provider-key` | POST | `{ "provider": string }` | 删除一个平台的 Key（未配置过也返回成功，幂等）；同样返回新状态。免密平台（kilo / opencode）没有可清除的 Key，返回 400 |
+| `reveal-provider-key` | `/admin/reveal-provider-key` | POST | `{ "provider": string }` | **显式回传一个已配置平台的 Key**，形态 `{ "provider": string, "apiKey": string }`；这是全契约**唯一**会把凭据写进响应体的入口，只在面板打开某平台弹窗（掩码回填，一次一条）或用户点眼睛时调用，值只留在组件内存（不落 prefs / 日志 / status.json）。未配置、注册表外或免密平台（kilo / opencode）返回 400 `provider_not_configured` |
 | `remove-model` | `/admin/remove-model` | POST | `{ "model": string }` | 用户手动移除一个模型：持久化到 `settings.json` 的 `removedModels`，此后**不再探测、不再发布**（从 `/v1/models`、插件配置与 `WB · auto` 选择域中排除）。目录条目保留以便恢复；模型不在目录中返回 400 `model_not_found`；重复移除幂等 |
 | `restore-model` | `/admin/restore-model` | POST | `{ "model": string }` | 从移除名单恢复并立即对该模型发起一次单模型探测；恢复不等于可用，探测通过后才重新进入发布集。模型不在当前目录中返回 400 `model_not_found`；未在移除名单中时幂等返回 `restored: false` |
 | `set-paid-models` | `/admin/set-paid-models` | POST | `{ "models": string[] }` | **全量替换**付费白名单：数组元素是 `<注册表平台 id>/<模型 id>`（最多 64 条，平台命名空间必须在 `providers.rs::PROVIDERS` 内）。写入 `settings.json` 的 `paidModels`，放行的付费模型绕过「标价全 0」过滤进入发现 / 探测 / 发布集；空数组 = 清空。核心正在读取或探测时返回 409 `busy`。返回 `{ "paidModels": string[] }`（已排序去重） |
@@ -50,12 +50,12 @@
 > 全量「读取免费模型」会清空并重建目录，但核心会在读取前留住已移除的条目、读取后接回
 > （发现清单里已下架的沿用旧条目），因此回收站不会因为一次读取而清空。
 
-> 🔴 凭据口径（这四条动作是本契约里**唯一**允许让用户凭据进出核心的入口）：
+> 🔴 凭据口径（这四条动作是本契约里**唯一**允许让用户平台凭据进出核心的入口；另有第三处落盘面见下方 DSH）：
 > `apiKey` 只经请求体进入，只落 `providers.json`；不出现在 `provider-status` 响应体、`status.json`、日志、
 > 面板偏好（`src/core/prefs.js` 的键白名单）与子进程环境（`runtime::ENV_ALLOW`）里。校验失败只回文案与
 > `invalid_provider` / `invalid_provider_key`，**不回显入参**。唯一例外是 `reveal-provider-key`：它按用户
-> **显式**请求回传**一个**已配置平台的 Key（未配置 / 注册表外 400 `provider_not_configured`），面板只在
-> 弹窗组件内存里展示、关闭即清掉。守卫点：`src-tauri/core/src/providers.rs`
+> **显式**请求回传**一个**已配置平台的 Key（未配置 / 注册表外 / 免密平台 400 `provider_not_configured`），面板只在
+> 弹窗组件内存里展示、关闭即清掉。免密平台里 Kilo 的配置段只注入 `baseURL`、不带 `apiKey`（带占位凭据会被上游 401）；`opencode` 是运行时内建命名空间，**整条不注入**（`Provider::injected()` 为 false），只上「平台」列表。守卫点：`src-tauri/core/src/providers.rs`
 > 的单测（含 `reveal_returns_only_configured_registered_keys`）、`server.rs::provider_actions_take_whole_body_and_never_echo_the_key`、
 > `tests/red_lines.rs::provider_registry_is_reviewed_and_status_echoes_no_key_material`。
 > 平台 id 只认 `providers.rs::PROVIDERS` 这张随版本发布的常量表，注册表外的一律 400。
@@ -130,9 +130,11 @@
   绝不能终止壳进程。
 - 回环 HTTP 不可用时（典型：启动早期核心还在 `find_runtime` / 下载运行时，服务尚未监听；或拿不到
   `api-key`），壳改为调用进程内的 `orchestration::request_shutdown(&runtime.handle(), 0)`，走**同一条**
-  `shutdown()` 清理链（含 WorkBuddy/CodeBuddy 条目清空），预算 5s；仍不成立才强制关闭运行时。
+  `shutdown()` 清理链（含 WorkBuddy/CodeBuddy 条目与 DSH `wbbridge` 路由的清空），预算 5s；
+  仍不成立才强制关闭运行时。
 - 面板主动终止核心、或核心任务非预期结束后的重启，均走同一个 `shutdown` 动作（核心侧会先完成
-  WorkBuddy 配置清理再收尾），重启由壳命令 `restart_core` 重新装配一次核心实例。
+  三个目标的发布清空再收尾；该清空不受 `BUDDY_NO_SYNC` 影响），重启由壳命令 `restart_core`
+  重新装配一次核心实例。
 
 ## 对外模型接口：`WB · auto` 合成模型名（v1.1.14 落地、v1.1.15 起写入插件配置，2026-10-11 实机取证已端到端跑通）
 
@@ -164,11 +166,14 @@
 |---|---|---|---|---|
 | WorkBuddy | `models.json`（默认 `~/.workbuddy/`） | `BUDDY_MODELS_FILE` > settings `workBuddyModelsFile` > `WORKBUDDY_CONFIG_DIR` > `WORKBUDDY_DATA_FOLDER_NAME` > 平台默认 | `modelsFile` | `workBuddy` |
 | CodeBuddy | `models.json`（默认 `~/.codebuddy/`） | `BUDDY_CODEBUDDY_MODELS_FILE` > settings `codeBuddyModelsFile`（预留，当前恒空）> `CODEBUDDY_CONFIG_DIR` > `CODEBUDDY_DATA_FOLDER_NAME` > 平台默认 | `codeBuddyModelsFile` | `codeBuddy` |
+| DSH（DeepSeek Harness） | `profiles/<名称>/cordis.patch.yml` + `$DSH_HOME/.credentials.yaml`（默认 `~/.dsh/`） | `DSH_HOME`（trim 后非空）> `~/.dsh`；**必须已有** `profiles/<名称>/cordis.patch.yml`（不补建 profile） | `dshPatchFiles`（数组，每轮同步刷新） | `dsh` |
 
-- **「已安装」的判定只有一条：定位函数返回 `Some`**（候选文件必须通过 `validate_models_file` 的路径与形状校验）。不猜进程、不猜注册表；显式位置失效时绝不静默回退（与 WorkBuddy 既有约定一致）。
-- 两个目标共用同一套幂等写入（`sync::sync_models`：OWNER 归属标记、冲突不覆盖、文件锁、二次读取、原子替换），CodeBuddy 不是第二套实现。**不再写 `.bak` 备份**（2026-10-09 用户裁定：备份从来没有读取方、面板也没有恢复入口，却按发布次数在插件配置目录里无限堆积）；每次同步（含内容无变化的那次）会按同名族白名单 `<配置文件名>.buddy-bridge-<纯 ASCII 数字>.bak` 清扫旧版本攒下的存量备份，用户自己命名的 `*.bak` 与任何其它文件一律不碰。
+- **「已安装」的判定只有一条：定位函数返回 `Some`**（候选文件必须通过 `validate_models_file` 的路径与形状校验）。不猜进程、不猜注册表；显式位置失效时绝不静默回退（与 WorkBuddy 既有约定一致）。DSH 同口径：只认 profile 目录里已存在的用户 patch。
+- 两个插件目标共用同一套幂等写入（`sync::sync_models`：OWNER 归属标记、冲突不覆盖、文件锁、二次读取、原子替换），CodeBuddy 不是第二套实现。**不再写 `.bak` 备份**（2026-10-09 用户裁定：备份从来没有读取方、面板也没有恢复入口，却按发布次数在插件配置目录里无限堆积）；每次同步（含内容无变化的那次）会按同名族白名单 `<配置文件名>.buddy-bridge-<纯 ASCII 数字>.bak` 清扫旧版本攒下的存量备份，用户自己命名的 `*.bak` 与任何其它文件一律不碰。
+- **DSH 不是第三套 `models.json`**（`dsh.rs`）：DSH 由 Cordis 分层组合 profile，用户补丁按行 `id` 覆盖、且整份替换该行 `config`。因此本工具只改 `id: llm-pi-ai` 行的 `config.providers.wbbridge`（`displayName` / `api: openai-completions` / `baseURL` = `<endpoint>/v1` / `apiKeyEnv: WB_BRIDGE_API_KEY` / `models` = `WB · auto` + 逐模型客户端 ID），其它行、其它 provider、注释逐字保留；认不出的结构（`config` / `providers` 是行内非空值）直接报错。发布集转空时只删本服务这一条子映射（补建的空壳行整行删除）。路由带 `compat: {thinkingFormat: openai, supportsReasoningEffort: true}` 与逐模型 `reasoningEfforts`：只声明该模型 variant 覆盖的 `minimal/low/medium/high/xhigh/max`（`WB · auto` 取**免费**发布集并集），不推理与固定推理模型写 `false`，`off` 刻意不声明；DSH 选中的档位以 `reasoning_effort` 直达本服务，`WB · auto` 会按该档位过滤候选。凭据引用写 `$DSH_HOME/.credentials.yaml`（`version: 1` 的 `refs` 段，`0600`），值为**本服务自己的 api-key**，`records` 与其它引用原样保留。
 - **v1.1.15 起，发布集非空时两个目标的 `models.json` 都会多一条 `WB · auto`**（形态见上节「插件配置」行）：由 `sync::auto_entry` 生成、走同一套 OWNER 归属与冲突不覆盖规则，排在逐模型条目之后；发布集为空时不写、下一轮空同步也会把它一并删掉。生产发布链是唯一开启该写入的地方（`orchestration::sync_published` 传 `SyncOptions.auto_route = true`），**对拍路径与任何调用方默认都是 `false`**——JS 侧从未有这一条，默认值保证 `tests/fixtures` 逐字节不变。
 - `sync` 形状（加法式变更，`schemaVersion` 不递增）：新增 `sync.targets.{workBuddy,codeBuddy}`，每个目标 `status` ∈ `ok|missing|error`，`ok` 携带 `count/changed`（早期版本还带 `backup`，随「不再写备份」一并移除，面板从未读过它），`missing` 携带 `reason`，`error` 携带 `error`；顶层 `count` = 各成功目标之和；顶层 `error` 仅在「至少一个目标被定位且全部定位目标都失败」时出现（部分失败不算顶层失败）；新增顶层 `codeBuddyModelsFile` 字段。⚠ `count` **不含**那条 `WB · auto`（`owned_count` 显式排除别名），所以「插件里比 `count` 多显示一行」是预期结果，不是记账错乱。
+- **DSH 目标（v1.3.13 新增）**：`sync.targets.dsh` 与插件目标同形（`ok` 带 `count/changed`，另带 `profiles` = 写成功的 profile 数；`missing` 带 `reason`；`error` 带 `error`，部分 profile 失败时在 `ok` 里附 `error`）。顶层 `count` **只数插件目标**，不加 DSH——DSH 写的是同一批模型的另一份投影，相加会让数字随目标数翻倍；若有 DSH 写入，顶层 `changed` 置真。顶层 `error` 仍只由插件目标决定（DSH 的失败在逐目标条目里如实显示）。`status.json` 新增顶层 `dshPatchFiles`（数组，启动与每轮同步刷新），`schemaVersion` 仍为 `1`。
 - 面板侧：集成视图逐目标展示状态（缺 `targets` 时回退单行展示，兼容旧核心）；底部摘要行的措辞已不绑定单一目标。
 
 ## 运行形态与传输落点

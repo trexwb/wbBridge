@@ -59,10 +59,18 @@ pub struct Provider {
     /// ModelScope→MS、SiliconFlow→SF、腾讯混元 TokenHub→TT、智谱→ZP。`client_model_id`
     /// 与面板展示都以它为准，与 `label` 刻意解耦——label 继续当全名用，prefix 才是对外短码。
     pub prefix: &'static str,
-    /// 注入 `provider.<id>.npm` 的 SDK 包名。
+    /// 注入 `provider.<id>.npm` 的 SDK 包名。只对 [`Provider::injected`] 为 true 的条目生效；
+    /// 不注入的内建命名空间留空（端点与 SDK 由运行时自己决定）。
     pub npm: &'static str,
     /// 注入 `provider.<id>.options.baseURL` 的地址（2026-10-03 实测自 models.dev 索引）。
+    /// 与 `npm` 同口径：不注入的条目留空。
     pub base_url: &'static str,
+    /// 免密直连：平台自身公开、无需任何账号 Key 即可推理。注入面分两类：`injected()` 为 true 的
+    /// Kilo 恒常注入（不读 `providers.json`、也不接受写入 Key，`options` 段只带 `baseURL`）；
+    /// `injected()` 为 false 的 OpenCode 是运行时内建命名空间，只登记不注入，模型与端点由运行时
+    /// 自带的目录决定。两类在面板上都显示「免密直连」。免密不等于匿名安全：上游可能把提示词用于
+    /// 服务改进，面板与文档必须如实提示不要发送敏感数据。
+    pub keyless: bool,
     /// 该平台的**权威模型清单**：非空时它替代 models.dev 的 catalog 声明，同时约束两处——
     /// 注入声明段只写这份清单里的模型（`runtime::providers_section_for`），发现阶段也只放行
     /// 这份清单里的 key（`backend::free_models_in`）。
@@ -78,8 +86,21 @@ pub struct Provider {
     pub models: &'static [DeclaredModel],
 }
 
-/// 九家都是 OpenAI 兼容端点，因此 Stage 3 只有一条注入代码路径。
+/// 需要注入的平台都是 OpenAI 兼容端点，因此 Stage 3 只有一条注入代码路径（免密平台只是少一个
+/// `apiKey`）；`opencode` 是内建命名空间，整条不注入（见 [`Provider::injected`]）。
 const OPENAI_COMPATIBLE: &str = "@ai-sdk/openai-compatible";
+
+impl Provider {
+    /// 是否写进 `OPENCODE_CONFIG_CONTENT` 的 `provider` 段。
+    ///
+    /// `opencode` 是隔离运行时**内建**的命名空间：模型、端点与鉴权全部由运行时自带的目录
+    /// （models.dev）与本机登录态决定。往配置里注入同名段会覆盖它——等于把用户已登录的目录
+    /// 换成本工具凭空拼出来的声明。它登记在注册表里只为让「平台」页像 Kilo 一样显出一行
+    /// 「免密直连」，并让 Key 通道对它给出正确文案。
+    pub fn injected(&self) -> bool {
+        self.id != crate::model_status::OPENCODE_NAMESPACE
+    }
+}
 
 /// 注册表：唯一真相。`id` 一旦发布出去（`providers.json` 的键、面板动作的 `provider` 参数）
 /// 就不得改名，改了等于让用户已填的 Key 失效。
@@ -88,13 +109,14 @@ const OPENAI_COMPATIBLE: &str = "@ai-sdk/openai-compatible";
 /// 它们都在 models.dev 目录里，且目录中已有标价为零的文本模型；OpenCode 1.19.5 实测会实时拉取该目录，
 /// 声明段只放锚点即可让目录内的免费模型进入发现队列（本地沙箱实测：自定义 provider 仅带锚点也能在
 /// `/provider` 里出现）。带清单反而要在每次上游增删模型时跟着发版。
-pub const PROVIDERS: [Provider; 9] = [
+pub const PROVIDERS: [Provider; 11] = [
     Provider {
         id: "modelscope",
         label: "ModelScope",
         prefix: "MS",
         npm: OPENAI_COMPATIBLE,
         base_url: "https://api-inference.modelscope.cn/v1",
+        keyless: false,
         // 逐条来自 2026-10-10 对 `GET https://api-inference.modelscope.cn/v1/models`（公开可读、
         // 无需 Key）的实测抓取，并按模型页的分类筛过一遍：只留通用「nlp / 文本生成」，
         // 视觉多模态理解（Qwen3.5/3.8、InternVL、Intern-S、MiniMax-M3、ERNIE-VL、DeepSeek-V4.1-Flash、
@@ -183,6 +205,7 @@ pub const PROVIDERS: [Provider; 9] = [
         prefix: "SF",
         npm: OPENAI_COMPATIBLE,
         base_url: "https://api.siliconflow.cn/v1",
+        keyless: false,
         models: &[],
     },
     Provider {
@@ -191,6 +214,7 @@ pub const PROVIDERS: [Provider; 9] = [
         prefix: "TT",
         npm: OPENAI_COMPATIBLE,
         base_url: "https://tokenhub.tencentmaas.com/v1",
+        keyless: false,
         models: &[],
     },
     Provider {
@@ -200,6 +224,7 @@ pub const PROVIDERS: [Provider; 9] = [
         prefix: "ZP",
         npm: OPENAI_COMPATIBLE,
         base_url: "https://open.bigmodel.cn/api/paas/v4",
+        keyless: false,
         models: &[],
     },
     Provider {
@@ -211,6 +236,7 @@ pub const PROVIDERS: [Provider; 9] = [
         prefix: "AG",
         npm: OPENAI_COMPATIBLE,
         base_url: "https://apihub.agnes-ai.com/v1",
+        keyless: false,
         models: &[],
     },
     Provider {
@@ -220,6 +246,7 @@ pub const PROVIDERS: [Provider; 9] = [
         prefix: "SN",
         npm: OPENAI_COMPATIBLE,
         base_url: "https://token.sensenova.cn/v1",
+        keyless: false,
         models: &[],
     },
     Provider {
@@ -229,6 +256,7 @@ pub const PROVIDERS: [Provider; 9] = [
         prefix: "NV",
         npm: OPENAI_COMPATIBLE,
         base_url: "https://integrate.api.nvidia.com/v1",
+        keyless: false,
         models: &[],
     },
     Provider {
@@ -239,6 +267,7 @@ pub const PROVIDERS: [Provider; 9] = [
         prefix: "OR",
         npm: OPENAI_COMPATIBLE,
         base_url: "https://openrouter.ai/api/v1",
+        keyless: false,
         models: &[],
     },
     Provider {
@@ -249,14 +278,42 @@ pub const PROVIDERS: [Provider; 9] = [
         prefix: "HF",
         npm: OPENAI_COMPATIBLE,
         base_url: "https://router.huggingface.co/v1",
+        keyless: false,
+        models: &[],
+    },
+    Provider {
+        // Kilo（Kilo Code 的公开推理网关）：免费池无需账号 / Key，按 `:free` 与标价零筛选。
+        // 2026-11-16 沙箱实测（OpenCode 1.19.5）：只注入 `{ npm, options: { baseURL }, models: {锚点} }`
+        // 即可让 `/provider` 出现 kilo 的零价模型，且不带 Authorization 头的请求能真实返回文本；
+        // 反过来带 `Authorization: Bearer <任意占位>` 会被上游 401，所以这里**不得**回落到占位 Key。
+        // 🔴 隐私：上游公示免费池的提示词可能被记录用于服务改进，面板必须提示不要发送敏感数据。
+        id: "kilo",
+        label: "Kilo",
+        prefix: "KL",
+        npm: OPENAI_COMPATIBLE,
+        base_url: "https://api.kilo.ai/api/gateway",
+        keyless: true,
+        models: &[],
+    },
+    Provider {
+        // OpenCode 自身的命名空间（2026-11-16 起与 Kilo 一样在「平台」页显示「免密直连」）。
+        // 它的模型、端点与鉴权都由隔离运行时内建：模型来自 models.dev 目录，免费判定仍按标价全 0。
+        // 🔴 `injected()` 对它返回 false —— 不得注入同名配置段（会覆盖内建 provider 的声明），
+        // 因此 `npm` / `base_url` 留空：万一有人把内建条目接进注入链，空值会立刻在配置校验上暴露。
+        id: "opencode",
+        label: "OpenCode",
+        prefix: "OC",
+        npm: "",
+        base_url: "",
+        keyless: true,
         models: &[],
     },
 ];
 
 /// 该平台的权威模型清单；空切片表示没有（沿用 models.dev 的 catalog 声明）。
 ///
-/// 命名空间不在注册表内（`opencode` 与合成命名空间）同样返回空切片——发现阶段据此放行，
-/// 所以「查不到平台」绝不能变成「一个模型都不出」。
+/// 查不到平台（合成命名空间）或平台未声明清单（`opencode`，模型由运行时内建目录决定）同样
+/// 返回空切片——发现阶段据此放行，所以「查不到平台」绝不能变成「一个模型都不出」。
 pub fn served_models(namespace: &str) -> &'static [DeclaredModel] {
     match find(namespace) {
         Some(provider) => provider.models,
@@ -315,14 +372,18 @@ pub fn read_keys(data_dir: &str) -> Map<String, Value> {
     keys
 }
 
-/// 面板唯一能拿到的平台信息：`id` / `label` / 是否已配置。**不含任何 Key 材料。**
+/// 面板唯一能拿到的平台信息：`id` / `label` / 是否已配置 / 是否免密。**不含任何 Key 材料。**
+///
+/// 免密平台（`keyless`）恒常 `configured: true`——它不读也不接受 `providers.json`，
+/// 面板据此显示「免密直连」而不是「未配置」。
 pub fn status(data_dir: &str) -> Value {
     let keys = read_keys(data_dir);
     json!({
         "providers": PROVIDERS.iter().map(|provider| json!({
             "id": provider.id,
             "label": provider.label,
-            "configured": keys.contains_key(provider.id),
+            "configured": provider.keyless || keys.contains_key(provider.id),
+            "keyless": provider.keyless,
         })).collect::<Vec<Value>>()
     })
 }
@@ -337,6 +398,9 @@ pub fn reveal_key(data_dir: &str, id: &str) -> Result<String, String> {
     let Some(provider) = find(id) else {
         return Err(format!("未知平台：{id}"));
     };
+    if provider.keyless {
+        return Err(format!("{} 免密直连，没有可回显的 Key", provider.label));
+    }
     match read_keys(data_dir).get(provider.id).and_then(Value::as_str) {
         Some(key) => Ok(key.to_string()),
         None => Err(format!("{} 尚未配置 Key", provider.label)),
@@ -374,6 +438,9 @@ pub fn set_key(data_dir: &str, id: &str, key: &str) -> Result<(), String> {
     let Some(provider) = find(id) else {
         return Err(format!("未知平台：{id}"));
     };
+    if provider.keyless {
+        return Err(format!("{} 免密直连，无需设置 Key", provider.label));
+    }
     let trimmed = check_key(key)?;
     let _guard = write_lock();
     let mut keys = read_keys(data_dir);
@@ -386,6 +453,9 @@ pub fn clear_key(data_dir: &str, id: &str) -> Result<(), String> {
     let Some(provider) = find(id) else {
         return Err(format!("未知平台：{id}"));
     };
+    if provider.keyless {
+        return Err(format!("{} 免密直连，没有可清除的 Key", provider.label));
+    }
     let _guard = write_lock();
     let mut keys = read_keys(data_dir);
     if keys.remove(provider.id).is_none() {
@@ -426,7 +496,19 @@ mod tests {
         assert_eq!(prefixes.len(), prefix_count, "短前缀必须全注册表唯一");
         for provider in PROVIDERS {
             assert!(provider.label.starts_with(|c: char| !c.is_whitespace()));
-            assert!(provider.base_url.starts_with("https://"), "{} 必须走 HTTPS", provider.id);
+            if provider.injected() {
+                assert!(provider.base_url.starts_with("https://"), "{} 必须走 HTTPS", provider.id);
+                assert_eq!(provider.npm, OPENAI_COMPATIBLE, "{} 的 SDK 包名", provider.id);
+            } else {
+                // 不注入的只有内建命名空间，且不得携带任何端点 / SDK 声明（防止被误注入）。
+                assert_eq!(
+                    provider.id,
+                    crate::model_status::OPENCODE_NAMESPACE,
+                    "只有内建命名空间可以不注入"
+                );
+                assert!(provider.keyless, "不注入的条目只可能是免密内建平台");
+                assert!(provider.npm.is_empty() && provider.base_url.is_empty(), "{} 不得带端点或 SDK 声明", provider.id);
+            }
             assert_eq!(find(provider.id).map(|found| found.id), Some(provider.id));
             assert_eq!(provider.prefix.len(), 2, "{} 的短前缀必须两字符：{}", provider.id, provider.prefix);
             assert!(
@@ -442,7 +524,7 @@ mod tests {
     /// 权威清单的形态自检：这份表是**手工抓取**的（不联网、没有远端真相可对账），
     /// 所以每一条都得靠断言钉住可用性与「清单与非清单平台的分界」。
     /// 只有 ModelScope 有清单是 2026-10-10 的实测结论（那家 catalog 与网关交集为空），
-    /// 其余八家按 catalog 声明即可命中，加清单只会平白缩小可选面。
+    /// 其余九家按 catalog 声明即可命中，加清单只会平白缩小可选面。
     #[test]
     fn the_authoritative_model_list_is_well_formed_and_scoped_to_modelscope() {
         for provider in PROVIDERS {
@@ -515,8 +597,45 @@ mod tests {
         }
     }
 
+    /// 2026-11-16 新增的免密平台：Kilo 恒常注入（`options` 只带 `baseURL`）；OpenCode 是运行时
+    /// 内建命名空间，只上「平台」列表、**不注入**（同名段会覆盖内建 provider）。Key 通道
+    /// （设置 / 清除 / 回显）对两者全程拒绝——否则面板会为一个不需要 Key 的平台显示「未配置」，
+    /// 或让占位 Key 被上游 401。
+    #[test]
+    fn keyless_platforms_are_kilo_and_opencode_and_reject_the_key_channel() {
+        let keyless: Vec<&str> = PROVIDERS
+            .iter()
+            .filter(|provider| provider.keyless)
+            .map(|provider| provider.id)
+            .collect();
+        assert_eq!(
+            keyless,
+            vec!["kilo", "opencode"],
+            "免密平台集合是复核过的，改动必须同步这条断言"
+        );
+
+        let kilo = find("kilo").expect("注册表缺 kilo");
+        assert_eq!(kilo.prefix, "KL");
+        assert_eq!(kilo.base_url, "https://api.kilo.ai/api/gateway");
+        assert!(kilo.models.is_empty(), "kilo 走 catalog 声明，不该带清单");
+        assert!(kilo.injected(), "kilo 必须注入（否则免费池不会出现在运行时目录里）");
+
+        let opencode = find("opencode").expect("注册表缺 opencode");
+        assert_eq!(opencode.prefix, "OC", "内建命名空间的展示前缀必须沿用历史 OC");
+        assert!(opencode.models.is_empty(), "opencode 走内建目录，不该带清单");
+        assert!(!opencode.injected(), "内建命名空间不得注入同名配置段");
+
+        let dir = temp_dir();
+        for id in ["kilo", "opencode"] {
+            assert!(set_key(&dir, id, "anything").is_err(), "{id}：免密平台不得写入 Key");
+            assert!(clear_key(&dir, id).is_err(), "{id}：免密平台没有可清除的 Key");
+            assert!(reveal_key(&dir, id).is_err(), "{id}：免密平台没有可回显的 Key");
+        }
+        assert_eq!(read_keys(&dir).len(), 0, "被拒绝的写入不得留下条目");
+    }
+
     /// 查不到平台必须回落**空清单**（＝不过滤），而不是「有清单但一条都不在」：
-    /// 后者会把该命名空间发现出的模型全数丢掉。`opencode` 与合成命名空间都走这条路。
+    /// 后者会把该命名空间发现出的模型全数丢掉。`opencode`（已登记但清单留空）与合成命名空间都走这条路。
     #[test]
     fn served_models_is_empty_for_any_namespace_without_a_list() {
         for namespace in [
@@ -528,6 +647,7 @@ mod tests {
             "nvidia",
             "openrouter",
             "huggingface",
+            "kilo",
             "",
             "not-registered",
         ] {
@@ -543,13 +663,24 @@ mod tests {
     }
 
     #[test]
-    fn status_lists_every_provider_as_unconfigured_when_nothing_is_stored() {
+    fn status_marks_only_keyless_platforms_configured_when_nothing_is_stored() {
         let value = status(&temp_dir());
         let listed = value["providers"].as_array().expect("providers 是数组");
         assert_eq!(listed.len(), PROVIDERS.len());
-        assert!(listed
-            .iter()
-            .all(|item| item["configured"] == json!(false)));
+        for item in listed {
+            let keyless = item["keyless"] == json!(true);
+            assert_eq!(
+                item["configured"],
+                json!(keyless),
+                "空目录时只有免密平台算可用：{item}"
+            );
+        }
+        assert_eq!(
+            listed.last().map(|item| &item["id"]),
+            Some(&json!("opencode")),
+            "两个免密平台都在注册表末位，状态顺序必须与注册表一致"
+        );
+        assert_eq!(listed[listed.len() - 2]["id"], json!("kilo"));
         assert_eq!(listed[0]["id"], json!("modelscope"));
         assert_eq!(listed[0]["label"], json!("ModelScope"));
     }

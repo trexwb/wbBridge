@@ -845,9 +845,16 @@ pub fn providers_section_for(data_dir: &str) -> (Value, Vec<String>) {
     let mut section = serde_json::Map::new();
     let mut configured: Vec<String> = Vec::new();
     for provider in crate::providers::PROVIDERS {
-        let Some(key) = keys.get(provider.id).and_then(Value::as_str) else {
+        // 内建命名空间（`opencode`）只上「平台」页、不参与注入：注入同名段会覆盖运行时自带的
+        // provider 声明（模型来自 models.dev 目录与本机登录态），把用户的目录整个换掉。
+        if !provider.injected() {
             continue;
-        };
+        }
+        let key = keys.get(provider.id).and_then(Value::as_str);
+        // 免密平台恒常注入（它不读 providers.json）；其余平台必须已存 Key。
+        if key.is_none() && !provider.keyless {
+            continue;
+        }
         // 🔴 非空 models 段是调用链生效的前提（2026-10-09 六组沙箱对照实验收敛的结论）：
         // 对 models.dev 在册的 provider，经 OPENCODE_CONFIG_CONTENT 注入的声明段
         // **不带 models 键**时，该平台全部模型的调用都会在 ai-sdk 层报
@@ -881,14 +888,18 @@ pub fn providers_section_for(data_dir: &str) -> (Value, Vec<String>) {
                 );
             }
         }
+        // 免密平台的 options 段**不得**带 apiKey：2026-11-16 沙箱实测，Kilo 网关收到
+        // `Authorization: Bearer <任意占位>` 会直接 401（不带该头才正常返回文本）。
+        let mut options = serde_json::Map::new();
+        options.insert("baseURL".to_string(), json!(provider.base_url));
+        if let Some(key) = key {
+            options.insert("apiKey".to_string(), json!(key));
+        }
         section.insert(
             provider.id.to_string(),
             json!({
                 "npm": provider.npm,
-                "options": {
-                    "baseURL": provider.base_url,
-                    "apiKey": key,
-                },
+                "options": Value::Object(options),
                 "models": Value::Object(models),
             }),
         );
@@ -1461,16 +1472,30 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("临时目录");
         let data_dir = dir.to_string_lossy().to_string();
 
-        // 空目录：没有任何平台配置。
+        // 空目录：没有 Key 的平台不出现，但免密平台（kilo）恒常注入。
         let (section, configured) = providers_section_for(&data_dir);
-        assert_eq!(section, json!({}));
-        assert!(configured.is_empty());
+        assert_eq!(configured, vec!["kilo".to_string()]);
+        assert_eq!(section.as_object().map(|map| map.len()), Some(1));
+        assert!(
+            section.get("opencode").is_none(),
+            "内建命名空间不得注入同名配置段：会覆盖运行时自带的 provider 声明"
+        );
+        assert_eq!(section["kilo"]["options"]["baseURL"], json!("https://api.kilo.ai/api/gateway"));
+        assert!(
+            section["kilo"]["options"].get("apiKey").is_none(),
+            "免密平台不得注入 apiKey：上游收到占位 Key 会 401"
+        );
+        assert_eq!(section["kilo"]["models"], json!({ ANCHOR_MODEL_KEY: {} }));
 
         // 配置两家（含首尾空白裁剪语义），另一家写注册表外的残留键。
         crate::providers::set_key(&data_dir, "modelscope", " ms-key ").expect("写入 modelscope");
         crate::providers::set_key(&data_dir, "zhipuai", "glm-key").expect("写入 zhipuai");
         let (section, configured) = providers_section_for(&data_dir);
-        assert_eq!(configured, vec!["modelscope".to_string(), "zhipuai".to_string()]);
+        assert_eq!(
+            configured,
+            vec!["modelscope".to_string(), "zhipuai".to_string(), "kilo".to_string()],
+            "免密平台恒常排在注册表末位"
+        );
         assert_eq!(section["modelscope"]["npm"], json!("@ai-sdk/openai-compatible"));
         assert_eq!(section["modelscope"]["options"]["baseURL"], json!("https://api-inference.modelscope.cn/v1"));
         assert_eq!(section["modelscope"]["options"]["apiKey"], json!("ms-key"), "必须复用 check_key 的裁剪结果");
