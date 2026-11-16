@@ -18,11 +18,11 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const SCRIPT = path.join(ROOT, 'scripts', 'gen-latest-json.mjs')
 const VERSION = JSON.parse(readFileSync(path.join(ROOT, 'src-tauri/tauri.conf.json'), 'utf8')).version
 
-// 六平台的目录名 = CI 里 download-artifact 收到的 artifact 名（`${os}-${target triple}-bundles`）。
-// 平台键只由目录名里的 triple 片段决定，与文件名无关 —— 下面 mac 两条刻意用不同命名佐证这点。
-const SIX = {
+// 五平台的目录名 = CI 里 download-artifact 收到的 artifact 名（`${os}-${target triple}-bundles`）。
+// 平台键只由目录名里的 triple 片段决定，与文件名无关。
+// macOS 自 2026-11-16 起只构建 aarch64（darwin-x86_64 已从 CI 矩阵与默认平台集合里移除）。
+const FIVE = {
   'macos-aarch64-apple-darwin-bundles': ['WB Bridge_1_aarch64.app.tar.gz'],
-  'macos-x86_64-apple-darwin-bundles': ['WB Bridge_1_x86_64.app.tar.gz'],
   'windows-x86_64-pc-windows-msvc-bundles': ['WB Bridge_1_x64-setup.exe'],
   'windows-aarch64-pc-windows-msvc-bundles': ['WB Bridge_1_arm64-setup.exe'],
   'linux-x86_64-unknown-linux-gnu-bundles': ['WB Bridge_1_amd64.AppImage'],
