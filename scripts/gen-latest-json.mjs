@@ -7,10 +7,11 @@
    规则：
      • 版本号取自 src-tauri/tauri.conf.json（单一真源，不重复登记）
      • 平台键取自 artifact **目录名**里的 target triple（macos|windows|linux + aarch64|x86_64）。
-       不能靠文件名：macOS 的 updater 包实测叫「WB Bridge.app.tar.gz」，既不带版本也不带架构，
-       两个 mac 架构的文件名完全相同 —— 架构后缀由 CI 的 macos 作业在上传前补齐。
+       不能靠文件名：macOS 的 updater 包实测叫「WB Bridge.app.tar.gz」，既不带版本也不带架构 ——
+       架构后缀由 CI 的 macos 作业在上传前补齐（当前只剩 aarch64，但该后缀仍是硬性要求）。
      • 每个目录内只允许出现一个带配对 .sig 的 updater 安装包，多个即拒绝（宁缺毋假）
-     • 没有同名 .sig 的安装包一律不进清单；默认要求六平台齐全，缺一即退出 1，
+     • 没有同名 .sig 的安装包一律不进清单；默认要求五平台齐全（macOS 自 2026-11-16 起只出
+       aarch64，Intel 构建已取消），缺一即退出 1，
        让「某平台静默缺席」在 CI 里失败，而不是等用户装上旧版本才发现
      • url 指向 GitHub Release 资产；Draft 未 Publish 前下载 404 属预期
    ═══════════════════════════════════════════════════════════════════ */
@@ -32,9 +33,9 @@ const base = `https://github.com/${repo}/releases/download/${tag}`
 const dir = arg('dir', 'artifacts')
 const out = arg('out', 'latest.json')
 
-// 六平台：与 .github/workflows/release.yml 的 matrix 一一对应。
+// 五平台：与 .github/workflows/release.yml 的 matrix 一一对应（macOS 只有 aarch64）。
 const EXPECTED = (arg('expect')
-  || 'windows-x86_64,windows-aarch64,darwin-aarch64,darwin-x86_64,linux-x86_64,linux-aarch64')
+  || 'windows-x86_64,windows-aarch64,darwin-aarch64,linux-x86_64,linux-aarch64')
   .split(',').map(s => s.trim()).filter(Boolean)
 
 const OS_FROM_DIR = { macos: 'darwin', windows: 'windows', linux: 'linux' }
@@ -117,7 +118,7 @@ for (const entry of readdirSync(dir, { withFileTypes: true })) {
   // 客户端到下载那一步才发现（清单本身验不出这个问题）。
   platforms[key] = { name, url: `${base}/${encodeURIComponent(name.replace(/ /g, '.'))}`, signature: readFileSync(`${installer}.sig`, 'utf8').trim() }
   if (key.startsWith('darwin') && !/_(aarch64|x86_64)\.app\.tar\.gz$/i.test(name)) {
-    console.error(`[gen-latest-json] ${key}：资产名 ${name} 没有架构后缀，两个 mac 架构会在 Release 上同名互覆盖（CI 的重命名步骤没生效？）`)
+    console.error(`[gen-latest-json] ${key}：资产名 ${name} 没有架构后缀（CI 的重命名步骤没生效？）`)
     process.exit(1)
   }
 }
