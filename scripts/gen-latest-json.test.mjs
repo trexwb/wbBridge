@@ -18,11 +18,11 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const SCRIPT = path.join(ROOT, 'scripts', 'gen-latest-json.mjs')
 const VERSION = JSON.parse(readFileSync(path.join(ROOT, 'src-tauri/tauri.conf.json'), 'utf8')).version
 
-// 五平台的目录名 = CI 里 download-artifact 收到的 artifact 名（`${os}-${target triple}-bundles`）。
-// 平台键只由目录名里的 triple 片段决定，与文件名无关。
-// macOS 自 2026-11-16 起只构建 aarch64（darwin-x86_64 已从 CI 矩阵与默认平台集合里移除）。
-const FIVE = {
+// 六平台的目录名 = CI 里 download-artifact 收到的 artifact 名（`${os}-${target triple}-bundles`）。
+// 平台键只由目录名里的 triple 片段决定，与文件名无关 —— 下面 mac 两条刻意用不同命名佐证这点。
+const SIX = {
   'macos-aarch64-apple-darwin-bundles': ['WB Bridge_1_aarch64.app.tar.gz'],
+  'macos-x86_64-apple-darwin-bundles': ['WB Bridge_1_x86_64.app.tar.gz'],
   'windows-x86_64-pc-windows-msvc-bundles': ['WB Bridge_1_x64-setup.exe'],
   'windows-aarch64-pc-windows-msvc-bundles': ['WB Bridge_1_arm64-setup.exe'],
   'linux-x86_64-unknown-linux-gnu-bundles': ['WB Bridge_1_amd64.AppImage'],
@@ -44,7 +44,7 @@ function makeArtifacts(files, { signatures = true } = {}) {
   return base
 }
 
-/** 跑生成器；expect 把「五平台齐全」的校验收窄到单平台，让各失败路径互不干扰。 */
+/** 跑生成器；expect 把「六平台齐全」的校验收窄到单平台，让各失败路径互不干扰。 */
 function run(base, { out = 'latest.json', expect, tag } = {}) {
   const args = [SCRIPT, '--dir', base, '--out', path.join(base, out)]
   if (expect) args.push('--expect', expect)
@@ -59,16 +59,15 @@ function run(base, { out = 'latest.json', expect, tag } = {}) {
   }
 }
 
-test('五平台齐全：写出五个平台键、签名与 url，url 用 GitHub 实际提供的资产名（空格→点）', () => {
-  const base = makeArtifacts(FIVE)
+test('六平台齐全：写出六个平台键、签名与 url，url 用 GitHub 实际提供的资产名（空格→点）', () => {
+  const base = makeArtifacts(SIX)
   try {
     const { status, manifest, output } = run(base, { tag: 'v9.9.9' })
     assert.equal(status, 0, output)
     assert.equal(manifest.version, VERSION, '版本号必须取自 tauri.conf.json，不在脚本里重复登记')
     assert.deepEqual(
       Object.keys(manifest.platforms).sort(),
-      ['darwin-aarch64', 'linux-aarch64', 'linux-x86_64', 'windows-aarch64', 'windows-x86_64'],
-      'macOS 只出 aarch64：清单里不得再出现 darwin-x86_64',
+      ['darwin-aarch64', 'darwin-x86_64', 'linux-aarch64', 'linux-x86_64', 'windows-aarch64', 'windows-x86_64'],
     )
     assert.equal(manifest.platforms['darwin-aarch64'].signature, 'sig:WB Bridge_1_aarch64.app.tar.gz')
     assert.equal(
@@ -76,6 +75,7 @@ test('五平台齐全：写出五个平台键、签名与 url，url 用 GitHub �
       'https://github.com/trexwb/wbBridge/releases/download/v9.9.9/WB.Bridge_1_aarch64.app.tar.gz',
       'GitHub 把资产名的空格规范化成点，空格/%20 形式一律 404（v1.0.2 实测），url 必须用点形式',
     )
+    assert.equal(manifest.platforms['darwin-x86_64'].url.endsWith('/WB.Bridge_1_x86_64.app.tar.gz'), true)
     assert.equal(
       manifest.platforms['windows-x86_64'].url.endsWith('/WB.Bridge_1_x64-setup.exe'),
       true,
@@ -87,7 +87,7 @@ test('五平台齐全：写出五个平台键、签名与 url，url 用 GitHub �
 })
 
 test('缺一个平台的已签名产物：整体失败，而不是写出缺平台的清单', () => {
-  const partial = { ...FIVE }
+  const partial = { ...SIX }
   delete partial['linux-aarch64-unknown-linux-gnu-bundles']
   const base = makeArtifacts(partial)
   try {
@@ -115,7 +115,7 @@ test('安装包缺配对 .sig（Secrets 未配置时的表现）：该平台判�
   }
 })
 
-test('mac 资产名漏了架构后缀（CI 重命名没生效）：必须失败', () => {
+test('mac 资产名漏了架构后缀（CI 重命名没生效）：必须失败，不能让两个架构同名互覆盖', () => {
   const base = makeArtifacts({ 'macos-aarch64-apple-darwin-bundles': ['WB Bridge.app.tar.gz'] })
   try {
     const { status, output } = run(base, { expect: 'darwin-aarch64' })
