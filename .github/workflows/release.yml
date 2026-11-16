@@ -7,7 +7,7 @@
 #     勾选 create_release 后才创建 Draft Release（与推 tag 行为一致）
 # 产物：
 #   • Windows:  NSIS 安装包(.exe) + MSI 安装包(.msi)
-#   • macOS:   .dmg + .app（ad-hoc 签名，**仅 Apple Silicon**；Intel 构建已于 2026-11-16 取消）
+#   • macOS:   .dmg + .app（ad-hoc 签名）
 #   • Linux:   .AppImage + .deb
 # 说明：
 #   • 核心已用 Rust 重写并**静态编进 Tauri 壳**（`src-tauri/core/` 作为 path 依赖），
@@ -231,10 +231,10 @@ jobs:
         include:
           # macos-14 镜像已于 2026-11-02 被 GitHub 彻底退役（brownout 后直接拒绝作业），
           # aarch64 构建迁移到 macos-15（同为 arm64 原生 runner）。
-          # 2026-11-16 用户要求取消 Intel（x86_64-apple-darwin）构建：macOS 只出 Apple Silicon 包，
-          # latest.json 因此不再有 darwin-x86_64 键（Intel 老客户端收不到更新，只能手动换包）。
           - os: macos-15
             arch: aarch64-apple-darwin
+          - os: macos-15
+            arch: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -279,11 +279,11 @@ jobs:
           TARGET_TRIPLE: ${{ matrix.arch }}
 
       - name: 给 macOS 更新包补架构后缀
-        # 实测：tauri 产出的 updater 包叫「WB Bridge.app.tar.gz」，既不带版本也不带架构。
-        # 自 2026-11-16 起只有一个 mac 架构（aarch64），同名互覆盖已不可能，但这一步仍保留：
-        # gen-latest-json.mjs 要求 darwin 资产名必须带 `_<arch>` 后缀，且日后若重新加回 Intel 时
-        # 两个 runner 又会撞名。统一补成「WB Bridge_<arch>.app.tar.gz」；.sig 同步改名——
-        # minisign 签的是内容不是文件名，因此改名不影响 updater 验签。
+        # 实测：tauri 产出的 updater 包叫「WB Bridge.app.tar.gz」，既不带版本也不带架构，
+        # 于是两个 mac runner 会往同一个 Release 传**同名**资产、后者静默覆盖前者，
+        # latest.json 也无法靠文件名区分 darwin-aarch64 / darwin-x86_64。
+        # 统一补成「WB Bridge_<arch>.app.tar.gz」；.sig 同步改名——minisign 签的是内容不是文件名，
+        # 因此改名不影响 updater 验签。
         run: |
           set -euo pipefail
           arch="${{ matrix.arch }}"
@@ -529,11 +529,10 @@ jobs:
             src-tauri/target/**/release/bundle/**/*.AppImage.tar.gz
             src-tauri/target/**/release/bundle/**/*.sig
 
-  # ── 更新清单：五平台产物的唯一汇总写者 ────────────────────────────
+  # ── 更新清单：六平台产物的唯一汇总写者 ────────────────────────────
   # 客户端 plugins.updater.endpoints 读 releases/latest/download/latest.json。
   # 放在最后一个作业 = 单一写者，不会出现「某平台静默缺席」；
-  # gen-latest-json.mjs 默认要求五平台齐全（macOS 自 2026-11-16 起只出 aarch64），
-  # 缺任何一个都退出 1 让本次发布失败。
+  # gen-latest-json.mjs 默认要求六平台齐全，缺任何一个都退出 1 让本次发布失败。
   update-manifest:
     name: 生成更新清单 (latest.json)
     needs: [build-macos, build-windows, build-linux]
@@ -546,7 +545,7 @@ jobs:
         with:
           node-version: 24
 
-      - name: 下载各平台产物
+      - name: 下载六平台产物
         uses: actions/download-artifact@v4
         with:
           pattern: '*-bundles'
@@ -587,7 +586,7 @@ jobs:
           '
 
       - name: 产物版本自检（结论写进 run summary，供 Release 正文引用）
-        # 汇总各平台实际收到的安装包，逐个核对文件名里的版本号是否等于源码版本。
+        # 汇总六个平台实际收到的安装包，逐个核对文件名里的版本号是否等于源码版本。
         # v1.0.1 事故的二次网：标签打在不含版本推进的提交上时，test 作业的标签闸门会先红；
         # 万一闸门被绕过（手动 dispatch、改了 conf 没改标签），这里仍能把错名产物摊在明面上。
         run: |

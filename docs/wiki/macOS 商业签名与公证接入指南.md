@@ -195,7 +195,7 @@ base64 -d -i ~/WBBridge-DeveloperID.p12.b64 -o /tmp/roundtrip.p12 \
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 ```
 
-⚠ 自 2026-11-16（1.3.17）起 macOS 作业**只有一个 runner**（`macos-15` / `aarch64-apple-darwin`，Intel 构建已取消），签名变量只需对这一组生效；`.dmg` 公证步骤（步骤 10）仍须加在同一作业里。若日后加回 Intel 目标，记得签名 / 公证步骤对两个 `matrix.arch` 都要生效。
+⚠ 注意 macOS 作业是**两个 runner**（`macos-14` ARM 与 `macos-15` Intel，见 `matrix.arch`），签名变量对两者都生效；`.dmg` 公证步骤（步骤 10）也必须加在同一作业里，否则只有一半平台产物被公证。
 
 ### 步骤 7：修改 `tauri.conf.json`
 
@@ -312,7 +312,7 @@ xcrun stapler validate "$DMG"
 
 - [ ] 推一个测试标签（或在 `workflow_dispatch` 勾选 `create_release`）后，`build-macos` 两个架构作业均 success。
 - [ ] 构建日志里没有 `skipping app notarization`；有公证提交/装订步骤的执行记录。
-- [ ] Release 资产数与既有轮次一致（1.3.17 起为 20 个；`v1.2.5` 及更早为 23 个），资产名不受影响。
+- [ ] Release 资产数与既有轮次一致（23 个），资产名不受影响。
 - [ ] 下载 macOS `.dmg` 与 `.app.tar.gz`，在本地机器上重复 §4.2 的第 5–10 项。
 - [ ] `latest.json` 六条 `url` 逐条 200（该对账步骤已在 CI 内，实跑 success 即可）。
 
