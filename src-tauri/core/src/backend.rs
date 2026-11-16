@@ -2030,6 +2030,44 @@ mod tests {
         assert!(models[0].get("input").is_none());
     }
 
+    /// video 能力位与 images 同源同形态地归一：只认 `capabilities.input.video == true`
+    /// （缺键 / 显式 false / 非布尔真值一律 false）。这是 has_videos / any_video_capable /
+    /// prepare 视频闸门全链路的唯一数据源，路径写错会让所有模型静默 video=false。
+    #[test]
+    fn models_in_normalizes_the_video_capability_flag() {
+        let providers = json!({ "all": [{ "id": "opencode", "models": {
+            "vid": {
+                "name": "Vid", "cost": { "input": 0, "output": 0 },
+                "capabilities": { "input": { "video": true } },
+            },
+            "novid": {
+                "name": "NoVid", "cost": { "input": 0, "output": 0 },
+                "capabilities": { "input": { "image": true } },
+            },
+            "explicit-false": {
+                "name": "ExplicitFalse", "cost": { "input": 0, "output": 0 },
+                "capabilities": { "input": { "video": false } },
+            },
+            "weird": {
+                "name": "Weird", "cost": { "input": 0, "output": 0 },
+                "capabilities": { "input": { "video": "true" } },
+            },
+            "bare": { "name": "Bare", "cost": { "input": 0, "output": 0 } },
+        } }] });
+        let models = free_models(&providers).unwrap();
+        let find = |key: &str| {
+            models
+                .iter()
+                .find(|model| model["id"] == json!(format!("opencode/{key}")))
+                .expect("免费条目必须在列")
+        };
+        assert_eq!(find("vid")["video"], json!(true), "capabilities.input.video=true 才点亮");
+        assert_eq!(find("novid")["video"], json!(false), "未声明视频的模型归一成 false");
+        assert_eq!(find("explicit-false")["video"], json!(false));
+        assert_eq!(find("weird")["video"], json!(false), "非布尔真值按 false（缺键即 false 的同形态）");
+        assert_eq!(find("bare")["video"], json!(false), "连 capabilities 都没有时归一成 false");
+    }
+
     /// 声明段的锚点条目（OpenCode 会为它合成 cost 全 0 的幽灵模型）绝不能进入免费列表：
     /// 幽灵的 cost 形态与免费模型完全一致，唯一判别依据就是保留名。
     /// 用没有权威清单的平台来测，才只钉住锚点这一件事（modelscope 会被清单过滤，见下条）。
@@ -2412,6 +2450,53 @@ mod tests {
         assert_eq!(meta.get("sessionID"), Some(json!("ses_mock")));
         assert_eq!(meta.get("calls"), Some(json!(0)));
         assert_eq!(meta.get("steps"), Some(json!(1)));
+    }
+
+    /// 视频沿既有 `{type:"file"}` part 通道进上游 payload：parts 顺次为 text → images → videos
+    /// （对上游的 wire 契约，评审要求逐项钉住顺序与文件名）。
+    #[tokio::test]
+    async fn complete_sends_text_images_then_videos_as_file_parts() {
+        let (base, server, state) = start_mock_with(vec![good_envelope("ok")], vec![], false).await;
+        let model = json!({
+            "id": "opencode/mock", "name": "Mock", "images": true, "video": true,
+        });
+        let mut body = mock_body();
+        body["messages"] = json!([{ "role": "user", "content": [
+            { "type": "text", "text": "看" },
+            { "type": "image_url", "image_url": { "url": "data:image/png;base64,AA==" } },
+            { "type": "image_url", "image_url": { "url": "data:video/mp4;base64,AA==" } },
+        ] }]);
+        let backend = Backend::new(&base, "pw", |_| {});
+        let prepared = prepare(&body, std::slice::from_ref(&model)).unwrap();
+        let meta = SharedMeta::new(json!({ "model": model }));
+        let (_controller, signal) = AbortSignal::channel();
+        let result = backend
+            .complete(
+                prepared,
+                RequestContext {
+                    meta: meta.clone(),
+                    signal,
+                    activity: Activity::silent(),
+                },
+            )
+            .await;
+        server.abort();
+        result.expect("mock 信封应成功");
+
+        let bodies = lock(&state.bodies);
+        assert_eq!(bodies.len(), 1, "成功信封只有一次 /message POST");
+        let parts = bodies[0]["parts"].as_array().expect("parts 数组");
+        assert_eq!(parts.len(), 3, "text + image + video 各一个 part");
+        assert_eq!(parts[0]["type"], json!("text"));
+        let text = parts[0]["text"].as_str().expect("正文标记在 text part 里");
+        assert!(text.contains("[Attached image: message-1-image-2.png]"), "{text}");
+        assert!(text.contains("[Attached video: message-1-video-3.mp4]"), "{text}");
+        assert_eq!(parts[1]["type"], json!("file"));
+        assert_eq!(parts[1]["mime"], json!("image/png"));
+        assert_eq!(parts[1]["filename"], json!("message-1-image-2.png"));
+        assert_eq!(parts[2]["type"], json!("file"), "视频排在图片之后");
+        assert_eq!(parts[2]["mime"], json!("video/mp4"));
+        assert_eq!(parts[2]["filename"], json!("message-1-video-3.mp4"));
     }
 
     #[tokio::test]
