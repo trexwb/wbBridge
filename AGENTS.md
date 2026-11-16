@@ -61,7 +61,7 @@ WB Bridge 是一个**跨平台托盘工具**，通过**隔离的 OpenCode 技术
 | 运行提示词优化测试 | `npm run test:prompt` | 仓库根 | = `node --test src/core/prompt.test.js`（模板与输入上限、优化 / 迭代 / 对比请求的消息组装与数据边界、围栏与首行标签清洗、占位符缺失 / 新增比对、版本链编号、陈旧判定、提交拒绝文案与两档节流）；只测 `src/core/prompt.js` 纯函数，不联网、不起 Tauri |
 | 运行对话记录测试 | `npm run test:chat` | 仓库根 | = `node --test src/core/chatSession.test.js`（IndexedDB 会话存储：字段递归裁剪、落盘前丢弃工具入参、写盘失败静默降级）；只测 `src/core/chatSession.js` 纯逻辑，不联网、不起 Tauri |
 | 运行面板桥接测试 | `npm run test:bridge` | 仓库根 | = `node --test src/core/bridge.test.js`（桩 Tauri IPC：v2 监听回调收到的是事件对象，载荷在 `event.payload` 上——拿错一层 ai-* 四类事件全被滤掉、助手永远转圈）；不联网、不编译 Rust |
-| 运行更新清单生成测试 | `npm run test:manifest` | 仓库根 | = `node --test scripts/gen-latest-json.test.mjs`；用临时产物目录跑真脚本，钉住六平台成功路径与缺平台/缺签名/漏架构后缀/歧义产物等失败路径。**严禁**改成真实联网或读仓库 `src-tauri/target/` 下的产物 |
+| 运行更新清单生成测试 | `npm run test:manifest` | 仓库根 | = `node --test scripts/gen-latest-json.test.mjs`；用临时产物目录跑真脚本，钉住五平台（macOS 仅 aarch64，Intel 构建 2026-11-16 取消）成功路径与缺平台/缺签名/漏架构后缀/歧义产物等失败路径。**严禁**改成真实联网或读仓库 `src-tauri/target/` 下的产物 |
 | 运行 updater 签名注入测试 | `npm run test:updater-key` | 仓库根 | = `node --test scripts/with-updater-key.test.mjs`；钉住 env 文件取值优先级（进程环境 > `.env.local` > `.env` > `~/.tauri/wbBridge{,-updater}.env`，**显式空口令压过文件里的口令**、`~/…` 先展开）、内联位的两种形态（单行 base64 全文 vs `.key` 文件路径 → 读成全文并 **trim**，尾部换行会让 tauri 报 `Invalid symbol 10`）、路径注入后删除与之互斥的 `_PATH`、明文钥显式置空口令、加密钥缺口令**只告警不阻断**、公钥配对**只认配置里第一条且只告警**、`buildCommand` 的三种入参形态、CLI 在**相对路径**调用下确实执行且**任何输出都不回显密钥**。接线断言：`tauri:build` 确实经本包装器、`build` 链 `make:dmg`、`release.yml` 把私钥读成 `vars.` 且调用 `npm run tauri:build`（不再有 `tauri-action`、不再有私钥前置步骤）、`plugins.updater.pubkey` **恰好一条公钥**、`bundle.targets` **不含 dmg**。**不联网、不调 tauri CLI、不读 `~/.tauri`、不碰真实私钥**（用合成的假 base64 串与临时目录） |
 | 静态检查 | `cargo clippy --all-targets` | `src-tauri/core/` | 必须保持 0 warning |
 | 启动核心（独立进程，调试用） | `cargo run --manifest-path src-tauri/core/Cargo.toml --bin wbbridge-core` | 仓库根 | 监听 `127.0.0.1:41980`（`BUDDY_PORT` 覆盖），数据目录走平台默认值 |
@@ -93,10 +93,10 @@ WB Bridge 是一个**跨平台托盘工具**，通过**隔离的 OpenCode 技术
   # -k/--private-key 是「私钥字符串」，读文件要用 -f/--private-key-path；
   # 单独签文件：npm run tauri -- signer sign -f <私钥路径> -p '' <产物路径>
   ```
-- `latest.json` **只有一个写者**：CI 末尾的 `update-manifest` 作业跑 `scripts/gen-latest-json.mjs`（`node scripts/gen-latest-json.mjs --dir artifacts --out latest.json`），平台键取自 artifact **目录名**里的 target triple（`macos-aarch64-…-bundles` → `darwin-aarch64`；不能靠文件名），默认要求六平台齐全、缺一即退出 1。三个 build 作业**谁都不写清单**。
+- `latest.json` **只有一个写者**：CI 末尾的 `update-manifest` 作业跑 `scripts/gen-latest-json.mjs`（`node scripts/gen-latest-json.mjs --dir artifacts --out latest.json`），平台键取自 artifact **目录名**里的 target triple（`macos-aarch64-…-bundles` → `darwin-aarch64`；不能靠文件名），默认要求五平台齐全（macOS 仅 `darwin-aarch64`；Intel 构建 2026-11-16 取消，清单不再有 `darwin-x86_64` 键）、缺一即退出 1。三个 build 作业**谁都不写清单**。
   - 🔴 **url 里的空格必须写成 `.`**：GitHub 在上传时把 Release 资产名里的空格规范化成点（磁盘 `WB Bridge_1.0.2_x64-setup.exe` → API 里 `WB.Bridge_1.0.2_x64-setup.exe`），而 `/releases/download/<tag>/<空格名>`（含 `%20`）一律 404；脚本因此先 `name.replace(/ /g, '.')` 再 `encodeURIComponent`，CI 另有一步用 API 把清单 url 末段与实际资产名逐条对账，对不上即失败。
 - **macOS 的 `.dmg` 不经 Tauri**：`bundle.targets` 为显式列表 `["app", "nsis", "msi", "appimage", "deb"]`（本平台不适用的目标由打包器跳过），`.dmg` 由 `scripts/make-dmg.sh`（`npm run make:dmg`，已接进 `npm run build` 链尾）用 **hdiutil** 生成 —— Tauri 自带的 create-dmg 末尾要用 AppleScript 美化窗口，无 GUI / 无 Finder 自动化授权的 runner 上会失败。脚本从 `tauri.conf.json` 读 `productName`/`version`，架构取 `TARGET_TRIPLE` 前缀（CI 交叉目标**必须传**，否则 `uname -m` 反映的是 runner 架构，会拿错 bundle 目录并把 x86_64 的包标成 aarch64），产物 `bundle/dmg/<productName>_<version>_<arch>.dmg`；非 macOS 直接跳过返回 0。
-- **macOS 更新包名不含版本也不含架构**（就是 `WB Bridge.app.tar.gz`），两个 mac runner 会往同一 Release 传同名资产、后者静默覆盖前者；CI 的「给 macOS 更新包补架构后缀」步骤因此把它改名为 `WB Bridge_<arch>.app.tar.gz`（`.sig` 同步改名——minisign 签的是内容不是文件名）。
+- **macOS 更新包名不含版本也不含架构**（就是 `WB Bridge.app.tar.gz`）。macOS 自 2026-11-16 起只构建 `aarch64-apple-darwin`（Intel 版本已取消，矩阵与 `latest.json` 的默认平台集合同步收窄）；CI 的「给 macOS 更新包补架构后缀」步骤仍把它改名为 `WB Bridge_<arch>.app.tar.gz`（`.sig` 同步改名——minisign 签的是内容不是文件名），因为 `gen-latest-json.mjs` 要求 darwin 资产名带 `_aarch64`/`_x86_64` 后缀，日后加回 Intel 时也靠它防两个 runner 同名互覆盖。
 - CI：`.github/workflows/release.yml`（推 `v*` tag 或手动 dispatch）——**发布不被测试阻塞（2026-10-14 用户裁定）**：`release-gate` 作业（轻量、必须通过）跑 `check-version.mjs` + 标签↔版本闸门，三个 build 作业 `needs: release-gate`；`test` 作业照常跑 `cargo test` + 八组 `node --test`（prefs / ops / ai / prompt / chat / bridge / manifest / updater-key），但**只作告警展示、不再是发布前置**。三个平台作业跑 `npm ci` → `npm run tauri:build -- --target <triple>`（签名变量取自 `vars.TAURI_SIGNING_PRIVATE_KEY{,_PASSWORD}`，**不设私钥前置校验步骤**）；macOS 另加 `npm run make:dmg`（带 `TARGET_TRIPLE`）与「给 macOS 更新包补架构后缀」两步；`update-manifest` 作业 = 生成 latest.json → 校验清单 url 指向的资产在 Release 上真的存在 → 产物版本自检 → 上传 `latest.json`。Release 由 `softprops/action-gh-release` 创建（**不用 `tauri-apps/tauri-action`**），`tag_name` 由「读取版本号」步骤现读 `tauri.conf.json` 拼成 `v<版本>`。
 
 ### 环境变量（核心）
@@ -380,7 +380,7 @@ start_backend
   - `npm run test:prompt` = `node --test src/core/prompt.test.js`：`prompt.js` 的模板与输入上限、优化 / 迭代 / 对比请求的消息组装与**数据边界**（待处理文本必须标为数据、不得变成指令）、围栏与首行套话清洗、`{{变量}}` 缺失 / 新增比对、版本链编号、源文与对比结果的陈旧判定、提交拒绝文案、500ms 前沿节流与 800ms 拒绝提示节流。不联网、不起 Tauri。
   - `npm run test:chat` = `node --test src/core/chatSession.test.js`：`chatSession.js` 的 IndexedDB 会话存储——字段递归裁剪、**落盘前丢弃工具入参**（`set_provider_key` 的 `args.apiKey` 是用户 Key 明文）、写盘失败（无 `indexedDB`、隐私模式、配额）静默降级为「这次不记住」。不联网、不起 Tauri。
   - `npm run test:bridge` = `node --test src/core/bridge.test.js`：`bridge.js` 的桩 IPC 单测——**Tauri v2 监听回调收到的是事件对象 `{event, id, payload}`**，载荷在 `event.payload` 上；`aiEvents` 必须解包后再按 chatId 过滤（拿错一层等于把 ai-chunk/ai-done/ai-error/ai-aborted 全部滤掉，助手每一轮永远转圈、连「停止」都失效）。不联网、不编译 Rust。
-  - `npm run test:manifest` = `node --test scripts/gen-latest-json.test.mjs`：`latest.json` 六平台成功路径（平台键只由 artifact 目录名决定、url 空格编码、签名取自配对 `.sig`）与各类必须失败/告警的路径；用 `spawnSync` 跑真脚本 + 临时目录，**不联网、不碰真实产物**。
+  - `npm run test:manifest` = `node --test scripts/gen-latest-json.test.mjs`：`latest.json` 五平台成功路径（平台键只由 artifact 目录名决定、url 空格编码、签名取自配对 `.sig`）与各类必须失败/告警的路径；用 `spawnSync` 跑真脚本 + 临时目录，**不联网、不碰真实产物**。
   - `npm run test:updater-key` = `node --test scripts/with-updater-key.test.mjs`：签名注入包装器的取值优先级、内联位两种形态的归一、互斥 `_PATH` 的删除、明文钥显式置空口令、公钥配对只认第一条且只告警、`buildCommand` 入参形态，以及接线断言（`tauri:build` 确实经本包装器、`build` 链 `make:dmg`、`release.yml` 用 `vars.` 且调用 `npm run tauri:build`、`plugins.updater.pubkey` 恰好一条、`bundle.targets` 不含 dmg）。**不联网、不调 tauri CLI、不读 `~/.tauri`、不碰真实私钥**。
   八组都已进 CI 的 `test` 作业（「运行面板偏好、操作守卫、AI 引擎、提示词优化、对话记录、桥接事件、更新清单与签名注入单测」一步；该作业自 2026-10-14 起只作告警展示，不再是发布前置）。改 `prefs.js` 的白名单/投影、`ai.js` 的工具表/校验/裁剪/渲染、`prompt.js` 的模板/校验/请求组装/清洗/守卫判定、`ops.js` 的守卫判定与文案、`gen-latest-json.mjs` 的平台识别与失败判定、或 `with-updater-key.mjs` 的取值/归一/口令/配对判定，**必须同步改对应测试**。
 - **JS↔Rust 对拍已快照化**：`tests/fixtures/*.json` 每个用例带 `expected`（迁移前由 JS 实现录制、已抹平随机 id / `created` / `ms` / sync 文案；沙箱绝对路径在比较前还原成 `$BASE` 占位符，快照因此不绑定机器与目录布局）。默认不启动 Node。需要重新录制时，把仓库外归档 `backup/wbBridge-node-20261001/` 的 `core/` 与 `core-rs-tests-js/`（归档内的目录名，放回后即 `tests/js/`）放回原位，再 `WB_PARITY_RECORD=1 cargo test --test js_parity`；**禁止**在没有 JS 真相的情况下手工编辑 `expected` 来"让测试通过"。
@@ -462,7 +462,7 @@ start_backend
 提交纪律：
 
 - 提交前必须运行 `cargo test`（`src-tauri/core/`）；测试失败禁止提交。
-- **标签纪律（发布必须遵守）**：① 先 `npm run version:set -- <x.y.z>` 改写 7 处落点并**提交**，再**在该提交上**打 `v<x.y.z>` 标签——标签绝不允许指向"不含本次版本推进"的提交；② CI 的 `release-gate` 作业有闸门（2026-10-14 起从 test 作业拆出，test 失败不再阻塞发布，此闸仍必须通过）：`GITHUB_REF_NAME` 去掉前导 `v` 必须等于 `tauri.conf.json` 的 `version`，不一致 exit 1（`check-version.mjs` 只看同一提交内部一致，抓不到标签指错）；③ 三个 build 作业上传前打印产物名，`update-manifest` 作业汇总六平台安装包名并把「产物版本 = tag 版本」自检结论写进 run summary，**待人工核对项不为 0 时不得点 Publish**；④ 删除/移动**已推送**的标签属共享状态变更，只能用户执行。
+- **标签纪律（发布必须遵守）**：① 先 `npm run version:set -- <x.y.z>` 改写 7 处落点并**提交**，再**在该提交上**打 `v<x.y.z>` 标签——标签绝不允许指向"不含本次版本推进"的提交；② CI 的 `release-gate` 作业有闸门（2026-10-14 起从 test 作业拆出，test 失败不再阻塞发布，此闸仍必须通过）：`GITHUB_REF_NAME` 去掉前导 `v` 必须等于 `tauri.conf.json` 的 `version`，不一致 exit 1（`check-version.mjs` 只看同一提交内部一致，抓不到标签指错）；③ 三个 build 作业上传前打印产物名，`update-manifest` 作业汇总五平台（macOS 仅 aarch64）安装包名并把「产物版本 = tag 版本」自检结论写进 run summary，**待人工核对项不为 0 时不得点 Publish**；④ 删除/移动**已推送**的标签属共享状态变更，只能用户执行。
 - 一次提交只包含一类改动，禁止把源码改动与大批二进制/图标混在一起。
 - **严禁提交**：`api-key`、`.env.local`、`status.json`、`settings.json`、`node_modules/`、`dist/`、`src-tauri/target/`、`src-tauri/core/target/`、`src-tauri/gen/`、`.zwork/`、任何私钥文件、以及仓库外的 Node 归档目录。
 - 仓库现状：分支 `dev`，远端 `origin = https://github.com/trexwb/wbBridge.git`（另有 `main`）。提交前务必 `git status` 复核实际纳入内容。
@@ -512,9 +512,9 @@ start_backend
 
 | 项 | 值 | 来源 |
 |---|---|---|
-| 版本单一来源 | **1.3.16** | 根 `package.json` 的 `version` |
-| 壳工程同步落点 | **1.3.16** | `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `[package] version` |
-| 核心 crate 版本 | **1.3.16** | `src-tauri/core/Cargo.toml`（`wbbridge-core --version` 输出；随产品版本同步，`version:set`/`version:check` 均覆盖） |
+| 版本单一来源 | **1.3.17** | 根 `package.json` 的 `version` |
+| 壳工程同步落点 | **1.3.17** | `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `[package] version` |
+| 核心 crate 版本 | **1.3.17** | `src-tauri/core/Cargo.toml`（`wbbridge-core --version` 输出；随产品版本同步，`version:set`/`version:check` 均覆盖） |
 
 > `status.json` 内写入的 `version` 是历史沿革值 `0.2.0`，**不属版本落点**，不得在无用户指令的情况下静默改动（见「关键常量」）。
 

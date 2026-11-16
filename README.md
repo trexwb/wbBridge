@@ -24,11 +24,11 @@ WB Bridge 做三件事：
 
 ## 下载与安装
 
-推送 `v*` 标签后 GitHub Actions 自动构建六平台（macOS ARM/Intel、Windows x64/ARM、Linux x64/ARM）安装包并发布 Release（每轮 23 个资产：六平台安装包 + 各自 `.sig` + `latest.json`）。
+推送 `v*` 标签后 GitHub Actions 自动构建五平台（macOS ARM、Windows x64/ARM、Linux x64/ARM）安装包并发布 Release（每轮 20 个资产：五平台安装包 + 各自 `.sig` + `latest.json`）。macOS 只出 Apple Silicon 包，**Intel 构建已于 2026-11-16 取消**（`latest.json` 不再有 `darwin-x86_64` 键，Intel Mac 用户收不到应用内更新，需手动换包）。
 
 | 系统 | 安装包 |
 |---|---|
-| macOS 10.15+（Apple Silicon / Intel） | `WB.Bridge_<版本>_aarch64.dmg` / `…_x64.dmg`（hdiutil 生成）；另有 `WB.Bridge_<arch>.app.tar.gz`（+ 同名 `.sig`）供自动更新 |
+| macOS 10.15+（**仅 Apple Silicon**） | `WB.Bridge_<版本>_aarch64.dmg`（hdiutil 生成）；另有 `WB.Bridge_aarch64.app.tar.gz`（+ 同名 `.sig`）供自动更新 |
 | Windows 10/11 x64 / ARM64 | `WB.Bridge_<版本>_x64-setup.exe` / `…_arm64-setup.exe`（+ 同名 `.sig`；另有 `.msi`，不参与更新） |
 | Linux x64 / ARM64 | `WB.Bridge_<版本>_amd64.AppImage` / `.deb`（`.sig` 齐全；更新包就是裸 `.AppImage`） |
 
