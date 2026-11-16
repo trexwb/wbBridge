@@ -1036,7 +1036,7 @@ onBeforeUnmount(() => {
               <input v-model="settingsForm.brain" type="radio" value="self" name="aiBrain">
               <span>
                 <strong>本机免费模型</strong>
-                <em>用 WB Bridge 自己的桥接服务（OpenCode 免费模型）。无需任何 Key，端点与令牌由本应用自己持有；会消耗少量免费额度。</em>
+                <em>用 WB Bridge 自己的桥接服务（多平台免费模型池）。无需任何 Key，端点与令牌由本应用自己持有；会消耗少量免费额度。</em>
               </span>
             </label>
             <label class="assistant-brain" :class="{ active: settingsForm.brain === 'external' }">

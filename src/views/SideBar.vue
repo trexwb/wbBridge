@@ -78,7 +78,7 @@ const NAV_INDEX = new Map(groups.flatMap((group) => group.items).map((item, i) =
   <aside>
     <img class="brand-mark" :src="logo" alt="WB Bridge" aria-hidden="true">
     <h1>WB Bridge</h1>
-    <p class="tagline">让 WorkBuddy / CodeBuddy 连接 OpenCode 免费模型</p>
+    <p class="tagline">让各类 AI 工具连接多平台的免费与付费模型</p>
 
     <nav class="nav" aria-label="主导航">
       <section v-for="group in groups" :key="group.title" class="nav-group">

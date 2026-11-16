@@ -342,7 +342,7 @@ jobs:
         with:
           tag_name: v${{ steps.ver.outputs.version }}
           release_name: WB Bridge v${{ steps.ver.outputs.version }}
-          body: WB Bridge — 让 WorkBuddy 使用 OpenCode 免费模型。
+          body: WB Bridge — 让各类 AI 工具连接多平台的免费与付费模型。
           draft: true
           prerelease: false
           generate_release_notes: true
@@ -428,7 +428,7 @@ jobs:
         with:
           tag_name: v${{ steps.ver.outputs.version }}
           release_name: WB Bridge v${{ steps.ver.outputs.version }}
-          body: WB Bridge — 让 WorkBuddy 使用 OpenCode 免费模型。
+          body: WB Bridge — 让各类 AI 工具连接多平台的免费与付费模型。
           draft: true
           prerelease: false
           generate_release_notes: true
@@ -519,7 +519,7 @@ jobs:
         with:
           tag_name: v${{ steps.ver.outputs.version }}
           release_name: WB Bridge v${{ steps.ver.outputs.version }}
-          body: WB Bridge — 让 WorkBuddy 使用 OpenCode 免费模型。
+          body: WB Bridge — 让各类 AI 工具连接多平台的免费与付费模型。
           draft: true
           prerelease: false
           generate_release_notes: true

@@ -183,7 +183,7 @@ onUnmounted(() => {
     </div>
 
     <p class="note">
-      · 模型名单与免费额度由上游 OpenCode 决定，本应用不控制、不缓存额度。<br>
+      · 模型名单与额度由各上游平台决定，本应用不控制、不缓存额度。<br>
       · 数据目录中保存 api-key、status.json 与运行日志；密钥不会出现在日志或状态里。
     </p>
   </section>

@@ -175,7 +175,7 @@ test('summarizeToolCall / toolCallPreview：Key 只以掩码形态出现', () =>
   assert.equal(JSON.stringify(preview).includes('1234567890abcd'), false)
 
   assert.equal(summarizeToolCall('probe_models', { model: 'opencode/big-pickle' }), '检测模型 opencode/big-pickle')
-  assert.equal(summarizeToolCall('probe_models', {}), '检测全部模型（消耗少量免费额度）')
+  assert.equal(summarizeToolCall('probe_models', {}), '检测全部模型（会消耗对应额度）')
   assert.equal(summarizeToolCall('restart_core'), '重启核心服务')
   assert.equal(summarizeToolCall('shutdown_core'), '停止核心服务（模型立即不可用）')
   assert.equal(summarizeToolCall('check_update', {}), '检查是否有新版本（不下载、不安装）')

@@ -540,7 +540,11 @@ fn owned_count(merged: &Value) -> u64 {
 }
 
 /// `models.filter(...).map(m => ({ id, name, vendor, url, apiKey, supportsToolCall, supportsImages,
-/// ...workBuddyReasoning(m), buddyBridgeOwner, maxInputTokens?, maxOutputTokens? }))`。
+/// supportsVideo?, ...workBuddyReasoning(m), buddyBridgeOwner, maxInputTokens?, maxOutputTokens? }))`。
+///
+/// `supportsVideo` 是条件键：只有模型真的声明视频输入（`backend.rs::models_in` 归一出的
+/// `video == true`）才写入——镜像 `paid` 的条件模式，无视频模型的输出键集保持不变，
+/// JS↔Rust 对拍夹具因此零影响。
 ///
 /// 键顺序必须与 JS 的对象字面量一致：`availableModels` 只比较集合，但整篇 `models.json`
 /// 会被逐字节对拍，键顺序不同即视为不一致。
@@ -559,6 +563,9 @@ fn model_entry(model: &Value, client_id: &str, endpoint: &str, key: &str) -> Val
         "supportsImages".to_string(),
         Value::Bool(matches!(model.get("images"), Some(Value::Bool(true)))),
     );
+    if matches!(model.get("video"), Some(Value::Bool(true))) {
+        entry.insert("supportsVideo".to_string(), Value::Bool(true));
+    }
     if let Value::Object(reasoning) = work_buddy_reasoning(model) {
         for (name, value) in reasoning {
             entry.insert(name, value);
@@ -585,14 +592,21 @@ fn model_entry(model: &Value, client_id: &str, endpoint: &str, key: &str) -> Val
 /// 1. `id` / `name` 逐字取 [`crate::auto::AUTO_MODEL_ID`]，**不经过** [`client_model_id`]——
 ///    插件发出去的 `model` 就是这里的 `id`，而 `server.rs` 的改写判定比对的也是这个字面量，
 ///    拼成 `OC · WB · auto` 就永远匹配不上。形态上它仍与逐模型条目的 `前缀 · 名称` 对齐。
-/// 2. 能力声明取**保守档**（用户裁定 2026-10-10）：`supportsImages` 恒 false（声明了就得承担
-///    「图片+工具档无候选→退全池→落到不支持视觉的模型」这种注定失败的组合），
-///    `supportsToolCall` 取 [`crate::auto::any_tool_capable`]，与核心选择器的档位谓词同源。
-/// 3. 不写 `workBuddyReasoning` 的推理档位、也不写 `maxOutputTokens`：这两个值随实际选中的模型
-///    而变，固定声明只会把某些模型的上游限制错误地套到另一些模型上。
-///    `maxInputTokens` 例外地写成**当轮发布集的最小值**——宁可少给，也不给一个会把小上下文
-///    模型顶爆的值。
+/// 2. 能力声明与核心选择器的档位谓词**同源**（2026-10-10 的保守档已于 2026-11-17 被用户推翻，
+///    `supportsImages` 不再恒 false）：`supportsToolCall` / `supportsImages` / `supportsVideo`
+///    分别取 [`crate::auto::any_tool_capable`] / [`crate::auto::any_image_capable`] /
+///    [`crate::auto::any_video_capable`]，推理档位取 [`crate::auto::auto_reasoning`] 的并集。
+///    声明域是 [`crate::auto::free_pool`] 剔除付费白名单条目后的**免费池**：`server.rs::chat()`
+///    改写 `WB · auto` 时只在免费池里选模型（数据红线 #6），付费独家的能力 / 档位若按全发布集
+///    声明，路由却永远选不出那个落点（DSH 侧的 `auto_levels` 也是同一口径）。选择器按请求
+///    携带的能力 / 档位过滤候选，因此如实声明后，插件声明的每一种组合在免费池里都至少有
+///    一个落点；候选层为空时退全池，判决交回 `prepare` 的既有 400。
+/// 3. 不写 `maxOutputTokens`：该值随实际选中的模型而变，固定声明只会把某些模型的上游限制
+///    错误地套到另一些模型上。
+///    `maxInputTokens` 例外地写成**当轮免费池的最小值**——宁可少给，也不给一个会把小上下文
+///    模型顶爆的值；免费池为空（发布集只剩付费条目）时该键缺省不写。
 fn auto_entry(models: &[Value], endpoint: &str, key: &str) -> Value {
+    let pool = crate::auto::free_pool(models);
     let name = Value::String(crate::auto::AUTO_MODEL_ID.to_string());
     let mut entry = Map::new();
     entry.insert("id".to_string(), name.clone());
@@ -602,17 +616,31 @@ fn auto_entry(models: &[Value], endpoint: &str, key: &str) -> Value {
     entry.insert("apiKey".to_string(), Value::String(key.to_string()));
     entry.insert(
         "supportsToolCall".to_string(),
-        Value::Bool(crate::auto::any_tool_capable(models)),
+        Value::Bool(crate::auto::any_tool_capable(&pool)),
     );
-    entry.insert("supportsImages".to_string(), Value::Bool(false));
+    entry.insert(
+        "supportsImages".to_string(),
+        Value::Bool(crate::auto::any_image_capable(&pool)),
+    );
+    entry.insert(
+        "supportsVideo".to_string(),
+        Value::Bool(crate::auto::any_video_capable(&pool)),
+    );
+    // 与 model_entry 展开逐模型 reasoning 声明的同法平铺：别名写的是免费池的并集形态。
+    if let Value::Object(reasoning) = crate::auto::auto_reasoning(&pool) {
+        for (name, value) in reasoning {
+            entry.insert(name, value);
+        }
+    }
     entry.insert("buddyBridgeOwner".to_string(), Value::String(OWNER.to_string()));
-    if let Some(tokens) = smallest_input(models) {
+    if let Some(tokens) = smallest_input(&pool) {
         entry.insert("maxInputTokens".to_string(), tokens);
     }
     Value::Object(entry)
 }
 
-/// 发布集里最小的 `input`（缺失时回落 `context`，与 [`model_entry`] 同一取法）。
+/// 给定候选域里最小的 `input`（缺失时回落 `context`，与 [`model_entry`] 同一取法）。
+/// 调用方（[`auto_entry`]）传的是免费池——统计域先按付费剔除、再在能接工具的候选上取最小值。
 ///
 /// 非数值、0、负数一律跳过：这些值在插件侧不是可用的上下文上限，写进去不如不写。
 /// 返回**原样克隆**的那个数，整数不会因为比较而变成 `128000.0`。
@@ -1594,12 +1622,18 @@ mod tests {
         assert_eq!(alias["url"], json!("http://127.0.0.1:41980/v1/chat/completions"));
         assert_eq!(alias["apiKey"], json!("secret"));
         assert_eq!(alias["supportsToolCall"], json!(true));
-        assert_eq!(alias["supportsImages"], json!(false), "保守档：绝不声明没有候选的能力");
+        assert_eq!(alias["supportsImages"], json!(false), "池里没有图片候选，就不声明图片能力");
+        assert_eq!(alias["supportsVideo"], json!(false), "池里没有视频候选，就不声明视频能力");
+        assert_eq!(
+            alias["supportsReasoning"],
+            json!(false),
+            "池里没有推理模型时只声明 supportsReasoning: false（与逐模型条目同形）"
+        );
         assert_eq!(alias["buddyBridgeOwner"], json!(OWNER));
         assert_eq!(alias["maxInputTokens"], json!(32_000), "取发布集里的最小上下文");
         assert!(
             alias.get("maxOutputTokens").is_none() && alias.get("reasoning").is_none(),
-            "随实际模型而变的值不做固定声明"
+            "随实际模型而变的值不做固定声明；没有推理模型时不展开 reasoning 块"
         );
         assert_eq!(
             alias.as_object().expect("键序").keys().collect::<Vec<_>>(),
@@ -1611,10 +1645,12 @@ mod tests {
                 "apiKey",
                 "supportsToolCall",
                 "supportsImages",
+                "supportsVideo",
+                "supportsReasoning",
                 "buddyBridgeOwner",
                 "maxInputTokens"
             ],
-            "键序与 model_entry 同形，整篇 models.json 的文本才稳定"
+            "键序与 model_entry 同形（supportsVideo 之后平铺推理声明），整篇 models.json 的文本才稳定"
         );
     }
 
@@ -1644,6 +1680,230 @@ mod tests {
         let merged = merge_auto(&json!([]), &one_can);
         let alias = &merged.as_array().expect("数组")[2];
         assert_eq!(alias["supportsToolCall"], json!(true));
+    }
+
+    // 🔴 数据红线 #6 的对齐：别名的能力声明必须算在**免费池**上——`server.rs::chat()` 改写
+    // `WB · auto` 时只在 `free_pool` 里选模型，付费白名单条目永不入选（与 DSH 的 `auto_levels`
+    // 同口径）。付费模型是唯一可接工具的模型时按全发布集声明 true，路由却永远选不出工具模型。
+    #[test]
+    fn the_alias_declares_its_capabilities_over_the_free_pool_only() {
+        // 付费条目既是最小上下文也是唯一工具候选：别名不得沾它的光。
+        let paid_only_tools = vec![
+            json!({ "id": "vendor/paid", "name": "paid", "input": 8_192, "toolcall": true, "paid": true }),
+            json!({ "id": "vendor/free", "name": "free", "input": 32_000 }),
+        ];
+        let merged = merge_auto(&json!([]), &paid_only_tools);
+        let alias = &merged.as_array().expect("数组")[2];
+        assert_eq!(
+            alias["supportsToolCall"],
+            json!(false),
+            "免费池里没有工具候选，别名就不声明工具能力"
+        );
+        assert_eq!(
+            alias["maxInputTokens"],
+            json!(32_000),
+            "上下文下限也不被付费模型拉低：免费池的候选里取最小值"
+        );
+
+        // 对照组：同一条目转为免费（无 paid 键）后，别名如实声明 true，且下限取它（8192）。
+        let paid_turned_free = vec![
+            json!({ "id": "vendor/paid", "name": "paid", "input": 8_192, "toolcall": true }),
+            json!({ "id": "vendor/free", "name": "free", "input": 32_000 }),
+        ];
+        let merged = merge_auto(&json!([]), &paid_turned_free);
+        let alias = &merged.as_array().expect("数组")[2];
+        assert_eq!(alias["supportsToolCall"], json!(true));
+        assert_eq!(alias["maxInputTokens"], json!(8_192));
+    }
+
+    // 发布集只剩付费条目（免费池为空）时别名仍写入——与 DSH `route_models` 的口径一致，
+    // 但能力声明必须保守：免费池上选不出任何模型，true 只会给出一个恒定失败的入口。
+    #[test]
+    fn a_paid_only_publish_set_still_writes_a_conservative_alias() {
+        let paid = vec![json!({
+            "id": "vendor/paid",
+            "name": "paid",
+            "input": 8_192,
+            "toolcall": true,
+            "images": true,
+            "video": true,
+            "reasoning": true,
+            "variants": { "max": { "reasoningEffort": "max" } },
+            "paid": true,
+        })];
+        let merged = merge_auto(&json!([]), &paid);
+        let items = merged.as_array().expect("数组");
+        assert_eq!(items.len(), 2, "付费条目照常发布（用户白名单授权），别名照常出现");
+        let alias = &items[1];
+        assert_eq!(alias["id"], json!(crate::auto::AUTO_MODEL_ID));
+        assert_eq!(alias["supportsToolCall"], json!(false));
+        assert_eq!(alias["supportsImages"], json!(false), "免费池为空时不声明图片能力");
+        assert_eq!(alias["supportsVideo"], json!(false), "免费池为空时不声明视频能力");
+        assert_eq!(
+            alias["supportsReasoning"],
+            json!(false),
+            "免费池为空时没有推理档位可并（付费模型独有档不得进来）"
+        );
+        assert!(alias.get("reasoning").is_none(), "不展开 reasoning 块");
+        assert!(
+            alias.get("maxInputTokens").is_none(),
+            "免费池为空时没有可统计的候选，上下文键缺省不写"
+        );
+    }
+
+    // 🔴 别名的视觉声明按**免费池**如实点亮：付费独家的视觉/视频模型不得为别名背书
+    // （server.rs::chat() 改写 WB · auto 时只在 free_pool 里选模型，数据红线 #6）。
+    #[test]
+    fn the_alias_declares_vision_and_video_over_the_free_pool_only() {
+        // 付费条目是唯一的视觉/视频模型：别名不得沾它的光。
+        let paid_only_vision = vec![
+            json!({ "id": "vendor/paid", "name": "paid", "images": true, "video": true, "paid": true }),
+            json!({ "id": "vendor/free", "name": "free" }),
+        ];
+        let merged = merge_auto(&json!([]), &paid_only_vision);
+        let alias = &merged.as_array().expect("数组")[2];
+        assert_eq!(alias["supportsImages"], json!(false), "图片候选只在付费条目上，不点亮");
+        assert_eq!(alias["supportsVideo"], json!(false), "视频候选只在付费条目上，不点亮");
+
+        // 对照组：同一条目转为免费（无 paid 键）后，别名如实声明 true。
+        let turned_free = vec![
+            json!({ "id": "vendor/paid", "name": "paid", "images": true, "video": true }),
+            json!({ "id": "vendor/free", "name": "free" }),
+        ];
+        let merged = merge_auto(&json!([]), &turned_free);
+        let alias = &merged.as_array().expect("数组")[2];
+        assert_eq!(alias["supportsImages"], json!(true));
+        assert_eq!(alias["supportsVideo"], json!(true));
+    }
+
+    // 🔴 免费池只有 chatOnly 条目（无 images/video 声明）时，别名不得声明视觉能力：
+    // 路由的图片/视频档虽放行 chatOnly（旧真值表冻结的行为），prepare 随后必判 400
+    // unsupported_content——声明了却没有落点。any_image_capable/any_video_capable
+    // 因此按 prepare 的闸门（声明位）统计，不走 chatOnly 短路。
+    #[test]
+    fn the_alias_does_not_declare_vision_for_a_chat_only_pool() {
+        let chat = vec![
+            json!({ "id": "vendor/a", "name": "a", "chatOnly": true }),
+            json!({ "id": "vendor/b", "name": "b", "chatOnly": true, "images": false, "video": false }),
+        ];
+        let merged = merge_auto(&json!([]), &chat);
+        let alias = &merged.as_array().expect("数组")[2];
+        assert_eq!(alias["id"], json!(crate::auto::AUTO_MODEL_ID));
+        assert_eq!(alias["supportsToolCall"], json!(false), "工具维度本就诚实");
+        assert_eq!(alias["supportsImages"], json!(false), "chatOnly 短路不得把图片声明成 true");
+        assert_eq!(alias["supportsVideo"], json!(false), "chatOnly 短路不得把视频声明成 true");
+    }
+
+    // 🔴 别名的推理声明是免费池的**并集**：付费独有档不进（DSH 的 auto_levels 同口径）。
+    #[test]
+    fn the_alias_reasoning_union_excludes_paid_only_levels() {
+        let pool = vec![
+            json!({ "id": "vendor/free", "name": "free", "reasoning": true,
+                    "variants": { "low": { "reasoningEffort": "low" }, "high": { "reasoningEffort": "high" } } }),
+            json!({ "id": "vendor/paid", "name": "paid", "reasoning": true, "paid": true,
+                    "variants": { "max": { "reasoningEffort": "max" } } }),
+        ];
+        let merged = merge_auto(&json!([]), &pool);
+        let alias = &merged.as_array().expect("数组")[2];
+        assert_eq!(
+            alias["supportsReasoning"],
+            json!(true),
+            "免费池里有推理模型，别名如实声明"
+        );
+        assert_eq!(
+            alias["onlyReasoning"],
+            json!(true),
+            "并集（low/high）不含 none → 只推理；与同池逐模型条目的 onlyReasoning 同式"
+        );
+        assert_eq!(
+            alias["reasoning"]["supportedEfforts"],
+            json!(["low", "high"]),
+            "max 只在付费模型上，不得进并集"
+        );
+        assert_eq!(
+            alias["reasoning"]["canDisableThinking"],
+            json!(false),
+            "并集不含 none 就不能声明可关思考"
+        );
+        assert_eq!(alias["reasoning"]["defaultEffort"], json!("low"), "没有 medium 时取首个非 none 档");
+
+        // 逐模型条目仍按各自 variant 声明档位（用户手动选中时可用）。
+        let paid_entry = &merged.as_array().expect("数组")[1];
+        assert_eq!(paid_entry["reasoning"]["supportedEfforts"], json!(["max"]));
+    }
+
+    // supportsVideo 是逐模型条目的**条件键**：只有模型真的声明视频输入才写入，
+    // 无视频模型的键集与之前逐字节一致（对拍夹具零影响）。
+    #[test]
+    fn model_entry_writes_supports_video_only_when_declared() {
+        let document = json!([]);
+        let merged = merge_models(
+            &document,
+            &[json!({ "id": "vendor/v", "name": "v", "video": true }), model("plain")],
+            "http://e",
+            "k",
+            false,
+            DocumentShape::Preserve,
+        )
+        .expect("合并");
+        let items = merged.as_array().expect("数组");
+        let with_video = &items[0];
+        assert_eq!(with_video["id"], json!("OC · v"));
+        assert_eq!(with_video["supportsVideo"], json!(true));
+        assert_eq!(
+            with_video.as_object().expect("键序").keys().collect::<Vec<_>>(),
+            vec![
+                "id",
+                "name",
+                "vendor",
+                "url",
+                "apiKey",
+                "supportsToolCall",
+                "supportsImages",
+                "supportsVideo",
+                "supportsReasoning",
+                "buddyBridgeOwner"
+            ],
+            "supportsVideo 紧随 supportsImages 之后，键序与 JS 字面量同形"
+        );
+
+        let plain = &items[1];
+        assert_eq!(plain["id"], json!("OC · plain"));
+        assert!(
+            plain.get("supportsVideo").is_none(),
+            "未声明视频的模型不写该键"
+        );
+    }
+
+    // 生产路径就是「CodeBuddy 形态 × auto_route」的组合：别名要落进 `{ "models": […] }`
+    // 的末位，且与 Preserve 形态一样幂等（对拍夹具不覆盖该组合，这里由单测钉住）。
+    #[test]
+    fn a_codebuddy_shaped_auto_route_puts_the_alias_inside_the_models_object() {
+        let document = json!({ "models": [{ "id": "mine", "name": "手动条目" }] });
+        let merged = merge_models_auto(
+            &document,
+            &pool(&[32_000], true),
+            "http://127.0.0.1:41980/v1/chat/completions",
+            "secret",
+            true,
+            DocumentShape::ModelsObject,
+        )
+        .expect("合并成功");
+        let items = merged["models"].as_array().expect("数组");
+        assert_eq!(items.len(), 3, "手动条目 + 一条模型 + 一条别名");
+        assert_eq!(items[2]["id"], json!(crate::auto::AUTO_MODEL_ID), "别名在末位");
+        assert_eq!(items[0]["id"], json!("mine"), "手动条目原样保留");
+
+        let again = merge_models_auto(
+            &merged,
+            &pool(&[32_000], true),
+            "http://127.0.0.1:41980/v1/chat/completions",
+            "secret",
+            true,
+            DocumentShape::ModelsObject,
+        )
+        .expect("二次合并");
+        assert_eq!(again, merged, "CodeBuddy 形态下别名合并同样幂等");
     }
 
     #[test]

@@ -262,7 +262,7 @@ const probeProgress = computed(() => {
 // 除检测外都不写进度数字 —— 其余动作前端拿不到真实进度，写数字就是编造。
 const pendingText = computed(() => {
   if (busyAction.value === 'refresh') return '正在读取免费模型，请稍候…'
-  if (busyAction.value === 'import') return '正在写入 WorkBuddy / CodeBuddy 配置…'
+  if (busyAction.value === 'import') return '正在写入 WorkBuddy / CodeBuddy / DSH 配置…'
   if (busyAction.value === 'restart') return '正在重启核心服务…'
   if (busyAction.value === 'system-proxy') return '正在应用系统代理设置…'
   if (busyAction.value === 'remove-model') return '正在移除模型（此后不再检测、不再发布）…'
@@ -274,7 +274,7 @@ const pendingText = computed(() => {
   }
   if (busyAction.value === 'probe' || state.value.probe?.running) {
     const progress = probeProgress.value ? `（${probeProgress.value}）` : ''
-    return `正在逐个检测模型${progress}，会向每个模型发送一次简短请求（消耗少量免费额度）…`
+    return `正在逐个检测模型${progress}，会向每个模型发送一次简短请求（免费模型消耗免费额度、付费模型按平台标价计费）…`
   }
   return ''
 })
@@ -290,6 +290,8 @@ const banner = computed(() => {
 const syncSummary = computed(() => {
   const sync = state.value.sync
   if (sync?.error) return sync.error
+  // BUDDY_NO_SYNC=1 的跳过不是成功：count 是本轮发现的模型数，写成「已导入」就是编造写入。
+  if (sync?.skipped) return `已按 BUDDY_NO_SYNC 跳过本轮写入（发现 ${sync.count ?? 0} 个模型）`
   if (sync?.time) return `已导入 ${sync.count ?? 0} 个模型（写入所有检测到的插件）· 再次检测后需点击导入更新`
   return '首次读取和检测完成后自动写入所有检测到的插件'
 })
@@ -342,8 +344,8 @@ onUnmounted(() => {
       <div v-if="view === 'models'" class="top">
         <header>
           <div>
-            <h2>免费模型</h2>
-            <p class="subtitle">自动发现，保留每一个模型的状态。</p>
+            <h2>模型</h2>
+            <p class="subtitle">自动发现免费模型与白名单付费模型，保留每一个模型的状态。</p>
           </div>
           <div class="actions">
             <button
@@ -453,7 +455,7 @@ onUnmounted(() => {
 
       <footer v-if="view === 'models' && !binOpen">
         <p id="sync">{{ syncSummary }}</p>
-        <p class="note">打开应用默认沿用上次检测的模型与结果（不再每次重跑一遍探测），点「读取免费模型」才会重新获取并逐个检测，检测会向每个模型发送一次简短请求、消耗少量免费额度。耗时为完整请求用时，非首字延迟。不可用模型仅在本窗口保留，不供任何插件使用；剩余额度暂不可查询。</p>
+        <p class="note">打开应用默认沿用上次检测的模型与结果（不再每次重跑一遍探测），点「读取免费模型」才会重新获取并逐个检测，检测会向每个模型发送一次简短请求、消耗对应额度（免费模型耗免费额度、付费白名单模型按标价计费）。耗时为完整请求用时，非首字延迟。不可用模型仅在本窗口保留，不供任何插件使用；剩余额度暂不可查询。</p>
       </footer>
 
       <!-- 模型回收站：独立面板（填满主区、不被侧栏菜单占用），恢复后立即单检一次 -->

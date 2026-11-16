@@ -80,6 +80,11 @@ const targetRows = computed(() => {
         <dt>最近一次发布</dt>
         <dd>
           <template v-if="sync?.error"><span class="error-text">{{ sync.error }}</span></template>
+          <!-- BUDDY_NO_SYNC=1 跳过的是「写入」而不是「发现」：count 是本轮发现的模型数，
+               不能渲染成「已写入」，否则环境变量开着的时候面板永远显示成功。 -->
+          <template v-else-if="sync?.skipped">
+            已按 BUDDY_NO_SYNC 跳过本轮写入（发现 {{ sync.count ?? 0 }} 个模型） · {{ new Date(sync.time).toLocaleString() }}
+          </template>
           <template v-else-if="sync?.time">
             已写入 {{ sync.count ?? 0 }} 个可用模型 · {{ new Date(sync.time).toLocaleString() }}
           </template>
@@ -91,7 +96,8 @@ const targetRows = computed(() => {
         <dd>
           <template v-if="!targets || !targets[row.key]">未上报</template>
           <template v-else-if="targets[row.key].status === 'ok'">
-            已写入 {{ targets[row.key].count ?? 0 }} 个<template v-if="row.key === 'dsh' && targets[row.key].profiles">（{{ targets[row.key].profiles }} 个 profile）</template><template v-if="!targets[row.key].changed">（无变化）</template>
+            已写入 {{ targets[row.key].count ?? 0 }} 个<template v-if="row.key === 'dsh' && targets[row.key].profiles">（{{ targets[row.key].profiles }} 个 profile）</template><template v-if="!targets[row.key].changed">（无变化）</template><!-- DSH 多 profile 时部分失败仍是 ok：原因必须就地可见，而不是只留在 status.json -->
+            <template v-if="targets[row.key].error"> <span class="error-text">{{ targets[row.key].error }}</span></template>
           </template>
           <template v-else-if="targets[row.key].status === 'missing'">
             <span class="muted-text">未检测到{{ row.file ? '（路径已定位但未通过校验）' : '' }}：{{ targets[row.key].reason }}</span>

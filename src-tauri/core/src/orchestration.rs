@@ -1856,7 +1856,7 @@ async fn refresh(
                     // 定向读取：目录、结果、面板列表都原样留着，只把这一家的条目换成新的。
                     // 不动 phase（全量读取才用「正在读取」把列表清空）。
                     update_and_persist(json!({
-                        "message": format!("正在重新读取 {} 的免费模型…", scope.labels())
+                        "message": format!("正在重新读取 {} 的模型…", scope.labels())
                     }));
                 }
                 run_refresh(restart_runtime, enabled, proxy_env, &scope, &retained).await
@@ -2020,7 +2020,7 @@ async fn run_refresh(
     *lock(&app.models) = merged.clone();
     let mut patch = json!({
         "phase": "ready",
-        "message": format!("运行中 · {} 个免费模型", merged.len())
+        "message": format!("运行中 · {} 个模型", merged.len())
     });
     if scope != &Scope::All {
         // 全量读取的列表由随后的逐个揭示填（`start_probes(reveal = true)`）；定向读取不走那条路径，
@@ -2617,7 +2617,7 @@ async fn startup_sequence(app: &App) -> Result<String, BackendError> {
         ));
         update_and_persist(json!({
             "phase": "ready",
-            "message": format!("运行中 · {} 个免费模型（沿用上次检测结果）", usable.len()),
+            "message": format!("运行中 · {} 个模型（沿用上次检测结果）", usable.len()),
             "availableModels": ids,
         }));
         // 空集闸门照常生效：沿用判定要求至少一个通过，这里不会因空集被拒。

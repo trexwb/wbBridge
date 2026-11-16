@@ -168,6 +168,11 @@ pub fn models_in(
                 "images".to_string(),
                 json!(nested(model, &["capabilities", "input", "image"]) == Some(&json!(true))),
             );
+            // 与 images 同源同形态：OpenCode 目录里 `capabilities.input.video` 为 true 才声明视频输入。
+            entry.insert(
+                "video".to_string(),
+                json!(nested(model, &["capabilities", "input", "video"]) == Some(&json!(true))),
+            );
             insert_defined(&mut entry, "output", nested(model, &["limit", "output"]));
             entry.insert(
                 "toolcall".to_string(),
@@ -1515,6 +1520,8 @@ impl Backend {
         }
         let mut parts = vec![json!({ "type": "text", "text": request.text() })];
         parts.extend(request.images().iter().cloned());
+        // 视频沿用 {type:"file"} 的既有 part 通道（不新增 part 形态），排在图片之后。
+        parts.extend(request.videos().iter().cloned());
         payload.insert("parts".to_string(), json!(parts));
         let mut payload = Value::Object(payload);
 
@@ -2245,6 +2252,9 @@ mod tests {
         permission_hits: AtomicUsize,
         abort_hits: AtomicUsize,
         delete_hits: AtomicUsize,
+        /// `POST /session/:id/message` 的请求体：parts 顺序（text→images→videos）是对上游的
+        /// wire 契约，由测试逐项钉住。
+        bodies: Mutex<Vec<Value>>,
     }
 
     async fn mock_handler(
@@ -2276,6 +2286,13 @@ mod tests {
             return axum::Json(json!(true)).into_response();
         }
         if method == axum::http::Method::POST && path.ends_with("/message") {
+            // 捕获请求体（wire 契约测试用）：短暂的锁内不做任何 await，持锁跨 await 不会发生。
+            let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                .await
+                .unwrap_or_default();
+            if let Ok(body) = serde_json::from_slice::<Value>(&bytes) {
+                lock(&state.bodies).push(body);
+            }
             if state.hang {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
                 return axum::Json(json!({})).into_response();
@@ -2325,6 +2342,7 @@ mod tests {
             permission_hits: AtomicUsize::new(0),
             abort_hits: AtomicUsize::new(0),
             delete_hits: AtomicUsize::new(0),
+            bodies: Mutex::new(Vec::new()),
         });
         let app = axum::Router::new()
             .fallback(axum::routing::any(mock_handler))
