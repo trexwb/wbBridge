@@ -16,8 +16,12 @@
 //! 3. 图片与工具混合请求单列一档：`prepare` 的两个闸门（图片 → 400 `unsupported_content`，
 //!    chatOnly 带 tools → 400 `tools_not_supported`）都是**服务端本地拒绝**，选错档位会让
 //!    「带截图 + 带工具定义」这种常见 agent 请求注定 400。
+//! 4. 带推理档位的请求再叠一层档位过滤（[`accepts_effort`]，与 `prepare` 的
+//!    `unsupported_reasoning_effort` 判决同源）：DSH 里选中的档位随请求进来，自动路由若落到
+//!    没有该 variant 的模型上，就是一个注定 400 的落点。
 
-use crate::protocol::random_uuid;
+use crate::protocol::{random_uuid, DEFAULT_EFFORTS};
+use crate::reasoning::reasoning_efforts;
 use serde_json::{json, Value};
 
 /// 对外暴露的唯一字面量：客户端把 `model` 配成它即可获得自动路由。
@@ -166,7 +170,35 @@ pub fn free_pool(models: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// 按请求内容筛出候选集（能力档位，见模块头注释第 3 条）。候选层为空时退回全池。
+/// 请求携带的推理档位：`reasoning_effort` 优先，其次 OpenAI 的嵌套 `reasoning.effort`。
+/// null 与非字符串一律视为未携带——与 `protocol::prepare` 的取读同形态（那边把「携带但非法」
+/// 判成 400，这里只是不做档位过滤、把判决交回去）。
+pub fn requested_effort(body: &Value) -> Option<&str> {
+    body.get("reasoning_effort")
+        .filter(|value| !value.is_null())
+        .or_else(|| {
+            body.get("reasoning")
+                .and_then(|reasoning| reasoning.get("effort"))
+                .filter(|value| !value.is_null())
+        })
+        .and_then(Value::as_str)
+}
+
+/// 模型能否接住该档位——镜像 `protocol::prepare` 的三条判决：必须声明 `reasoning`；
+/// 有 variant 时只认 variant 覆盖的档位；没有 variant 的固定推理模型认
+/// [`DEFAULT_EFFORTS`]（WorkBuddy 对这类模型固定带 high 兜底，走的正是这条免除路径）。
+fn accepts_effort(model: &Value, effort: &str) -> bool {
+    if !flag(model, "reasoning") {
+        return false;
+    }
+    let efforts = reasoning_efforts(model);
+    if efforts.contains_key(effort) {
+        return true;
+    }
+    efforts.is_empty() && DEFAULT_EFFORTS.contains(&effort)
+}
+
+/// 按请求内容筛出候选集（能力档位与推理档位，见模块头注释第 3、4 条）。候选层为空时退回全池。
 fn candidates<'a>(body: &Value, pool: &'a [Value]) -> Vec<&'a Value> {
     let messages: &[Value] = body
         .get("messages")
@@ -175,10 +207,12 @@ fn candidates<'a>(body: &Value, pool: &'a [Value]) -> Vec<&'a Value> {
         .unwrap_or(&[]);
     let images = has_images(messages);
     let tools = has_tools(body);
+    let effort = requested_effort(body);
 
     let matching: Vec<&Value> = pool
         .iter()
         .filter(|model| fits(model, images, tools))
+        .filter(|model| effort.is_none_or(|name| accepts_effort(model, name)))
         .collect();
     // 退全池而非「报一个专用错误」：与用户手动选到能力不匹配的模型时的行为保持一致。
     if matching.is_empty() {
@@ -384,6 +418,128 @@ mod tests {
         });
         assert_eq!(seen, Some(1), "唯一候选也要走选择器（len=1），与多候选同一条路径");
         assert_eq!(got.as_deref(), Some("opencode/all"));
+    }
+
+    /// 带 variant 的推理模型：`levels` 即它真正能服务的档位。
+    fn reasoning_entry(id: &str, levels: &[&str]) -> Value {
+        let variants = levels
+            .iter()
+            .map(|level| (level.to_string(), json!({ "reasoningEffort": level })))
+            .collect::<serde_json::Map<_, _>>();
+        json!({
+            "id": id,
+            "images": false,
+            "toolcall": false,
+            "chatOnly": false,
+            "reasoning": true,
+            "variants": variants,
+        })
+    }
+
+    fn effort_pool() -> Vec<Value> {
+        vec![
+            entry("opencode/plain", false, false, false),
+            reasoning_entry("opencode/low", &["low"]),
+            reasoning_entry("opencode/high", &["high"]),
+        ]
+    }
+
+    #[test]
+    fn a_requested_effort_only_considers_models_that_can_serve_it() {
+        let mut request = body(AUTO_MODEL_ID, json!("hi"), Value::Null);
+        request["reasoning_effort"] = json!("high");
+        assert_eq!(
+            select_with(&request, &effort_pool(), first).as_deref(),
+            Some("opencode/high"),
+            "档位过滤后只剩能服务 high 的模型，普通模型与别的档位都不得入选"
+        );
+        request["reasoning_effort"] = json!("low");
+        assert_eq!(select_with(&request, &effort_pool(), first).as_deref(), Some("opencode/low"));
+    }
+
+    #[test]
+    fn nested_reasoning_effort_is_read_like_the_top_level_field() {
+        assert_eq!(requested_effort(&json!({ "reasoning_effort": "high" })), Some("high"));
+        assert_eq!(requested_effort(&json!({ "reasoning": { "effort": "low" } })), Some("low"));
+        assert_eq!(requested_effort(&json!({ "reasoning_effort": null })), None);
+        assert_eq!(requested_effort(&json!({ "reasoning": { "effort": null } })), None);
+        assert_eq!(requested_effort(&json!({ "reasoning_effort": 3 })), None, "非字符串不参与过滤");
+
+        let mut request = body(AUTO_MODEL_ID, json!("hi"), Value::Null);
+        request["reasoning"] = json!({ "effort": "low" });
+        assert_eq!(select_with(&request, &effort_pool(), first).as_deref(), Some("opencode/low"));
+    }
+
+    #[test]
+    fn an_effort_no_model_serves_falls_back_to_the_whole_pool() {
+        let mut request = body(AUTO_MODEL_ID, json!("hi"), Value::Null);
+        request["reasoning_effort"] = json!("xhigh");
+        let mut domain = None;
+        let _ = select_with(&request, &effort_pool(), |n| {
+            domain = Some(n);
+            Some(0)
+        });
+        assert_eq!(domain, Some(3), "档位层为空时退全池，判决交回 prepare（与能力层同一条规矩）");
+    }
+
+    #[test]
+    fn fixed_reasoning_models_serve_the_default_efforts_only() {
+        let fixed = json!({
+            "id": "opencode/fixed",
+            "images": false,
+            "toolcall": false,
+            "chatOnly": false,
+            "reasoning": true,
+            "variants": {},
+        });
+        let pool = vec![entry("opencode/plain", false, false, false), fixed];
+        let mut request = body(AUTO_MODEL_ID, json!("hi"), Value::Null);
+        request["reasoning_effort"] = json!("high");
+        assert_eq!(
+            select_with(&request, &pool, first).as_deref(),
+            Some("opencode/fixed"),
+            "固定推理模型在 prepare 里认 DEFAULT_EFFORTS，路由必须让它入选"
+        );
+        request["reasoning_effort"] = json!("none");
+        let mut domain = None;
+        let _ = select_with(&request, &pool, |n| {
+            domain = Some(n);
+            Some(0)
+        });
+        assert_eq!(domain, Some(2), "none 不在 DEFAULT_EFFORTS 里：固定推理模型接不住，退全池");
+    }
+
+    #[test]
+    fn effort_and_capability_tiers_intersect() {
+        let pool = vec![
+            json!({
+                "id": "opencode/tools-low",
+                "images": false,
+                "toolcall": true,
+                "chatOnly": false,
+                "reasoning": true,
+                "variants": { "low": { "reasoningEffort": "low" } },
+            }),
+            json!({
+                "id": "opencode/tools-high",
+                "images": false,
+                "toolcall": true,
+                "chatOnly": false,
+                "reasoning": true,
+                "variants": { "high": { "reasoningEffort": "high" } },
+            }),
+        ];
+        let mut request = body(
+            AUTO_MODEL_ID,
+            json!("用工具"),
+            json!([{ "type": "function", "function": { "name": "run" } }]),
+        );
+        request["reasoning_effort"] = json!("high");
+        assert_eq!(
+            select_with(&request, &pool, first).as_deref(),
+            Some("opencode/tools-high"),
+            "能力层与档位层必须同时满足"
+        );
     }
 
     #[test]

@@ -153,7 +153,9 @@ const IMAGE_INSTRUCTIONS: &str = "\nImages are attached separately. Match each a
 
 const CHAT_ONLY_SYSTEM: &str = "Continue the conversation provided as JSON. Reply in plain text. You have no tools. Do not invoke native tools or claim to execute actions. If an action is requested, explain that this model supports chat only.";
 
-const DEFAULT_EFFORTS: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+/// 固定推理模型（`reasoning: true` 且没有 variant）能接受的档位；`auto.rs` 的候选过滤
+/// 必须与这里的判决同源，否则自动路由会把带档位的请求交给注定 400 的模型。
+pub(crate) const DEFAULT_EFFORTS: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
 
 const MESSAGE_ROLES: [&str; 5] = ["system", "developer", "user", "assistant", "tool"];
 

@@ -54,7 +54,7 @@ wbbridge-core —— WB Bridge 核心代理（Rust 实现）
   BUDDY_PORT          监听端口（默认 41980，范围 1024–65535）
   BUDDY_DATA_DIR      数据目录（默认按平台推导）
   BUDDY_MODELS_FILE   WorkBuddy models.json 路径覆盖
-  BUDDY_NO_SYNC=1     跳过启动导入与后续同步
+  BUDDY_NO_SYNC=1     跳过启动导入与模型发布（关停等用户意图的清空照常执行）
   BUDDY_PARENT_PID    父进程 pid；父进程消失时本进程自行关停
   BUDDY_OPENCODE_PATH 首选 OpenCode 可执行文件路径";
 
@@ -574,9 +574,10 @@ fn restored_removed_models(settings: &Value) -> Vec<String> {
 
 /// 用户显式放行的付费模型（`settings.json` 的 `paidModels`）。
 ///
-/// 白名单元素必须是 `<注册表平台 id>/<模型 key>`：注册表之外的命名空间（尤其 `opencode`）
-/// 一律丢弃——白名单的语义是「用户点名要为这家平台上的这个模型付费」，而 `opencode`
-/// 是本机已登录账号的目录、没有本工具管理的平台 Key，放行它只会绕过价格闸门而不产生任何收益。
+/// 白名单元素必须是 `<可注入的注册表平台 id>/<模型 key>`：其余命名空间（尤其 `opencode`——
+/// 它虽已登记为免密平台，但只上「平台」页、不注入，发现路径固定只收免费）一律丢弃——
+/// 白名单的语义是「用户点名要为这家平台上的这个模型付费」，而 `opencode` 是本机已登录账号的
+/// 目录、没有本工具管理的平台 Key，放行它只会绕过价格闸门而不产生任何收益。
 /// 上限 64 条 / 每条 200 字符：`settings.json` 是用户可见的普通文件，坏数据不能让启动失败。
 fn restored_paid_models(settings: &Value) -> Vec<String> {
     let mut ids: Vec<String> = settings
@@ -597,13 +598,17 @@ fn restored_paid_models(settings: &Value) -> Vec<String> {
 
 /// 单个白名单条目的归一：去首尾空白（面板输入框粘贴常带空白），校验形态与平台已注册。
 /// 模型 key 内部空格原样保留——全限定 id 是上游 key 拼出来的，改一个字节就永远匹配不上。
+///
+/// 只认**可注入**的注册表平台：`opencode` 虽然也上了「平台」页（免密内建命名空间），
+/// 但它的发现路径固定「只收免费」（`free_models` 不带白名单），放行它只会让白名单里
+/// 躺着一条永远不会生效的条目。
 fn normalize_paid_model(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty() || value.chars().count() > MAX_PAID_MODEL_CHARS {
         return None;
     }
     let (namespace, model) = value.split_once('/')?;
-    if model.is_empty() || providers::find(namespace).is_none() {
+    if model.is_empty() || !providers::find(namespace).is_some_and(|provider| provider.injected()) {
         return None;
     }
     Some(value.to_string())
@@ -847,8 +852,16 @@ fn rejects_publication_while_stopping(stopping: bool, models: &[Value]) -> bool 
     stopping && !models.is_empty()
 }
 
+/// `BUDDY_NO_SYNC=1` 只跳过**非空**发布；空集是用户意图的清空（关停、启动清旧、换配置、
+/// 移除最后一个模型），必须照常落盘。否则关停后 WorkBuddy / CodeBuddy / DSH 里上一轮写下的
+/// 条目会一直指向已停掉的端点，而这条路正是 `NO_SYNC` 唯一不能省掉的一次写入。
+fn skips_sync_when_disabled(no_sync: bool, models: &[Value]) -> bool {
+    no_sync && !models.is_empty()
+}
+
 /// `syncPublished(published, allowEmpty)`：把发布集串行写入所有已检测到的插件配置 —— WorkBuddy 与
-/// CodeBuddy 的 `models.json`；未检测到的目标在 `sync.targets` 里报 `missing` 及原因。
+/// CodeBuddy 的 `models.json`，以及 DSH 的 profile 用户 patch；未检测到的目标在 `sync.targets`
+/// 里报 `missing` 及原因。
 ///
 /// `published = None` 表示按 `usableModels()` 取值（与 JS 默认参数一致）。
 ///
@@ -865,7 +878,8 @@ fn sync_published(published: Option<Vec<Value>>, allow_empty: bool) {
     let endpoint = format!("{}/chat/completions", app.endpoint);
     let key = app.bridge_key.to_string();
 
-    if env_text("BUDDY_NO_SYNC").as_deref() == Some("1") {
+    let no_sync = env_text("BUDDY_NO_SYNC").as_deref() == Some("1");
+    if skips_sync_when_disabled(no_sync, &models) {
         let count = models.len() as u64;
         chain_sync(async move {
             update_and_persist(json!({
@@ -897,7 +911,12 @@ fn sync_published(published: Option<Vec<Value>>, allow_empty: bool) {
     // 双目标分发：对每个已定位的目标各写一次（同一份发布集、同一套幂等合并），未检测到的
     // 目标报 missing 及原因；聚合形状（count 之和、顶层 error 仅在全部定位目标失败时出现）
     // 见 targets.rs::aggregate_sync。逐目标串行 await，写入本身在 spawn_blocking 里。
+    // DSH 不是 models.json 目标：它由 dsh.rs 改 profile 用户 patch 的 `id: llm-pi-ai` 行，
+    // 报告形状与 aggregate_sync 的逐目标条目一致，这里合并进同一份 `sync.targets`。
     let files = vec![app.workbuddy_models_file(), app.codebuddy_models_file()];
+    let dsh_env: Env = std::env::vars().collect();
+    let dsh_home = crate::platform::home_directory();
+    let dsh_base = app.endpoint.to_string();
     chain_sync(async move {
         let mut outcomes: Vec<(Target, Option<Result<crate::sync::SyncOutcome, String>>)> =
             Vec::with_capacity(Target::ALL.len());
@@ -929,9 +948,36 @@ fn sync_published(published: Option<Vec<Value>>, allow_empty: bool) {
             .and_then(|inner| inner.map_err(|error| error.message));
             outcomes.push((target, Some(result)));
         }
+        let dsh_models = models.clone();
+        let dsh_key = key.clone();
+        let dsh_task = tokio::task::spawn_blocking(move || {
+            let patches = crate::dsh::discover_patches(&dsh_env, &dsh_home);
+            let report = crate::dsh::sync_all(&dsh_env, &dsh_home, &dsh_base, &dsh_key, &dsh_models);
+            (patches, report)
+        });
+        let (dsh_patches, dsh_report) = dsh_task.await.unwrap_or_else(|error| {
+            (
+                Vec::new(),
+                json!({ "status": "error", "error": error.to_string() }),
+            )
+        });
         let mut sync = aggregate_sync(outcomes).as_object().cloned().unwrap_or_default();
+        // DSH 记入同一份聚合：未检测到只标 missing，不算失败、不产生顶层 error（与插件目标
+        // 口径一致）；有写入时把顶层 changed 置真（否则「配置已是最新」会漏报 DSH 的更新）。
+        // 顶层 count 刻意不加 DSH 的条数：面板按它展示「已写入 N 个模型」，而 DSH 写的是
+        // 同一批模型的另一份投影，相加会让数字随目标数翻倍；DSH 自己的条数在逐目标条目里。
+        if let Some(entry) = dsh_report.as_object() {
+            if entry.get("status").and_then(Value::as_str) == Some("ok")
+                && entry.get("changed") == Some(&json!(true))
+            {
+                sync.insert("changed".to_string(), json!(true));
+            }
+            if let Some(targets) = sync.get_mut("targets").and_then(Value::as_object_mut) {
+                targets.insert("dsh".to_string(), Value::Object(entry.clone()));
+            }
+        }
         sync.insert("time".to_string(), json!(now_iso8601()));
-        update_and_persist(json!({ "sync": Value::Object(sync) }));
+        update_and_persist(json!({ "sync": Value::Object(sync), "dshPatchFiles": dsh_patches }));
     });
 }
 
@@ -2053,11 +2099,14 @@ async fn shutdown(code: u8) -> u8 {
     if let Some(sender) = lock(&app.server_stop).as_ref() {
         let _ = sender.send(true);
     }
-    // 🔴 关停必须清空插件配置（2026-10-10 用户裁定，覆盖上一轮「不清空、下次启动沿用」的取舍）：
-    // 应用不在跑的这段时间里，本工具名下的模型指向的是已经停掉的端点，留在 WorkBuddy/CodeBuddy
-    // 的配置里只会让用户「选中了却必然请求失败」。清空后这段真空期不存在，下次启动按 status.json
-    // 的沿用路径（`reusable_previous`）直接用上次的结果，并在那一刻按**当前**端点与 Key 重新发布。
-    // 数据红线不变：`merge_models` 只摘掉 `OWNER` 名下的条目，用户手动配置与其他元数据原样保留。
+    // 🔴 关停必须清空**三个目标**的发布（2026-10-10 用户裁定，覆盖上一轮「不清空、下次启动沿用」
+    // 的取舍；2026-11-16 用户要求明确覆盖 DSH）：应用不在跑的这段时间里，本工具名下的模型指向的
+    // 是已经停掉的端点，留在 WorkBuddy / CodeBuddy 的 `models.json` 与 DSH 的 `wbbridge` 路由里
+    // 只会让用户「选中了却必然请求失败」。清空后这段真空期不存在，下次启动按 status.json 的沿用
+    // 路径（`reusable_previous`）直接用上次的结果，并在那一刻按**当前**端点与 Key 重新发布。
+    // 数据红线不变：`merge_models` 只摘掉 `OWNER` 名下的条目，DSH 只摘掉本服务的 `wbbridge`
+    // 子映射（补建的空壳行整行删除），用户手动配置、其他 provider 与元数据原样保留；
+    // `.credentials.yaml` 里的 `WB_BRIDGE_API_KEY` 引用不删（红线：只增改该引用）。
     // 用户意图的清空：显式允许空集。
     // 排空写链必须紧跟着做完：后面的运行时收摊（SIGTERM ≤4s）才是关停的耗时大头，而壳的停止预算
     // 只有 `STOP_BUDGET`，把这次写盘放到最后有可能被进程退出截断。
@@ -2438,9 +2487,12 @@ fn bootstrap(options: &StartOptions) -> Result<Arc<App>, String> {
     // CodeBuddy 的「已保存值」预留对称形态（settings.codeBuddyModelsFile，当前尚无面板入口，恒为 None）。
     let codebuddy_models_file = resolve_target_models_file(Target::CodeBuddy, None, &env_vars, &home);
     *lock(&app.codebuddy_models_file) = codebuddy_models_file.clone();
+    // DSH 没有「导入」入口：只认 profile 目录里已存在的用户 patch，路径随状态暴露给面板。
+    let dsh_patch_files = crate::dsh::discover_patches(&env_vars, &home);
     update_and_persist(json!({
         "modelsFile": workbuddy_models_file.map(|value| json!(value)).unwrap_or(Value::Null),
         "codeBuddyModelsFile": codebuddy_models_file.map(|value| json!(value)).unwrap_or(Value::Null),
+        "dshPatchFiles": dsh_patch_files,
     }));
 
     Ok(app)
@@ -3189,6 +3241,17 @@ mod tests {
         assert!(pending.is_empty());
     }
 
+    /// `BUDDY_NO_SYNC=1` 只拦非空发布；关停等用户意图的清空必须照常写盘，否则三个目标里
+    /// 上一轮写下的条目会一直指向已停掉的端点。
+    #[test]
+    fn no_sync_skips_publication_but_never_the_user_intent_clear() {
+        let model = json!({ "id": "opencode/m", "name": "M" });
+        assert!(skips_sync_when_disabled(true, std::slice::from_ref(&model)));
+        assert!(!skips_sync_when_disabled(true, &[]));
+        assert!(!skips_sync_when_disabled(false, std::slice::from_ref(&model)));
+        assert!(!skips_sync_when_disabled(false, &[]));
+    }
+
     /// 关停开始后只放行「清空」：空集是 `shutdown` 的清理写，必须通过；非空发布必须被拒绝，
     /// 否则启动时序里迟到的「沿用上次结果」重发会把刚清掉的条目写回插件配置。
     #[test]
@@ -3357,8 +3420,9 @@ mod tests {
         assert_eq!(error.status, Some(400));
     }
 
-    /// `settings.json` 的 `paidModels` 同样是可手改字段：只收「注册表平台/模型」形态，
-    /// 平台未注册（尤其 `opencode`）与不成形的条目一律丢弃，并排序去重。
+    /// `settings.json` 的 `paidModels` 同样是可手改字段：只收「可注入的注册表平台/模型」形态，
+    /// 未注册平台与 `opencode`（免密内建命名空间，白名单对它永不生效）以及不成形的条目
+    /// 一律丢弃，并排序去重。
     #[test]
     fn restored_paid_models_keeps_only_registered_namespaced_ids() {
         assert_eq!(restored_paid_models(&json!({})), Vec::<String>::new());

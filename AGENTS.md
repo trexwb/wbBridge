@@ -17,7 +17,7 @@
 >
 > 🔴 **最小改动优先**：只做针对性修复，禁止重构、禁止大范围重写、禁止"顺手优化"。
 >
-> 🔴 **密钥零泄漏**：不得读取、打印、回显、提交或推断 `api-key`、`.env.local`、`providers.json`（用户自持的平台 Key）、用户 `~/.workbuddy/models.json` 中的凭据字段。**允许位只有两处，且都只经 `providers.rs`**：① 核心可以把**用户自己提交进来**的平台 Key 写到数据目录 `providers.json`（`0600`，唯一写入口是 `POST /admin/set-provider-key` 的请求体）；② 用户点眼睛时，`POST /admin/reveal-provider-key` 可回传**当前这一家**已配置平台的 Key（一次一条、显式触发；未配置返回 400 `provider_not_configured`，面板只在组件内存展示、不落偏好 / localStorage / IndexedDB）。除这两处以外，任何凭据都不得落盘、出日志、进 `status.json`、进面板偏好、进子进程环境变量，或出现在任何响应体里（`provider-status` 只回「是否已配置」，**连掩码尾字符都不返回**）。
+> 🔴 **密钥零泄漏**：不得读取、打印、回显、提交或推断 `api-key`、`.env.local`、`providers.json`（用户自持的平台 Key）、用户 `~/.workbuddy/models.json` 中的凭据字段。**允许位只有三处**：① 核心可以把**用户自己提交进来**的平台 Key 写到数据目录 `providers.json`（`0600`，唯一写入口是 `POST /admin/set-provider-key` 的请求体）；② 用户点眼睛时，`POST /admin/reveal-provider-key` 可回传**当前这一家**已配置平台的 Key（一次一条、显式触发；未配置返回 400 `provider_not_configured`，面板只在组件内存展示、不落偏好 / localStorage / IndexedDB）——①② 都只经 `providers.rs`；③ DSH 写入目标（`dsh.rs`）可把**本服务自己的 api-key** 写进 `$DSH_HOME/.credentials.yaml` 的 `refs.WB_BRIDGE_API_KEY`（`0600`，DSH 的 pi-ai 路由只认 `apiKeyEnv` 引用，不写就无法 Bearer 鉴权；值仅限本服务令牌，不进日志 / `status.json` / 响应体）。除这三处以外，任何凭据都不得落盘、出日志、进 `status.json`、进面板偏好、进子进程环境变量，或出现在任何响应体里（`provider-status` 只回「是否已配置」，**连掩码尾字符都不返回**）。
 >
 > 🔴 **提交由用户决定**：Agent 完成改动后不得自动执行 `git commit` / `git push`，除非用户在本轮明确要求。
 
@@ -28,7 +28,7 @@ WB Bridge 是一个**跨平台托盘工具**，通过**隔离的 OpenCode 技术
 
 1. **托管一个隔离的 OpenCode 运行时**：优先复用本机已有的 `opencode` 可执行文件，否则从 npm registry（官方源 → 国内镜像）下载官方 tarball，校验 `sha512-` 完整性后解包到数据目录，用**隔离环境变量 + 独立随机端口**以 `serve --pure` 方式启动，绝不污染用户 OpenCode 的配置、数据、缓存与登录态。
 2. **对外暴露 OpenAI 兼容 API**：本地 `127.0.0.1:<port>` 提供 `/v1/models` 与 `/v1/chat/completions`（含 SSE 流式），强制请求携带鉴权头（Bearer 方案，值为数据目录 `api-key` 文件的内容）鉴权，拒绝一切浏览器 Origin，最多 8 个并发请求。
-3. **把可用模型同步给 WorkBuddy**：自动发现免费模型 → 逐模型探测 → 只把探测通过的模型发布给 WorkBuddy（原子写 + 增量合并其 `models.json`，只增删自己名下的条目）。
+3. **把可用模型同步给客户端**：自动发现免费模型 → 逐模型探测 → 只把探测通过的模型发布给 WorkBuddy / CodeBuddy（原子写 + 增量合并其 `models.json`，只增删自己名下的条目）与 DSH（只改 profile 用户 patch 里 `id: llm-pi-ai` 行的 `config.providers.wbbridge`，其它 provider 与注释原样保留）。
 
 三层结构：
 
@@ -72,7 +72,7 @@ WB Bridge 是一个**跨平台托盘工具**，通过**隔离的 OpenCode 技术
 | 版本一致性校验 | `npm run version:check` | 仓库根 | `scripts/check-version.mjs`：7 处版本号必须一致，否则退出 1（含核心 crate） |
 | 版本推进 | `npm run version:set -- <x.y.z>` | 仓库根 | `scripts/bump-version.mjs` 同步改写；执行口径见下方「版本号规则」（每次修改必须递增，豁免情形除外） |
 | 健康检查 | `curl --oauth2-bearer "$(cat "<数据目录>/api-key")" http://127.0.0.1:41980/health` | 任意 | `/health` **同样需要 Bearer 鉴权**（无 key 返回 401；`--oauth2-bearer` 即发送 Bearer 头） |
-| 列出已发布模型 | `curl --oauth2-bearer "<api-key 文件内容>" http://127.0.0.1:41980/v1/models` | 任意 | 返回客户端可见模型（id 形如 `<前缀> · 名称`：注册表平台 `MS`/`SF`/`TT`/`ZP`，其余 `OC`）；发布集非空时**末位**多一条合成路由 `WB · auto`（池空即不列） |
+| 列出已发布模型 | `curl --oauth2-bearer "<api-key 文件内容>" http://127.0.0.1:41980/v1/models` | 任意 | 返回客户端可见模型（id 形如 `<前缀> · 名称`：注册表平台用各自两字母短前缀 `MS`/`SF`/`TT`/`ZP`/`AG`/`SN`/`NV`/`OR`/`HF`/`KL`，`opencode` 与未注册命名空间回落 `OC`）；发布集非空时**末位**多一条合成路由 `WB · auto`（池空即不列） |
 
 > ⚠ `<数据目录>` 取决于运行方式：**壳运行时**是 Tauri 的 `app_data_dir`（macOS `~/Library/Application Support/app.wbbridge.desktop`，identifier `app.wbbridge.desktop`）；**独立进程运行时**是平台默认目录（macOS `~/Library/Application Support/Buddy Bridge`，见下）。两套目录不要混为一谈。
 
@@ -107,7 +107,7 @@ WB Bridge 是一个**跨平台托盘工具**，通过**隔离的 OpenCode 技术
 | `BUDDY_DATA_DIR` | 平台数据目录（见下） | 覆盖数据目录（嵌入壳时由 `StartOptions.data_dir` 注入 app_data_dir） |
 | `BUDDY_MODELS_FILE` | macOS/Linux `~/.workbuddy/models.json` | 覆盖 WorkBuddy 配置文件路径（Windows 走"已保存值 → 发现"流程） |
 | `BUDDY_CODEBUDDY_MODELS_FILE` | 无 | 覆盖 CodeBuddy 的 models.json 路径（优先级最高；另有对称的 `CODEBUDDY_CONFIG_DIR` / `CODEBUDDY_DATA_FOLDER_NAME`，默认目录 `~/.codebuddy`） |
-| `BUDDY_NO_SYNC` | 未设置 | `=1` 时跳过启动导入与后续模型同步 |
+| `BUDDY_NO_SYNC` | 未设置 | `=1` 时 `sync_published` 跳过**非空**发布（发现与探测照常；关停、启动清旧、换配置这类**用户意图的清空**仍会写盘——否则三个目标里上一轮的条目会指向已停掉的端点） |
 | `BUDDY_OPENCODE_PATH` | 无 | 首选 OpenCode 可执行文件路径（优先级最高） |
 | `BUDDY_PARENT_PID` | 无 | 父进程 pid；父进程消失则核心自行优雅关停 |
 
@@ -174,17 +174,18 @@ wbBridge/
 │       │   ├── backend.rs        ← OpenCode HTTP 客户端：会话、事件流、原生工具审批、免费模型发现、转写钩子
 │       │   ├── runtime.rs        ← 运行时发现/下载/sha512 校验/解包/隔离 env/启动/关停
 │       │   ├── probe.rs          ← 模型探测（工具调用与纯文本两类；每模型各 60s 预算，重试共用）
-│       │   ├── providers.rs      ← 平台注册表（九家，唯一真相）+ providers.json 凭据通道（0600、只回是否已配置）
-│       │   ├── auto.rs           ← WB · auto 合成模型名的纯函数路由（按请求内容在可用池里选实际模型全限定 id；无 IO、无 JS 前身）
+│       │   ├── providers.rs      ← 平台注册表（十一家，唯一真相；kilo 与 opencode 为免密平台，后者只登记不注入）+ providers.json 凭据通道（0600、只回是否已配置 / 是否免密）
+│       │   ├── auto.rs           ← WB · auto 合成模型名的纯函数路由（按请求内容——能力档位 + 推理档位——在可用池里选实际模型全限定 id；无 IO、无 JS 前身）
 │       │   ├── repair.rs         ← 信封/工具格式修复与辅助模型转写（含 CLIENT_CONVENTIONS）
 │       │   ├── handoff.rs        ← 原生工具 handoff：构建客户端动作、拒绝反馈、动作校验
 │       │   ├── sync.rs           ← WorkBuddy models.json 原子写 + 增量合并（OWNER 标记、锁；**不写备份**，只清扫存量同族 `.bak`）
 │       │   ├── workbuddy_config.rs ← models.json 定位与校验（不猜测、不创建文件）
 │       │   ├── codebuddy_config.rs ← CodeBuddy models.json 定位（对照 workbuddy_config.rs）
+│       │   ├── dsh.rs            ← DSH（DeepSeek Harness）写入目标：只改 profile 用户 patch 的 `id: llm-pi-ai` 行 + `.credentials.yaml` 凭据引用
 │       │   ├── targets.rs        ← 写入目标：检测、分发、聚合
 │       │   ├── system_proxy.rs   ← 系统代理解析（macOS scutil / Windows 注册表）与子进程环境
 │       │   ├── reasoning.rs      ← 推理档位映射与 WorkBuddy 回退策略
-│       │   ├── model_status.rs   ← 模型状态构造、请求元信息、客户端展示 ID（`<前缀> · 名称`：注册表平台 `MS`/`SF`/`TT`/`ZP`，其余 `OC`）
+│       │   ├── model_status.rs   ← 模型状态构造、请求元信息、客户端展示 ID（`<前缀> · 名称`：注册表平台用各自两字母短前缀，`opencode` 与未注册命名空间回落 `OC`）
 │       │   ├── platform.rs       ← 数据目录、路径/平台原语、运行时包名
 │       │   ├── atomic.rs         ← 原子替换（重试 → 等待 → 换名，Windows 共享冲突友好）
 │       │   └── json.rs           ← 容错 JSON 解析 + JS 语义原语（truthy/js_stringify/…）
@@ -228,6 +229,7 @@ wbBridge/
 
 - **核心不得单方面结束进程**：嵌入壳时 `set_exit_hook` 把「退出」翻译成记录 `core_code` / `core_stopped`，真正退出只由壳的**关窗 / 托盘退出 / `RunEvent::ExitRequested`** 驱动。
 - **关闭窗口即退出应用（全平台一致）**：`on_window_event` 的 `CloseRequested` 在非退出态下 `prevent_close()` + `hide()`，随后在后台线程执行 `quit_app`（= `stop_core_bounded` → `cleanup_before_exit` → `exit(0)`）；**不再隐藏到托盘驻留**，用户无需二次退出。`show_main` 在 `quitting` 置位后直接返回，退出收尾期间不会被托盘左键唤回。
+- **退出即清空三个目标的发布**（2026-11-16 用户要求明确覆盖 DSH）：`shutdown()` 的第一步就是 `sync_published(Some(Vec::new()), true)` + `drain_sync().await`（排在运行时 SIGTERM 之前，壳的停止预算截不到它），因此 WorkBuddy / CodeBuddy 的 `models.json` 与 DSH 的 `wbbridge` 路由都会被摘干净；`.credentials.yaml` 的 `WB_BRIDGE_API_KEY` 引用**不删**（红线只增改该引用），DSH 里他人的 provider 与全部注释原样保留。HTTP 不通时壳走 `request_shutdown` 的**同一条**清理链。
 - **壳保留回环 HTTP 调用路径**（`admin_call` + `ACTION_ROUTES`），因此鉴权、Origin 拒绝、并发上限等红线与迁移前完全一致；`core_action` 通用代理已收口为 **12 个类型化命令**（`core_refresh`/`core_probe`/`core_import`/`core_system_proxy`/`core_shutdown`/`core_provider_status`/`core_set_provider_key`/`core_clear_provider_key`/`core_reveal_provider_key`/`core_remove_model`/`core_restore_model`/`core_set_paid_models`），每条只映射一个 `/admin/*` 路由、参数经 serde 类型校验，路由与载荷语义不变。
 - 核心可重启：`restart_core` 关停现有实例后按新的 `StartOptions` 重新装入（`APP` 为可重置的进程级全局）。
 
@@ -242,7 +244,7 @@ wbBridge/
 7. `find_runtime` 定位或下载 OpenCode 运行时 → `start_backend` 启动子进程 → axum HTTP 服务开始监听。
 8. `/agent` 校验：确认隔离配置中的 `buddy-bridge`、`buddy-chat` 两个自定义 agent 存在，否则 `phase` 不进入 `ready`。
 9. 系统代理（`useSystemProxy`）：macOS `scutil --proxy`、Windows 注册表解析注入子进程 env；**解析失败回退为关闭，不阻断启动**。
-10. 启动导入（`BUDDY_NO_SYNC !== "1"`）：**先清除旧 own 条目并 `drain_sync().await`，再逐模型探测（每模型各 `PROBE_TIMEOUT_MS = 60000` 预算，重试共用同一 deadline）**，仅 `ok` 的模型进入发布集。
+10. 启动导入：上一轮不可沿用（`reusable_previous` 为假）时**先清除旧 own 条目并 `drain_sync().await`**（用户意图的清空，`BUDDY_NO_SYNC=1` 下也执行），再逐模型探测（每模型各 `PROBE_TIMEOUT_MS = 60000` 预算，重试共用同一 deadline），仅 `ok` 的模型进入发布集；`BUDDY_NO_SYNC=1` 只让本轮的非空发布停下（写 `sync.skipped`），发现与探测不受它控制。
 11. 同步发布集到 WorkBuddy `models.json`，启动状态轮询/活动计时/刷新与探测后台任务；服务已在监听时启动失败会保留进程，由壳经 `/admin/shutdown` 结束这次启动。
 
 ### 请求链路（`/v1/chat/completions`）
@@ -250,7 +252,7 @@ wbBridge/
 ```
 WorkBuddy
   → server.rs：Bearer 鉴权（timing-safe）→ 拒绝 Origin（403）→ 限流（>8 并发 429 busy）→ 读体（>8MB 413、>20s 408）
-  → WB · auto：读体之后、记账键取读之前，若 body.model == "WB · auto" 则用 auto::auto_select（池快照只取读一次）改写为实际模型全限定 id；选不出（池空）即不改写
+  → WB · auto：读体之后、记账键取读之前，若 body.model == "WB · auto" 则用 auto::auto_select（池快照只取读一次）改写为实际模型全限定 id；选不出（池空）即不改写。候选先按能力档位、再按请求携带的推理档位过滤（`auto::requested_effort` / `accepts_effort`，与 `prepare` 的 400 `unsupported_reasoning_effort` 同源），档位层为空退全池
   → protocol::prepare(body, models)：模型匹配 / messages 校验 / n=1 / tool 定义唯一性 / 图片 mime 白名单（png·jpeg·webp·gif）
   → backend::complete(...)：OpenCode 会话 + 消息 + 事件流
         ├─ 原生工具调用 → native_permissions（'*': 'ask'，question/websearch/codesearch/webfetch/task/plan_enter/plan_exit/todowrite: 'deny'）
@@ -269,13 +271,22 @@ WorkBuddy
 ```
 models.json → free_models(providers)（免费判定：输入/输出/缓存全 0、输出支持文本、非 deprecated）
   → 逐模型探测（probe_model：工具调用类 + 纯文本类，失败可重试 1 次）
-  → 仅 ok 的模型进入发布集（客户端 ID = `<前缀> · <name>`：注册表平台 `MS`/`SF`/`TT`/`ZP`，其余 `OC`）
+  → 仅 ok 的模型进入发布集（客户端 ID = `<前缀> · <name>`：注册表平台用各自两字母短前缀，`opencode` 与未注册命名空间回落 `OC`）
      `publishable_models` 同时要求「已校验」且 `modelResults[id].ok === true`：失败 / 超时 / 不可用的模型
      既不写入两个插件配置，也不进 `/v1/models` 与 `WB · auto` 的选择域
   → sync_models（原子写）→ merge_models（保留非本工具条目，只清理/更新 OWNER = 'buddy-bridge-v1' 的条目）
      收敛：真实请求失败（`record()`）、批量探测本轮有失败（手工读取也重发）、单模型重检失败都立即重发
   → 生产发布链走 merge_models_auto（`SyncOptions.auto_route = true`）：发布集非空时在末位追加一条 `WB · auto` 合成路由条目，
     使 WorkBuddy/CodeBuddy 里看得见这个入口；该条目不计入 `sync.count`，也不进 `status.json` 的模型列表
+  → DSH（`dsh.rs`，检测到 `$DSH_HOME/profiles/<名称>/cordis.patch.yml` 时）：只改 `id: llm-pi-ai` 行的
+    `config.providers.wbbridge`（`api: openai-completions`、`baseURL` = 本服务 `<endpoint>/v1`、
+    `apiKeyEnv: WB_BRIDGE_API_KEY`），并保证 `.credentials.yaml` 的该引用 = 本服务 api-key；
+    路由的模型表是 `WB · auto`（池非空时）+ 逐模型客户端 ID，报告进 `sync.targets.dsh`
+    （`count` 不进顶层 `count`——顶层只数插件目标，避免同一批模型随目标数翻倍）；
+    同一路由带 `compat: {thinkingFormat: openai, supportsReasoningEffort: true}`，每个模型条目声明
+    `reasoningEfforts`（只列该模型 variant 真正覆盖的 `minimal/low/medium/high/xhigh/max`，`WB · auto`
+    取**免费**发布集并集；不推理与固定推理模型写 `false`；**刻意不声明 `off`**——pi-ai 把 off 的缺席读成
+    「支持、发送时不带参数」，而本服务不带档位时走上游默认档，声明 Off 会给出关不掉的开关）
 ```
 
 ### 运行时隔离链路
@@ -352,6 +363,11 @@ start_backend
 - **`WB · auto` 合成路由条目只在生产发布链写入插件配置**：`sync.rs::merge_models_auto` 走 `SyncOptions.auto_route`，该字段**默认 `false`**——JS 侧从来没有这一条，`tests/js_parity.rs::sync_options` 显式钉 `false`，因此对拍路径逐字节不变（把默认值翻成 `true`，`tests/fixtures/sync.json` 会立刻失败，那是**预期护栏生效**，不是要修的测试）。条目 `id` 刻意**绕过** `client_model_id`（否则变成 `OC · WB · auto`，与 `server.rs::chat()` 的字面比较永不匹配 ⇒ 改写不生效）。`sync.rs::owned_count` **必须排除别名**，否则 `sync.count` / `status.json` 的 `sync.targets.<目标>.count` 不再是「发布的模型数」。别名只进插件文档的 `availableModels`，**不进** `status.json` 的模型列表，面板因此没有也别新增这一行。`supportsToolCall` 必须取自 `auto::any_tool_capable(models)`，不得写成固定 `true`。
 - **插件配置写入不再产生任何备份**：`sync.rs` 写路径现存的是 `sweep_old_backups(file)`——在**两条出口**都调用（`atomic_write_with` 成功之后，以及内容无变化的早退之前），按**逐段白名单**（文件名以 `<配置文件名>.buddy-bridge-` 开头、以 `.bak` 结尾、中段全是 ASCII 数字、必须是普通文件；跳过目录、`read_dir` 失败静默）只清理本工具**旧版**攒下的存量备份。不得新增备份逻辑，也不得把判定放宽成通配删除（用户自己命名的 `*.bak`、`*.tmp` 一律不碰）。写盘保护只剩三道：文件锁 + 写前二次读取 + 原子替换（同目录临时文件再 `rename`）。
 - **付费白名单（v1.3.5）只能显式逐条放行，且绝不进入任何自动路径**：`backend::models_in(providers, namespace, allowed_paid)` 是唯一放行点——白名单内的全限定 id 可绕过「标价全 0」过滤，条目带 `paid: true`；免费条目**不得**带该键（否则 `tests/js_parity.rs` 的夹具会变）。白名单来源是 `settings.json` 的 `paidModels`（`/admin/set-paid-models` 全量替换，最多 64 条、前缀必须在 `providers::PROVIDERS` 内），写入后必须同步 `Backend::set_paid_models` 与 `status.json` 的 `paidModels`。**所有会产生真实账单的自动路径都必须排除 `paid: true`**：`server.rs::chat()` 的 `WB · auto` 选择域（`auto::free_pool`）、`attach_translator` 的转写候选、`reprobe_when_weights_exhausted` 的自愈重检；新增自动选模 / 自动请求逻辑时必须沿用同一过滤，不得直接遍历 `app.models`。用户手动指定付费模型仍照常请求与计费（这是白名单授权本身）。
+- **免密平台（2026-11-16 新增 `kilo`，同日把 `opencode` 也登记为免密）**：`Provider.keyless = true` 时 `providers::set_key` / `clear_key` / `reveal_key` 一律拒绝（面板也不显示 Key 表单），`status()` 把 `configured` 置 true 并带 `keyless: true`，`models` 必须留空（走 catalog 声明，免费判定仍按标价全 0，付费条目照旧被挡）。注入面按 `Provider::injected()` 分两类：
+  - `injected() == true`（Kilo）：`runtime::providers_section_for` **恒常注入**且 `options` **只带 `baseURL`、不得带 `apiKey`**（Kilo 网关收到 `Authorization: Bearer <任意占位>` 会直接 401，沙箱实测；不带该头才返回文本）；
+  - `injected() == false`（`opencode`，判据 `id == model_status::OPENCODE_NAMESPACE`）：**整条不注入**、`npm` / `base_url` 留空——注入同名段会覆盖运行时内建的 provider 声明（模型来自 models.dev 目录），把用户的目录整个换掉；它登记在注册表里只为在「平台」页显出一行「免密直连」并让 Key 通道给出正确文案。付费白名单同样只认可注入平台（`normalize_paid_model` 走 `injected()`），`opencode/*` 条目一律丢弃。
+
+  新增免密平台必须同步 `tests/red_lines.rs` 的平台集合断言、`providers.rs::keyless_platforms_are_kilo_and_opencode_and_reject_the_key_channel`、面板 `PLATFORMS`（`keylessNote` 写清生效方式与隐私边界）与 AI 提示词里的免密说明；**隐私**：上游免费池的提示词可能被记录，面板与 README 必须提示勿发送敏感数据。
 
 ### 测试规范
 
@@ -397,8 +413,8 @@ start_backend
   `prefers-reduced-motion`（`base.css`）两处。收起详情有三条等价路径：`Esc`（`App.vue::onKeydown`）、详情头部「收起详情」按钮、
   窗口失焦（`onDismiss`）；收起即清空选中，列表占满主区宽度。
 - **侧栏是分组导航**：分组为「模型 / 运行 / 集成 / 其他」，底部为「运行设置」（系统代理开关 + 版本号）。**8 个入口都是已实现的视图**（视图 ID 的唯一名单是 `prefs.js` 的 `VIEW_IDS`，视图状态由 `src/App.vue` 的 `view` 持有，侧栏按 `current` 高亮并带 `aria-current="page"`）：
-  模型与服务（`.top` + `.content`，保留主从两栏；工具条的「回收站」按钮在页内切到独立回收站面板 `src/views/ModelRecycleBin.vue`，已移除模型不混进主列表）、平台（`src/views/ProvidersView.vue`，九家平台各占一行摘要「名称 / 注册表 id / 已配置或未配置 / 付费放行数」；点「管理配置」进同一张弹窗，内分申请引导、Key 表单与付费白名单三块——**打开弹窗即经 `reveal-provider-key` 尝试取回该平台已保存的 Key 并掩码回填**（一次一条；不按「已配置」徽章决定——徽章可能滞后；「尚未配置」静默，其余失败在弹窗内显示原因并可点眼睛重试；回填后保存按钮禁用，避免原样重写触发重检），点眼睛在掩码 / 明文间切换（**纯本地即时切换**：不改 `revealing` 之外的状态、不等待回读、读回在飞时也不禁用；**入口绑 `pointerdown` 而非 `click`**——弹窗入场动画期间按下与松开的落点会差开，`click` 会落到共同祖先甚至不派发，键盘 / 辅助技术仍走 `click`，两者用 700ms 时间戳互斥保证一次操作只翻一下；收起明文不清空；读回值回来后按当前模式呈现；读回中的提示只走输入框占位文案，不插入额外行、不改变弹窗高度），值仅组件内存、关弹窗即清出；弹窗具备 `role="dialog"` + Tab 焦点陷阱 + Esc 关闭与焦点归还）；付费白名单的模型输入框是**可编辑选择器**（`<input list>` + `<datalist>`），默认候选取 `state.models` 里该平台命名空间下的已知模型（去重排序，值只填模型 key、保留 key 自身的 `/`），不在候选里的模型仍可手动输入；跨平台拒绝只认「首段命中别家注册表平台 id」，不得按第一个 `/` 粗暴切前缀）、运行日志（`src/views/LogsView.vue`，经 `read_log` 只读拉取日志尾部，另可经 `clear_log` 两段式确认后截断 `opencode.log`——文件缺失视为已清空，不动 `opencode.log.previous`）、用量与额度（`src/views/UsageView.vue`，渲染 `status.json` 顶层 `usage`）、
-  WorkBuddy 集成（`src/views/IntegrationView.vue`，只读展示配置定位与最近发布结果，唯一动作是复用既有 `import`）、**提示词优化**（`src/views/PromptView.vue` + `src/core/prompt.js` + `src/core/promptSession.js`：固定本机 `WB · auto`；系统 / 用户提示词、7 个内置模板、版本链与迭代、占位符缺失 / 新增提示、「同一输入分别跑源提示词 / 当前版本」的对比测试；内容只存会话内存；与 AI 助手共用壳侧 AI 通道并互斥；提交有在飞互斥、500ms 前沿节流与逐次拒绝文案）、**AI 助手**（`src/views/AssistantView.vue` + `src/core/ai.js`：自然语言入口，只读工具立即执行、写入工具一律先作提案再逐条确认；大脑默认本机 `WB · auto`，也可切外部 OpenAI 兼容端点；端点 Key **只在会话内存**（见 `prefs.js` 的 `ai` 键白名单），**对话记录默认记在本机 IndexedDB**（`src/core/chatSession.js`，可在「设置」关掉、可「清空」；工具入参不落盘）；**模型就位前输入区整块禁用**，横幅给出原因与出路）、关于与更新（`src/views/AboutView.vue`，版本与数据目录只读 + **自动更新区**：启动后静默检查、发现新版本才出现更新条、由用户点「下载并安装」，进度百分比只在上游给出 `contentLength` 时显示，装完点「重启应用」经 `process.relaunch` 走 `ExitRequested` 的有界停止）。
+  模型与服务（`.top` + `.content`，保留主从两栏；工具条的「回收站」按钮在页内切到独立回收站面板 `src/views/ModelRecycleBin.vue`，已移除模型不混进主列表）、平台（`src/views/ProvidersView.vue`，十一家平台各占一行摘要「名称 / 注册表 id / 已配置或未配置 / 付费放行数」——Kilo 与 OpenCode 是免密平台：徽章显示「免密直连」，弹窗只给生效方式与隐私提示（按平台的 `keylessNote` 分文案：Kilo 说明核心恒常注入，OpenCode 说明是运行时自带命名空间、不额外注入），不显示 Key 表单、申请引导与付费白名单；点「管理配置」进同一张弹窗，内分申请引导、Key 表单与付费白名单三块——**打开弹窗即经 `reveal-provider-key` 尝试取回该平台已保存的 Key 并掩码回填**（一次一条；不按「已配置」徽章决定——徽章可能滞后；「尚未配置」静默，其余失败在弹窗内显示原因并可点眼睛重试；回填后保存按钮禁用，避免原样重写触发重检），点眼睛在掩码 / 明文间切换（**纯本地即时切换**：不改 `revealing` 之外的状态、不等待回读、读回在飞时也不禁用；**入口绑 `pointerdown` 而非 `click`**——弹窗入场动画期间按下与松开的落点会差开，`click` 会落到共同祖先甚至不派发，键盘 / 辅助技术仍走 `click`，两者用 700ms 时间戳互斥保证一次操作只翻一下；收起明文不清空；读回值回来后按当前模式呈现；读回中的提示只走输入框占位文案，不插入额外行、不改变弹窗高度），值仅组件内存、关弹窗即清出；弹窗具备 `role="dialog"` + Tab 焦点陷阱 + Esc 关闭与焦点归还）；付费白名单的模型输入框是**可编辑选择器**（`<input list>` + `<datalist>`），默认候选取 `state.models` 里该平台命名空间下的已知模型（去重排序，值只填模型 key、保留 key 自身的 `/`），不在候选里的模型仍可手动输入；跨平台拒绝只认「首段命中别家注册表平台 id」，不得按第一个 `/` 粗暴切前缀）、运行日志（`src/views/LogsView.vue`，经 `read_log` 只读拉取日志尾部，另可经 `clear_log` 两段式确认后截断 `opencode.log`——文件缺失视为已清空，不动 `opencode.log.previous`）、用量与额度（`src/views/UsageView.vue`，渲染 `status.json` 顶层 `usage`）、
+  WorkBuddy 集成（`src/views/IntegrationView.vue`，只读展示配置定位与最近发布结果——WorkBuddy / CodeBuddy 的 `models.json` 与 DSH 的 profile patch 列表，唯一动作是复用既有 `import`；DSH 没有导入入口，检测到 profile 就随每次发布自动写入）、**提示词优化**（`src/views/PromptView.vue` + `src/core/prompt.js` + `src/core/promptSession.js`：固定本机 `WB · auto`；系统 / 用户提示词、7 个内置模板、版本链与迭代、占位符缺失 / 新增提示、「同一输入分别跑源提示词 / 当前版本」的对比测试；内容只存会话内存；与 AI 助手共用壳侧 AI 通道并互斥；提交有在飞互斥、500ms 前沿节流与逐次拒绝文案）、**AI 助手**（`src/views/AssistantView.vue` + `src/core/ai.js`：自然语言入口，只读工具立即执行、写入工具一律先作提案再逐条确认；大脑默认本机 `WB · auto`，也可切外部 OpenAI 兼容端点；端点 Key **只在会话内存**（见 `prefs.js` 的 `ai` 键白名单），**对话记录默认记在本机 IndexedDB**（`src/core/chatSession.js`，可在「设置」关掉、可「清空」；工具入参不落盘）；**模型就位前输入区整块禁用**，横幅给出原因与出路）、关于与更新（`src/views/AboutView.vue`，版本与数据目录只读 + **自动更新区**：启动后静默检查、发现新版本才出现更新条、由用户点「下载并安装」，进度百分比只在上游给出 `contentLength` 时显示，装完点「重启应用」经 `process.relaunch` 走 `ExitRequested` 的有界停止）。
   **禁止**再出现「规划中」标签、禁用占位或可点击却无响应的假入口。
 - **`usage` 口径（`status.json` 顶层字段）**：`{"since": ISO, "total": {requests, ok, failed}, "models": {"<clientModelId>": {requests, ok, failed, lastMs, avgMs}}}`；只累计 `source == "request"` 的真实客户端请求——探测（`probe`）不计；客户端取消（连接断开）走 `server.rs` 的两条早退路径，**整条不计入**（`requests` 也不 +1，不是记为失败）；启动时从上一份 `status.json` 读回，与 `modelResults` 同法跨重启延续。
 - **`schemaVersion` 升级口径**：向后兼容的**加法式**顶层字段（旧壳忽略未知字段即可）**不**递增两侧 `STATUS_SCHEMA_VERSION`，本次保持 `1`；只有删除 / 改名顶层字段、或改变既有字段语义（非兼容变更）时，才把 `src-tauri/src/lib.rs` 与 `src-tauri/core/src/orchestration.rs` 两侧常量**同步 +1**（规则原文见两处注释）。
@@ -461,7 +477,7 @@ start_backend
 4. **限流与体积**：并发 ≤8、请求体 ≤8MB，不得放宽（并发 2026-10-10 经用户裁定由 4 调至 8，其余一律维持「不得移除、不得放松、不得绕过」）。
 5. **原生工具严禁开放给模型**：`native_permissions()` 必须保持 `'*': 'ask'`，且 `question`/`websearch`/`codesearch`/`webfetch`/`task`/`plan_enter`/`plan_exit`/`todowrite` 为 `deny`；`isolated_config()` 的 `autoupdate: false`、`share: "disabled"` 不得改动。**模型绝不允许直接执行本地动作**，原生动作只能以 handoff 交回客户端。
 6. **chatOnly 模型不得使用工具**：纯文本 agent（`buddy-chat`）遇原生工具活动必须报 `native_tool_activity`，不得降级为静默执行。
-7. **密钥零泄漏**：子进程环境只透传 `ENV_ALLOW` 白名单（其中不得出现任何凭据类变量名）；`OPENCODE_SERVER_PASSWORD` 只能用核心自己生成的值；密钥不得写入日志、`status.json` 或仓库。**允许位只有两处，且都只经 `providers.rs`**：① 把**用户自己提交**的平台 Key 原子写到数据目录 `providers.json`（`0600`），写入口只有 `POST /admin/set-provider-key` 的请求体；② 用户显式点眼睛时，`POST /admin/reveal-provider-key` 回传**一个**已配置平台的 Key（未配置 / 注册表外返回 400 `provider_not_configured`，面板只在组件内存展示）。`/admin/provider-status` 的返回形态仍只有 `{ providers: [{ id, label, configured }] }`，**连掩码尾字符都不返回**。除这两处以外，Key 不得出日志、出 `status.json`、出任何响应体（由 `providers.rs::status_never_contains_key_material`、`stored_file_holds_the_key_but_the_status_shape_does_not`、`reveal_returns_only_configured_registered_keys` 与 `red_lines` 的注册表守卫钉死）。后续 Stage 3 注入子进程时同样只能走 `OPENCODE_CONFIG_CONTENT`，**不得**把 Key 放进 `ENV_ALLOW` 或独立环境变量。
+7. **密钥零泄漏**：子进程环境只透传 `ENV_ALLOW` 白名单（其中不得出现任何凭据类变量名）；`OPENCODE_SERVER_PASSWORD` 只能用核心自己生成的值；密钥不得写入日志、`status.json` 或仓库。**允许位只有三处**：① 把**用户自己提交**的平台 Key 原子写到数据目录 `providers.json`（`0600`），写入口只有 `POST /admin/set-provider-key` 的请求体；② 用户显式点眼睛时，`POST /admin/reveal-provider-key` 回传**一个**已配置平台的 Key（未配置 / 注册表外返回 400 `provider_not_configured`，面板只在组件内存展示）——①② 都只经 `providers.rs`；③ `dsh.rs` 把**本服务自己的 api-key** 写进 `$DSH_HOME/.credentials.yaml` 的 `refs.WB_BRIDGE_API_KEY`（`0600`；DSH 的 pi-ai 路由只认 `apiKeyEnv` 引用，不写就无法 Bearer 鉴权；值仅限本服务令牌，绝不进日志 / `status.json` / 响应体，同目录其它文件不得出现它）。`/admin/provider-status` 的返回形态是 `{ providers: [{ id, label, configured, keyless }] }`（`keyless` 是加法式字段；免密平台恒 `configured: true`），**连掩码尾字符都不返回**。除这三处以外，Key 不得出日志、出 `status.json`、出任何响应体（由 `providers.rs::status_never_contains_key_material`、`stored_file_holds_the_key_but_the_status_shape_does_not`、`reveal_returns_only_configured_registered_keys`、`tests/red_lines.rs::dsh_credentials_file_is_the_only_place_the_bridge_key_lands` 与 `red_lines` 的注册表守卫钉死）。后续 Stage 3 注入子进程时同样只能走 `OPENCODE_CONFIG_CONTENT`，**不得**把 Key 放进 `ENV_ALLOW` 或独立环境变量。
 
 ### 供应链红线（OpenCode 运行时）
 
@@ -480,6 +496,7 @@ start_backend
 4. 格式类上游失败（`invalid_model_output` / `invalid_tool_call` / `native_tool_activity` / `output_truncated`）**不得撤销已发布模型**；探测路径**不得启用辅助模型转写**；转写候选**不得包含刚失败的模型本身**。
 5. 客户端取消的请求不得记录为成功。
 6. 付费白名单（`paid: true`）不得进入任何**自动**选模 / 自动请求路径（`WB · auto`、辅助转写、权重耗尽自愈重检）；白名单只由用户显式写入，核心不得自行放行任何标价非 0 的模型。
+7. 写 DSH profile 用户 patch 时：**只改 `id: llm-pi-ai` 行的 `config.providers.wbbridge`**，该行其它 provider、其它行与全部注释原样保留；认不出的结构（`providers` / `config` 是行内非空值）必须报错而不是猜测性改写；发布集转空时只删本服务这一条子映射（补建出来的空壳行整行删除），他人的 provider 与 patch 其余内容不得被删。`.credentials.yaml` 只增改 `refs.WB_BRIDGE_API_KEY`，`records` 与其它引用一律保留。
 
 ### 工程红线
 
@@ -495,9 +512,9 @@ start_backend
 
 | 项 | 值 | 来源 |
 |---|---|---|
-| 版本单一来源 | **1.3.11** | 根 `package.json` 的 `version` |
-| 壳工程同步落点 | **1.3.11** | `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `[package] version` |
-| 核心 crate 版本 | **1.3.11** | `src-tauri/core/Cargo.toml`（`wbbridge-core --version` 输出；随产品版本同步，`version:set`/`version:check` 均覆盖） |
+| 版本单一来源 | **1.3.16** | 根 `package.json` 的 `version` |
+| 壳工程同步落点 | **1.3.16** | `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `[package] version` |
+| 核心 crate 版本 | **1.3.16** | `src-tauri/core/Cargo.toml`（`wbbridge-core --version` 输出；随产品版本同步，`version:set`/`version:check` 均覆盖） |
 
 > `status.json` 内写入的 `version` 是历史沿革值 `0.2.0`，**不属版本落点**，不得在无用户指令的情况下静默改动（见「关键常量」）。
 

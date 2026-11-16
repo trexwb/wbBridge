@@ -1,6 +1,6 @@
 # WB Bridge
 
-基于 Tauri 2 的跨平台托盘应用，通过隔离的 OpenCode 运行时为 [WorkBuddy](https://www.workbuddy.cn) 提供免费模型（CodeBuddy 同样支持）。当前版本 **1.3.11**。
+基于 Tauri 2 的跨平台托盘应用，通过隔离的 OpenCode 运行时为 [WorkBuddy](https://www.workbuddy.cn) 提供免费模型（CodeBuddy 与 DSH 同样支持）。当前版本 **1.3.13**。
 
 ## 简介
 
@@ -8,11 +8,12 @@ WB Bridge 做三件事：
 
 1. **托管一个隔离的 OpenCode 运行时**：优先复用本机已有的 `opencode`，否则从 npm registry（官方源 → 国内镜像）下载官方 tarball，校验 `sha512-` 完整性后解包到数据目录，用隔离环境变量 + 独立随机端口以 `serve --pure` 启动，不污染用户已有 OpenCode 的配置、数据、缓存与登录态。
 2. **在本地提供 OpenAI 兼容接口**：`127.0.0.1:<port>` 上的 `/v1/models` 与 `/v1/chat/completions`（含 SSE 流式）；所有路由都要 Bearer 鉴权（值为数据目录 `api-key` 文件的内容），任何非空 `Origin` 一律 403，并发 ≤8、请求体 ≤8MB。
-3. **把可用模型同步给插件**：自动发现免费模型 → 逐模型真实探测（会消耗少量免费额度）→ 只把探测通过的模型写进 WorkBuddy / CodeBuddy 的 `models.json`（原子替换 + 增量合并，只动本应用拥有的条目，不产生 `.bak` 备份；退出时清理自己名下的条目并保留用户手动配置）。
+3. **把可用模型同步给插件与 DSH**：自动发现免费模型 → 逐模型真实探测（会消耗少量免费额度）→ 只把探测通过的模型写进 WorkBuddy / CodeBuddy 的 `models.json`（原子替换 + 增量合并，只动本应用拥有的条目，不产生 `.bak` 备份；退出时清理自己名下的条目并保留用户手动配置），同时写进 DSH（DeepSeek Harness）的 profile 用户补丁：只覆盖本服务自己的 `wbbridge` provider，其它 provider 与注释原样保留，本服务令牌以凭据引用写入 `~/.dsh/.credentials.yaml`（`0600`）。
 
 其他要点：
 
-- **可选接入自己的平台 Key**：侧栏「平台」视图填入 ModelScope（魔搭）/ SiliconFlow / 腾讯混元 TokenHub / 智谱 / 爱思 Agnes / 商汤 SenseNova / NVIDIA NIM / OpenRouter / Hugging Face 任一家 Key，该家的免费模型会和 OpenCode 自带的免费模型一起被发现并发布。每家平台在列表里只占一行，点「管理配置」进入弹窗：官方申请指引、Key 管理、付费白名单都在这一处。Key 只落盘到数据目录 `providers.json`（`0600`），列表只显示「已配置 / 未配置」；已保存的 Key 在打开该平台弹窗时即由**本机核心**取回并掩码显示在输入框里（`POST /admin/reveal-provider-key`，一次一个平台；点眼睛可临时看明文，收起不清空），仅在弹窗内存中，关闭即清掉，绝不进日志、`status.json`、面板偏好或子进程环境变量。**付费模型按需放行**：发现只收标价全 0 的模型；已付费开通的模型在同一个弹窗的白名单里显式放行——输入框是**可编辑选择器**，默认给出该平台最近一次发现里的已知模型（可直接选），尚未被发现、不在候选里的模型也可手动输入 `<平台 id>/<模型 id>`。放行后会真实计费，且不会被 `WB · auto` 自动选中。**客户端可见的模型 id** 一律是 `<两字母短前缀> · 名称`（ModelScope `MS`、SiliconFlow `SF`、腾讯混元 TokenHub `TT`、智谱 `ZP`、爱思 Agnes `AG`、商汤 SenseNova `SN`、NVIDIA NIM `NV`、OpenRouter `OR`、Hugging Face `HF`），OpenCode 自带的免费模型与其余未知命名空间沿用 `OC · `。
+- **可选接入自己的平台 Key**：侧栏「平台」视图填入 ModelScope（魔搭）/ SiliconFlow / 腾讯混元 TokenHub / 智谱 / 爱思 Agnes / 商汤 SenseNova / NVIDIA NIM / OpenRouter / Hugging Face 任一家 Key，该家的免费模型会和 OpenCode 自带的免费模型一起被发现并发布。另有 **Kilo 与 OpenCode 免密直连**（2026-11-16 新增）：Kilo 无需账号或 Key，自动接入它公开的免费模型池；OpenCode 是 OpenCode 运行时自带的命名空间，同样无需 Key（本应用只登记不注入）。两者免费池的提示词都可能被上游记录用于服务改进，**请勿发送敏感内容**。每家平台在列表里只占一行，点「管理配置」进入弹窗：官方申请指引、Key 管理、付费白名单都在这一处（Kilo / OpenCode 只显示生效方式与隐私提示）。Key 只落盘到数据目录 `providers.json`（`0600`），列表只显示「已配置 / 未配置」；已保存的 Key 在打开该平台弹窗时即由**本机核心**取回并掩码显示在输入框里（`POST /admin/reveal-provider-key`，一次一个平台；点眼睛可临时看明文，收起不清空），仅在弹窗内存中，关闭即清掉，绝不进日志、`status.json`、面板偏好或子进程环境变量。**付费模型按需放行**：发现只收标价全 0 的模型；已付费开通的模型在同一个弹窗的白名单里显式放行——输入框是**可编辑选择器**，默认给出该平台最近一次发现里的已知模型（可直接选），尚未被发现、不在候选里的模型也可手动输入 `<平台 id>/<模型 id>`。放行后会真实计费，且不会被 `WB · auto` 自动选中。**客户端可见的模型 id** 一律是 `<两字母短前缀> · 名称`（ModelScope `MS`、SiliconFlow `SF`、腾讯混元 TokenHub `TT`、智谱 `ZP`、爱思 Agnes `AG`、商汤 SenseNova `SN`、NVIDIA NIM `NV`、OpenRouter `OR`、Hugging Face `HF`、Kilo `KL`、OpenCode `OC`），其余未知命名空间也沿用 `OC · `。
+- **DSH（DeepSeek Harness）自动接入**：只要 `$DSH_HOME`（默认 `~/.dsh`）的任一 profile 里存在 `cordis.patch.yml`，每次发布都会同步一份 `wbbridge` 路由到 DSH 的「模型」插件（`@deepseek-ai/dsh-llm-pi-ai`）——模型表含 `WB · auto` 与全部发布模型；只改该行 `config.providers.wbbridge`，别的 provider、别的行与注释一律不动，退出时只删本服务这一条。路由同时声明推理档位：每个模型只列出它真正支持的 `minimal/low/medium/high/xhigh/max`（`WB · auto` 取并集），因此 DSH 的模型选择器里能直接选思考档位，`WB · auto` 也会按选中的档位挑模型。本服务令牌以 `apiKeyEnv: WB_BRIDGE_API_KEY` 引用写入 `~/.dsh/.credentials.yaml`（`0600`，`records` 与其它引用保留）。没有 profile 时如实报「未检测到」并跳过，不补建 profile。
 - **`WB · auto`：不用挑模型**：把 `model` 填成 `WB · auto`，核心就在**当前可用**的免费模型里按请求内容选一个真实模型（带图片只挑支持视觉的；带工具定义避开「仅对话」且要求支持函数调用；付费白名单条目除外）；同一档位内优先选**速度权重最高**的模型，权重相同才随机分散。权重由探测耗时给出（≤2/5/10/20/40s → 100/80/60/40/20，更慢 10），真实请求整条耗时 ≥30s 时扣 20；全部归零后下一次真实请求会触发一次全量重新检测、按新耗时重新分配。响应里的 `model` 是**实际模型的全限定 id**，用量与逐模型状态都记在它身上；该模型真实报错时按既有判决被移出可用集合，恢复要靠面板「重新检测」或「刷新」。可用池为空时这个名字不出现在列表里。模型列表非空时，它会作为独立条目写进 WorkBuddy / CodeBuddy 的 `models.json`，在插件模型选择器里可直接选中；`同步数量` 仍只数真实模型、不含这一条。详见[使用指南](docs/wiki/使用指南.md)与[核心概念与功能](docs/wiki/核心概念与功能.md)。
 - **手动移除长期失败的模型 + 回收站**：不可用模型行内的「移除」（两段式确认）会让该模型**不再检测、不再发布**，并从主列表移到工具条的「回收站」面板；移除名单持久化在 `settings.json` 的 `removedModels`，跨重启生效，任何刷新 / 自动重检都不会把它拉回检测队列，也**不会把回收站里的条目清空**（「读取免费模型」后仍在那里，可随时恢复）。回收站内每行可「恢复」，恢复后立即单检一次，通过才重新进入发布集。工具条按钮在列表态显示「回收站（N）」，进入后变为「模型列表」，再点一次或按 `Esc` 返回。
 - **AI 助手：用自然语言代管本应用**：侧栏「AI 助手」把面板已有的动作换成对话入口——只读工具（状态 / 模型 / 用量 / 日志尾部 / 平台配置状态 / 运行环境 / 检查更新）立即执行，写入工具（读取模型、检测、导入、保存与清除平台 Key、系统代理、重启与停止核心、打开申请页、下载安装与重启生效）**一律先作为提案**，在弹窗里逐条勾选确认后才执行，与面板按钮走同一条链路、不新增任何能力面。输入框在模型就位前禁用：外部端点要求地址 / 模型 / Key 齐备，本机大脑要求核心就绪且至少有一个探测通过的模型。默认大脑是本机免费模型的合成路由 `WB · auto`（无需任何 Key，端点与令牌由应用自己持有），也可改用任意 OpenAI 兼容端点（DeepSeek / 智谱 / 通义 / 本地 Ollama…），那种端点的 Key **只存在当前会话内存**，重启需重填。对话记录默认存在本机 IndexedDB（可在「设置 → 记住对话」关掉，关掉即删除已存记录；落盘前丢弃工具入参），助手端点的 Key 只存在当前会话内存。⚠ 该功能的运行证据目前只有单测与构建，**面板从未在真实 GUI 里发出过一次助手请求**（见[已知限制与未验证项](docs/wiki/已知限制与未验证项.md) 第 17 项）。
@@ -45,7 +46,7 @@ xattr -dr com.apple.quarantine "/Applications/WB Bridge.app"
 
 ### 首次使用
 
-1. 先安装并登录 WorkBuddy（CodeBuddy 同样支持，两个插件可以都装）。在插件里保存过一个自定义模型最稳妥——它会生成 `models.json`；插件目录已存在但还没有这个文件时，本应用会补建一个空配置再照常发布（已存在的文件绝不改写，插件目录不存在也不会替插件建目录）。
+1. 先安装并登录 WorkBuddy（CodeBuddy 与 DSH 同样支持，可以都装）。插件里保存过一个自定义模型最稳妥——它会生成 `models.json`；插件目录已存在但还没有这个文件时，本应用会补建一个空配置再照常发布（已存在的文件绝不改写，插件目录不存在也不会替插件建目录）。DSH 只需已有 profile（`~/.dsh/profiles/<名称>/cordis.patch.yml`），不需要任何手工配置。
 2. 启动 WB Bridge：自动准备运行时、扫描并检测免费模型，找到有效配置后自动导入。
 3. 找不到配置时点「导入」选择 `models.json`；Windows 托盘菜单「选择 WorkBuddy 配置…」可更换位置。
 4. 「使用系统代理」开关控制运行时下载与模型请求是否走系统 HTTP/HTTPS 代理。
@@ -90,7 +91,7 @@ curl -H "Authorization: Bearer $(cat "$HOME/Library/Application Support/Buddy Br
 
 ## 已知限制
 
-- 免费模型名单、额度与可用性由上游 OpenCode 决定，本应用不控制也不缓存上游额度。新增的五家平台（爱思 Agnes / 商汤 SenseNova / NVIDIA NIM / OpenRouter / Hugging Face）端点与免费判定取自 models.dev 目录，**未用真实 Key 逐家跑过发现 → 探测 → 发布链路**。
+- 免费模型名单、额度与可用性由上游 OpenCode 决定，本应用不控制也不缓存上游额度。新增的五家平台（爱思 Agnes / 商汤 SenseNova / NVIDIA NIM / OpenRouter / Hugging Face）端点与免费判定取自 models.dev 目录，**未用真实 Key 逐家跑过发现 → 探测 → 发布链路**。Kilo 免密池只在 OpenCode 1.19.5 沙箱验证过「注入 → 目录出现零价模型 → 无鉴权对话返回文本」，**未在 Tauri GUI 走完整条发布链**，且其提示词可能被上游记录。OpenCode 免密行只改了注册表与「平台」页展示（不注入、发现链路不变），**未在 Tauri GUI 复核徽章与弹窗文案**。
 - 速度权重与模型移除 / 回收站目前只有核心单测与浏览器内的面板验证，**未在真实 Tauri GUI 里走过「慢请求扣权 → 全池归零 → 自动重检」与「移除 → 回收站 → 恢复再探测」的完整链路**。
 - 未做商用代码签名 / 公证：Windows 可能提示未知发布者，macOS 需按上方步骤放行。
 - Windows ARM64 与 Linux 包由 CI 构建，尚未实机验证。

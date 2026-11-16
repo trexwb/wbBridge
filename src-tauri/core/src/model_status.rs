@@ -149,10 +149,10 @@ pub fn split_namespace(id: &str) -> (&str, &str) {
 /// 规则：MS / SF / TT / ZP，逐字钉在 `client_prefixes_match_the_declared_short_prefix_table`），
 /// 其余一律回落历史前缀 `OC`。
 ///
-/// `opencode` 与「无命名空间」之外的命名空间在今天的调用面里只可能是注册表平台
-/// （`free_models_in` 只以 `OPENCODE_NAMESPACE` 或注册表 id 被调用，见 Stage 3）；测试与
-/// 对拍夹具里的 `vendor/gpt` 这类合成 id 走 OC 回落——对拍夹具没有注册表命名空间的用例，
-/// 本裁定不碰 JS 真相，非注册表形态与写死 `OC · ` 时代逐字节一致。
+/// `opencode` 现在也登记在注册表里（免密、只登记不注入），其 `prefix` 同为 `OC`，所以这条
+/// 回落与「无命名空间」之外的调用面一致：`free_models_in` 只以 `OPENCODE_NAMESPACE` 或注册表
+/// id 被调用（见 Stage 3）；测试与对拍夹具里的 `vendor/gpt` 这类合成 id 走 OC 回落——对拍夹具
+/// 没有注册表命名空间的用例，本裁定不碰 JS 真相，非注册表形态与写死 `OC · ` 时代逐字节一致。
 fn client_prefix(model: &Value) -> &str {
     let (namespace, _) = split_namespace(
         model.get("id").and_then(Value::as_str).unwrap_or_default(),
