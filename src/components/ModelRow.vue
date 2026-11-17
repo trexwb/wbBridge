@@ -54,8 +54,24 @@ const statusLabel = computed(() => {
   if (props.reprobing) return '检测中'
   if (props.waiting) return props.probing ? '检测中' : '等待检测'
   if (props.inRequest) return '请求中'
+  // 超时只降权、不摘除：模型仍在发布集里，只是速度权重比同池其他模型低。
+  if (props.available && props.result?.category === 'timeout') return '可用 · 超时降权'
   if (props.available) return props.result?.chatOnly ? '可用 · 仅对话' : '可用'
+  if (props.result?.category === 'quota') {
+    return props.result.restrictedUntil ? '额度不足 · 次日重试' : '额度不足'
+  }
   return LABELS[props.result?.category] || (props.result?.ok === false ? '不可用' : '待检测')
+})
+
+// 徽章悬浮说明：受限 / 降权都不是「坏了」，必须交代接下来会发生什么（次日自动重检、通过自动恢复）。
+const statusTitle = computed(() => {
+  if (props.result?.category === 'quota' && props.result?.restrictedUntil) {
+    return '当日额度已用尽：已停止发布，次日自动重新检测，通过后自动恢复'
+  }
+  if (props.available && props.result?.category === 'timeout') {
+    return '最近一次超时：仍可用，但速度权重已调低，WB · auto 会优先选择同档更快的模型'
+  }
+  return ''
 })
 const unavailable = computed(() => !props.removed && !busy.value && !props.inRequest && !props.available && (props.result?.ok === false || !props.available))
 // 不可用模型显示「重新检测」入口；点击后按钮留在原位转为「检测中」+ spinner，而不是消失或
@@ -125,7 +141,7 @@ const weight = computed(() => {
         class="badge weight"
         :title="`速度权重 ${weight}：WB · auto 优先选择权重最高的可用模型`"
       >权重 {{ weight }}</span>
-      <span class="badge" :class="{ unavailable: unavailable && !available, waiting: busy || inRequest, removed }">{{ statusLabel }}</span>
+      <span class="badge" :class="{ unavailable: unavailable && !available, waiting: busy || inRequest, removed }" :title="statusTitle || null">{{ statusLabel }}</span>
       <button
         v-if="canReprobe"
         class="reprobe-btn"

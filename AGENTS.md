@@ -272,10 +272,16 @@ WorkBuddy
 models.json → free_models(providers)（免费判定：输入/输出/缓存全 0、输出支持文本、非 deprecated）
   → 逐模型探测（probe_model：工具调用类 + 纯文本类，失败可重试 1 次）
   → 仅 ok 的模型进入发布集（客户端 ID = `<前缀> · <name>`：注册表平台用各自两字母短前缀，`opencode` 与未注册命名空间回落 `OC`）
-     `publishable_models` 同时要求「已校验」且 `modelResults[id].ok === true`：失败 / 超时 / 不可用的模型
-     既不写入两个插件配置，也不进 `/v1/models` 与 `WB · auto` 的选择域
+     `publishable_models` 同时要求「已校验」且「`modelResults[id].ok === true` 或带 `soft: true`」：
+     失败 / 额度用尽 / 从未通过探测的模型既不写入两个插件配置，也不进 `/v1/models` 与 `WB · auto` 的选择域
+  → 失败归类（`model_status::model_result` 的 `category`）决定后续动作（2026-11-17 用户裁定）：
+     **超时（`timeout`）只降权、不判死**——`record` 若该模型此前已通过校验则保留发布资格并打 `soft: true`
+     （重启后 `validated_from_results` 沿用），权重按 `auto::TIMEOUT_PENALTY`（= `SLOW_PENALTY`）扣一档；
+     **额度用尽（`quota`）判不可用**——写入 `modelResults[id].restrictedUntil`（下一个 UTC 零点，`next_day_retry_at`），
+     批量探测跳过尚未到点的受限模型，后台任务 `spawn_quota_retry` 每 60s 检查一次，到点自动重检、通过即恢复发布
+     （付费白名单不进入自动重检；换 Key 时 `clear_quota_restrictions` 解除该平台的受限时刻）
   → sync_models（原子写）→ merge_models（保留非本工具条目，只清理/更新 OWNER = 'buddy-bridge-v1' 的条目）
-     收敛：真实请求失败（`record()`）、批量探测本轮有失败（手工读取也重发）、单模型重检失败都立即重发
+     收敛：真实请求失败（`record()`，超时除外）、批量探测本轮有失败（手工读取也重发）、单模型重检失败都立即重发
   → 生产发布链走 merge_models_auto（`SyncOptions.auto_route = true`）：发布集非空时在末位追加一条 `WB · auto` 合成路由条目，
     使 WorkBuddy/CodeBuddy 里看得见这个入口；该条目不计入 `sync.count`，也不进 `status.json` 的模型列表。
     能力声明按**免费池**如实统计（2026-11-17 用户推翻 supportsImages 恒 false 的保守裁定）：
@@ -334,6 +340,8 @@ start_backend
 | `status.json` 顶层 `usage` | `{since, total:{requests,ok,failed}, models:{<clientModelId>:{requests,ok,failed,lastMs,avgMs}}}`；**只累计真实请求**（`source == "request"`，客户端取消的不计为成功），跨重启延续 | `orchestration.rs` |
 | 状态内置版本 | `"0.2.0"`（写入 `status.json`，历史沿革值） | `orchestration.rs` 状态初值 |
 | 格式类失败集合 | `REQUEST_SHAPED_FAILURES`（4 项） | `orchestration.rs` |
+| 超时降权额 | `TIMEOUT_PENALTY = SLOW_PENALTY = 20`（探测与真实请求的超时同额扣分） | `auto.rs` |
+| 额度受限重试 | 下一个 UTC 零点（`next_day_retry_at`，`restrictedUntil` 存于 `modelResults.<id>`）；后台每 60s 检查一次 | `orchestration.rs` |
 | 转写首选名单 | `TRANSLATOR_ORDER`（4 项，须排除刚失败模型） | `orchestration.rs` |
 
 ## 编码规范
@@ -416,7 +424,7 @@ start_backend
   禁止新增按宽度堆叠的媒体查询或 `<900px` 降级分支——`src/` 内现存的媒体查询只有 `prefers-color-scheme`（`variables.css`）与
   `prefers-reduced-motion`（`base.css`）两处。收起详情有三条等价路径：`Esc`（`App.vue::onKeydown`）、详情头部「收起详情」按钮、
   窗口失焦（`onDismiss`）；收起即清空选中，列表占满主区宽度。
-- **侧栏是分组导航**：分组为「模型 / 运行 / 集成 / 其他」，底部为「运行设置」（系统代理开关 + 版本号）。**8 个入口都是已实现的视图**（视图 ID 的唯一名单是 `prefs.js` 的 `VIEW_IDS`，视图状态由 `src/App.vue` 的 `view` 持有，侧栏按 `current` 高亮并带 `aria-current="page"`）：
+- **侧栏是分组导航**：分组为「模型 / 运行 / 其他」，底部为「运行设置」（系统代理开关 + 版本号）。**8 个入口都是已实现的视图**（视图 ID 的唯一名单是 `prefs.js` 的 `VIEW_IDS`，视图状态由 `src/App.vue` 的 `view` 持有，侧栏按 `current` 高亮并带 `aria-current="page"`）：
   模型与服务（`.top` + `.content`，保留主从两栏；工具条的「回收站」按钮在页内切到独立回收站面板 `src/views/ModelRecycleBin.vue`，已移除模型不混进主列表）、平台（`src/views/ProvidersView.vue`，十一家平台各占一行摘要「名称 / 注册表 id / 已配置或未配置 / 付费放行数」——Kilo 与 OpenCode 是免密平台：徽章显示「免密直连」，弹窗只给生效方式与隐私提示（按平台的 `keylessNote` 分文案：Kilo 说明核心恒常注入，OpenCode 说明是运行时自带命名空间、不额外注入），不显示 Key 表单、申请引导与付费白名单；点「管理配置」进同一张弹窗，内分申请引导、Key 表单与付费白名单三块——**打开弹窗即经 `reveal-provider-key` 尝试取回该平台已保存的 Key 并掩码回填**（一次一条；不按「已配置」徽章决定——徽章可能滞后；「尚未配置」静默，其余失败在弹窗内显示原因并可点眼睛重试；回填后保存按钮禁用，避免原样重写触发重检），点眼睛在掩码 / 明文间切换（**纯本地即时切换**：不改 `revealing` 之外的状态、不等待回读、读回在飞时也不禁用；**入口绑 `pointerdown` 而非 `click`**——弹窗入场动画期间按下与松开的落点会差开，`click` 会落到共同祖先甚至不派发，键盘 / 辅助技术仍走 `click`，两者用 700ms 时间戳互斥保证一次操作只翻一下；收起明文不清空；读回值回来后按当前模式呈现；读回中的提示只走输入框占位文案，不插入额外行、不改变弹窗高度），值仅组件内存、关弹窗即清出；弹窗具备 `role="dialog"` + Tab 焦点陷阱 + Esc 关闭与焦点归还）；付费白名单的模型输入框是**可编辑选择器**（`<input list>` + `<datalist>`），默认候选取 `state.models` 里该平台命名空间下的已知模型（去重排序，值只填模型 key、保留 key 自身的 `/`），不在候选里的模型仍可手动输入；跨平台拒绝只认「首段命中别家注册表平台 id」，不得按第一个 `/` 粗暴切前缀）、运行日志（`src/views/LogsView.vue`，经 `read_log` 只读拉取日志尾部，另可经 `clear_log` 两段式确认后截断 `opencode.log`——文件缺失视为已清空，不动 `opencode.log.previous`）、用量与额度（`src/views/UsageView.vue`，渲染 `status.json` 顶层 `usage`）、
   WorkBuddy 集成（`src/views/IntegrationView.vue`，只读展示配置定位与最近发布结果——WorkBuddy / CodeBuddy 的 `models.json` 与 DSH 的 profile patch 列表，唯一动作是复用既有 `import`；DSH 没有导入入口，检测到 profile 就随每次发布自动写入）、**提示词优化**（`src/views/PromptView.vue` + `src/core/prompt.js` + `src/core/promptSession.js`：固定本机 `WB · auto`；系统 / 用户提示词、7 个内置模板、版本链与迭代、占位符缺失 / 新增提示、「同一输入分别跑源提示词 / 当前版本」的对比测试；内容只存会话内存；与 AI 助手共用壳侧 AI 通道并互斥；提交有在飞互斥、500ms 前沿节流与逐次拒绝文案）、**AI 助手**（`src/views/AssistantView.vue` + `src/core/ai.js`：自然语言入口，只读工具立即执行、写入工具一律先作提案再逐条确认；大脑默认本机 `WB · auto`，也可切外部 OpenAI 兼容端点；端点 Key **只在会话内存**（见 `prefs.js` 的 `ai` 键白名单），**对话记录默认记在本机 IndexedDB**（`src/core/chatSession.js`，可在「设置」关掉、可「清空」；工具入参不落盘）；**模型就位前输入区整块禁用**，横幅给出原因与出路）、关于与更新（`src/views/AboutView.vue`，版本与数据目录只读 + **自动更新区**：启动后静默检查、发现新版本才出现更新条、由用户点「下载并安装」，进度百分比只在上游给出 `contentLength` 时显示，装完点「重启应用」经 `process.relaunch` 走 `ExitRequested` 的有界停止）。
   **禁止**再出现「规划中」标签、禁用占位或可点击却无响应的假入口。
@@ -516,9 +524,9 @@ start_backend
 
 | 项 | 值 | 来源 |
 |---|---|---|
-| 版本单一来源 | **1.3.18** | 根 `package.json` 的 `version` |
-| 壳工程同步落点 | **1.3.18** | `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `[package] version` |
-| 核心 crate 版本 | **1.3.18** | `src-tauri/core/Cargo.toml`（`wbbridge-core --version` 输出；随产品版本同步，`version:set`/`version:check` 均覆盖） |
+| 版本单一来源 | **1.3.20** | 根 `package.json` 的 `version` |
+| 壳工程同步落点 | **1.3.20** | `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `[package] version` |
+| 核心 crate 版本 | **1.3.20** | `src-tauri/core/Cargo.toml`（`wbbridge-core --version` 输出；随产品版本同步，`version:set`/`version:check` 均覆盖） |
 
 > `status.json` 内写入的 `version` 是历史沿革值 `0.2.0`，**不属版本落点**，不得在无用户指令的情况下静默改动（见「关键常量」）。
 

@@ -141,6 +141,18 @@ fn now_millis() -> f64 {
         * 1000.0
 }
 
+/// 一昼夜的毫秒数：额度「次日重试」的边界单位。
+const DAY_MS: i64 = 86_400_000;
+
+/// 当日额度用尽后的重检时刻：**下一个 UTC 零点**。
+///
+/// 免费平台的日额度普遍按 UTC 或本地零点重置；取 UTC 零点作为统一边界，最晚不超过一天，
+/// 常见时区（如 UTC+8，零点即本地早八点）也在「第二天」范围内，且不引入时区库。
+fn next_day_retry_at() -> i64 {
+    let now = now_millis().max(0.0) as i64;
+    (now / DAY_MS + 1) * DAY_MS
+}
+
 fn truthy(value: &Value) -> bool {
     match value {
         Value::Null => false,
@@ -444,12 +456,30 @@ fn apply_patch(
                 let ok = result.get("ok") == Some(&Value::Bool(true));
                 let source = result.get("source").and_then(Value::as_str).unwrap_or_default();
                 let duration_ms = result.get("durationMs").and_then(Value::as_i64).unwrap_or(0);
+                // 归类来自 `model_status::model_result`：超时降权（不是判死），额度用尽记次日重试时刻。
+                let category = result
+                    .get("category")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let timed_out = !ok && category == crate::model_status::CATEGORY_TIMEOUT;
                 results.insert(model.to_string(), result.clone());
-                if let Some(weight) =
-                    crate::auto::next_weight(previous_weight, ok, source, duration_ms)
-                {
+                if let Some(weight) = crate::auto::next_weight(
+                    previous_weight,
+                    ok,
+                    source,
+                    duration_ms,
+                    timed_out,
+                ) {
                     if let Some(entry) = results.get_mut(model).and_then(Value::as_object_mut) {
                         entry.insert("weight".to_string(), json!(weight));
+                    }
+                }
+                // 当日额度用尽：不是「坏了」，而是「今天没额度了」。写下次日重试时刻，
+                // 批量探测据此跳过、`spawn_quota_retry` 到点自动重检；探测通过时整条结果
+                // 被覆盖，这个键随之消失，模型自动恢复发布。
+                if !ok && category == crate::model_status::CATEGORY_QUOTA {
+                    if let Some(entry) = results.get_mut(model).and_then(Value::as_object_mut) {
+                        entry.insert("restrictedUntil".to_string(), json!(next_day_retry_at()));
                     }
                 }
             }
@@ -614,7 +644,8 @@ fn normalize_paid_model(value: &str) -> Option<String> {
     Some(value.to_string())
 }
 
-/// 从沿用的目录与历史结果重建「已通过校验」集合：只认 `ok === true` 且带字符串 `id` 的条目。
+/// 从沿用的目录与历史结果重建「已通过校验」集合：只认 `ok === true`（或超时的 `soft: true`）
+/// 且带字符串 `id` 的条目。
 ///
 /// 判定与 `usable_models()` 用的是同一个表达式，所以「沿用上次结果」与「重新探测」不会有两套口径；
 /// `ok: 1` 这种 truthy 但不是 `true` 的（外部改写过 status.json）一律不算通过。
@@ -623,8 +654,10 @@ fn validated_from_results(models: &[Value], results: &Value) -> HashSet<String> 
         .iter()
         .filter_map(|model| {
             let id = model.get("id").and_then(Value::as_str)?;
-            (results.get(id).and_then(|entry| entry.get("ok")) == Some(&json!(true)))
-                .then(|| id.to_string())
+            let entry = results.get(id);
+            let ok = entry.and_then(|entry| entry.get("ok")) == Some(&json!(true));
+            let soft = entry.and_then(|entry| entry.get("soft")) == Some(&json!(true));
+            (ok || soft).then(|| id.to_string())
         })
         .collect()
 }
@@ -710,6 +743,10 @@ async fn drain_status() {
 /// （并发写、被外部改过的 `status.json`），只要最近一次结果是 `ok: false`（含
 /// `code: "timeout"`）就进不了发布集。已移除模型同样按 id 排除——即使它此刻恰好探测
 /// 通过（移除动作与在飞探测并发时会出现），也不能重新发布。
+///
+/// **超时例外**（2026-11-17）：`ok: false` 且带 `soft: true`（由 `record` 只在模型此前已通过
+/// 校验时写入）仍留在发布集——超时表达的是「慢」，由权重降级（`auto::next_weight`）表达，
+/// 不撤销发布；从未通过探测的模型不会带这个标记，照旧排除。
 fn publishable_models(
     models: &[Value],
     validated: &HashSet<String>,
@@ -722,7 +759,8 @@ fn publishable_models(
             let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
             !removed.iter().any(|removed_id| removed_id == id)
                 && validated.contains(id)
-                && results.get(id).and_then(|entry| entry.get("ok")) == Some(&json!(true))
+                && (results.get(id).and_then(|entry| entry.get("ok")) == Some(&json!(true))
+                    || results.get(id).and_then(|entry| entry.get("soft")) == Some(&json!(true)))
         })
         .map(|model| {
             let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
@@ -790,6 +828,140 @@ fn reprobe_when_weights_exhausted(source: &str) {
     let started = start_probes(None, false, false, &Scope::All);
     if started.get("started") != Some(&json!(true)) {
         log_line("权重归零后的重新检测未能启动（已有读取或探测在进行）");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 当日额度用尽：跳过与次日自动重检
+// ---------------------------------------------------------------------------
+
+/// 结果条目是否处于「当日额度用尽、未到重试时刻」的受限态。
+fn quota_restricted(results: &Value, model_id: &str, now: f64) -> bool {
+    results.get(model_id).is_some_and(|entry| {
+        entry.get("category").and_then(Value::as_str) == Some(crate::model_status::CATEGORY_QUOTA)
+            && entry
+                .get("restrictedUntil")
+                .and_then(Value::as_f64)
+                .is_some_and(|until| until > now)
+    })
+}
+
+/// 到点可重检的模型：受限时刻已过、仍在目录里、未移除、非付费白名单。
+///
+/// 自动重检会发真实请求，付费条目按数据红线 6 一律排除（只留给用户手动触发）。
+fn quota_due_models(
+    models: &[Value],
+    results: &Value,
+    removed: &[String],
+    now: f64,
+) -> Vec<Value> {
+    models
+        .iter()
+        .filter(|model| {
+            let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
+            if id.is_empty() || removed.iter().any(|removed_id| removed_id == id) {
+                return false;
+            }
+            if model.get("paid") == Some(&json!(true)) {
+                return false;
+            }
+            results.get(id).is_some_and(|entry| {
+                entry.get("category").and_then(Value::as_str)
+                    == Some(crate::model_status::CATEGORY_QUOTA)
+                    && entry
+                        .get("restrictedUntil")
+                        .and_then(Value::as_f64)
+                        .is_some_and(|until| until <= now)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// 次日额度重检任务：每 60s 看一次是否有到点模型；有就按批量探测跑一轮。
+///
+/// 与用户触发的批量探测共用 `probing` 互斥与 `probe` 进度，因此面板能看到「自动检测中」。
+fn spawn_quota_retry(app: Arc<App>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            if app.stopping.load(Ordering::Relaxed) {
+                return;
+            }
+            if app.probing.load(Ordering::Relaxed) || lock(&app.refresh).is_some() {
+                continue;
+            }
+            let due = quota_due_models(
+                &app.models(),
+                &app.snapshot().get("modelResults").cloned().unwrap_or(Value::Null),
+                &lock(&app.removed).clone(),
+                now_millis(),
+            );
+            if !due.is_empty() {
+                start_quota_retry(due);
+            }
+        }
+    });
+}
+
+/// 把到点模型交给批量探测（`auto_import = true`：一轮结束即按新发布集重写配置，
+/// 探测通过的模型自动恢复为可用）。
+fn start_quota_retry(selected: Vec<Value>) -> bool {
+    let app = global_app();
+    if app.stopping.load(Ordering::Relaxed) || lock(&app.refresh).is_some() {
+        return false;
+    }
+    if app.probing.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    let pending: Vec<String> = selected
+        .iter()
+        .filter_map(|model| model.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    log_line(&format!(
+        "{} 个模型的当日额度限制已到期，开始自动重新检测",
+        pending.len()
+    ));
+    let (done_tx, done_rx) = watch::channel(false);
+    let id = next_chain_id();
+    tokio::spawn(async move {
+        run_probe_batch(selected, pending, false, true).await;
+        let _ = done_tx.send(true);
+    });
+    *lock(&app.probe_task) = Some(Slot::new(id, done_rx));
+    true
+}
+
+/// 换 / 新增平台 Key 等于换了一份额度：清掉该平台模型的受限时刻，
+/// 让随后的导入与探测重新覆盖它们（结果条目本身仍是失败态，直到新探测通过）。
+fn clear_quota_restrictions(provider: &str) {
+    let app = global_app();
+    let mut cleared = 0usize;
+    {
+        let mut state = lock(&app.state);
+        let Some(results) = state.get_mut("modelResults").and_then(Value::as_object_mut) else {
+            return;
+        };
+        for (id, entry) in results.iter_mut() {
+            if crate::model_status::split_namespace(id).0 != provider {
+                continue;
+            }
+            let Some(object) = entry.as_object_mut() else { continue };
+            if object.get("category").and_then(Value::as_str)
+                != Some(crate::model_status::CATEGORY_QUOTA)
+            {
+                continue;
+            }
+            if object.remove("restrictedUntil").is_some() {
+                cleared += 1;
+            }
+        }
+    }
+    if cleared > 0 {
+        persist_status(app.snapshot());
+        log_line(&format!(
+            "平台 {provider} 的 Key 已更新，{cleared} 个模型的当日额度限制已解除"
+        ));
     }
 }
 
@@ -1062,10 +1234,23 @@ async fn record(
     }
 
     // 只有「从通过集里被摘掉」才算发布集真的收缩：已不在集合里时重复失败不该反复重写配置。
+    // 超时是例外：它表达的是「慢」而不是「坏」，保留发布资格、只降权重（扣分在同一把锁里由
+    // `apply_patch` 完成），并用 `soft` 标记让重启后的 `validated_from_results` 沿用这份资格。
+    // 从未通过探测的模型不会被判 soft——它本来就不在 `validated` 里。
+    let soft_timeout = !ok
+        && result.get("category").and_then(Value::as_str)
+            == Some(crate::model_status::CATEGORY_TIMEOUT);
     let became_unavailable = {
         let mut validated = lock(&app.validated);
         if ok {
             validated.insert(model.to_string());
+            false
+        } else if soft_timeout {
+            if validated.contains(model) {
+                if let Some(object) = result.as_object_mut() {
+                    object.insert("soft".to_string(), json!(true));
+                }
+            }
             false
         } else {
             validated.remove(model)
@@ -1088,10 +1273,11 @@ async fn record(
     // `modelResults` 走锁内逐键写入（不再由这里读整份快照再整体覆盖）。
     let model_result = (!model.is_empty()).then_some((model, &result));
     persist_status(update_with_usage(Value::Object(patch), usage_entry, model_result));
-    // 真实请求把模型判成不可用（含超时）之后，插件配置必须当场收敛：否则 WorkBuddy /
-    // CodeBuddy 里仍留着这一条，用户选中就必然失败，而 `usable_models()`（`/v1/models`
-    // 与 `WB · auto` 的选择域）已经把它排除。批量探测期间不在这里写：每个失败都整写一次
-    // 没有意义，交给批次收尾统一按过滤后的发布集重发（见 `republish_after_probe_batch`）。
+    // 真实请求把模型判成不可用（超时除外——超时只降权、仍留在发布集）之后，插件配置必须
+    // 当场收敛：否则 WorkBuddy / CodeBuddy 里仍留着这一条，用户选中就必然失败，而
+    // `usable_models()`（`/v1/models` 与 `WB · auto` 的选择域）已经把它排除。批量探测期间
+    // 不在这里写：每个失败都整写一次没有意义，交给批次收尾统一按过滤后的发布集重发
+    // （见 `republish_after_probe_batch`）。
     if became_unavailable && source == "request" && !app.probing.load(Ordering::Relaxed) {
         sync_published(None, false);
     }
@@ -1250,27 +1436,58 @@ fn start_probes(
             !removed.iter().any(|removed_id| removed_id == id)
         })
         .collect();
-    let selected: Vec<Value> = match model_id.as_ref().and_then(Value::as_str) {
-        Some(id) => models
-            .iter()
-            .filter(|model| model.get("id").and_then(Value::as_str) == Some(id))
-            .cloned()
-            .collect(),
-        None => models
-            .iter()
-            .filter(|model| scope.covers(model))
-            .cloned()
-            .collect(),
+    let (selected, skipped_quota) = match model_id.as_ref().and_then(Value::as_str) {
+        Some(id) => (
+            models
+                .iter()
+                .filter(|model| model.get("id").and_then(Value::as_str) == Some(id))
+                .cloned()
+                .collect::<Vec<_>>(),
+            0usize,
+        ),
+        None => {
+            let covered: Vec<Value> = models
+                .iter()
+                .filter(|model| scope.covers(model))
+                .cloned()
+                .collect();
+            // 当日额度已用尽的模型不重复烧探测时间：到点由后台任务自动重检
+            // （见 `spawn_quota_retry`）。单模型重新检测不受这条限制——那是用户显式点名。
+            let results = app
+                .snapshot()
+                .get("modelResults")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let now = now_millis();
+            let kept: Vec<Value> = covered
+                .iter()
+                .filter(|model| {
+                    let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
+                    !quota_restricted(&results, id, now)
+                })
+                .cloned()
+                .collect();
+            let skipped = covered.len() - kept.len();
+            (kept, skipped)
+        }
     };
     if selected.is_empty() {
         // 显式指定模型与全量/平台检测分开措辞：后者为空通常是把模型都移除了，
-        // 说「模型不在当前目录中」会让人以为目录读取失败。
+        // 说「模型不在当前目录中」会让人以为目录读取失败。全部受限时说明真实原因，
+        // 免得用户以为检测坏了。
         let message = if model_id.is_some() {
             "模型不在当前目录中（或已被移除）"
+        } else if skipped_quota > 0 {
+            "模型当日额度已用尽，已安排次日自动重新检测"
         } else {
             "没有可检测的模型（可能已被全部移除）"
         };
         return json!({ "error": { "message": message, "type": "invalid_request_error" } });
+    }
+    if skipped_quota > 0 {
+        log_line(&format!(
+            "{skipped_quota} 个模型的当日额度已用尽，本轮跳过（次日自动重新检测）"
+        ));
     }
     // 单模型探测不与批量探测互斥：直接 spawn 独立 task，不走 probing 全局锁
     if model_id.is_some() {
@@ -2199,6 +2416,7 @@ pub async fn run(options: StartOptions) -> u8 {
         spawn_parent_watchdog(app.clone(), parent_pid);
     }
     spawn_activity_timer(app.clone());
+    spawn_quota_retry(app.clone());
 
     let startup = startup_sequence(&app).await;
     match startup {
@@ -3165,11 +3383,16 @@ fn provider_key_input(body: &Value) -> Result<(String, String), BackendError> {
 /// 写成功后直接回一份新状态，面板不必再发一次 `provider-status`。
 async fn set_provider_key(body: Value) -> Result<Value, BackendError> {
     let (provider, api_key) = provider_key_input(&body)?;
-    providers_io(move |data_dir| {
+    let id = provider.clone();
+    let status = providers_io(move |data_dir| {
         providers::set_key(data_dir, &provider, &api_key)?;
         Ok(providers::status(data_dir))
     })
-    .await
+    .await?;
+    // 新 Key 可能带着新一份额度：解除该平台被「当日额度用尽」挡住的模型，
+    // 让随后的导入 / 探测重新覆盖它们（探测通过即自动恢复发布）。
+    clear_quota_restrictions(&id);
+    Ok(status)
 }
 
 /// `POST /admin/clear-provider-key`：`{ provider }`。没配过也算成功（幂等，面板不该因状态滞后报错）。
@@ -3865,6 +4088,101 @@ mod tests {
         let failed = json!({ "ok": false, "source": "request", "durationMs": 50_000 });
         apply_patch(&mut state, &json!({}), None, Some((model, &failed)));
         assert_eq!(state["modelResults"][model]["weight"], json!(100), "失败不改变权重");
+    }
+
+    /// 超时只降权、不判死：结果仍写 `ok: false`（面板要显示「超时」），权重扣一档；
+    /// 带 `soft` 的条目仍留在发布集里（`WB · auto` 与 `/v1/models` 继续可见，只是排序靠后）。
+    #[test]
+    fn timeouts_lower_the_weight_and_stay_publishable_when_marked_soft() {
+        let model = "opencode/slowpoke";
+        let mut state = json!({ "modelResults": { model: { "ok": true, "weight": 100 } } });
+        let timeout = json!({
+            "ok": false,
+            "category": "timeout",
+            "soft": true,
+            "source": "request",
+            "durationMs": 60_000
+        });
+        apply_patch(&mut state, &json!({}), None, Some((model, &timeout)));
+        assert_eq!(state["modelResults"][model]["weight"], json!(80), "超时与慢请求同额扣分");
+
+        let models = vec![json!({ "id": model })];
+        let validated: HashSet<String> = [model.to_string()].into_iter().collect();
+        let results = state["modelResults"].clone();
+        assert_eq!(
+            publishable_models(&models, &validated, &results, &[]).len(),
+            1,
+            "带 soft 的超时条目仍可发布"
+        );
+        // 没有 soft 标记的失败照旧被摘除（从未通过探测的模型不会带这个标记）。
+        let plain = json!({ model: { "ok": false, "category": "timeout" } });
+        assert!(publishable_models(&models, &validated, &plain, &[]).is_empty());
+    }
+
+    /// 重启沿用上一份状态时，带 `soft` 的超时条目必须继续算「已通过校验」，
+    /// 否则降权过的模型会在一次重启后从发布集里消失。
+    #[test]
+    fn validated_history_keeps_soft_timeouts() {
+        let models = vec![json!({ "id": "opencode/a" }), json!({ "id": "opencode/b" })];
+        let results = json!({
+            "opencode/a": { "ok": true },
+            "opencode/b": { "ok": false, "category": "timeout", "soft": true },
+        });
+        let validated = validated_from_results(&models, &results);
+        assert!(validated.contains("opencode/a"));
+        assert!(validated.contains("opencode/b"), "soft 超时必须沿用发布资格");
+        let plain = json!({ "opencode/b": { "ok": false, "category": "timeout" } });
+        assert!(!validated_from_results(&models, &plain).contains("opencode/b"));
+    }
+
+    /// 额度用尽写「次日 UTC 零点」：落在未来 24 小时内且与日界对齐；
+    /// 探测通过后整条结果被覆盖，受限键随之消失（模型自动恢复）。
+    #[test]
+    fn quota_failures_are_restricted_until_the_next_utc_midnight() {
+        let model = "opencode/limited";
+        let mut state = json!({ "modelResults": {} });
+        let quota = json!({ "ok": false, "category": "quota", "source": "probe" });
+        apply_patch(&mut state, &json!({}), None, Some((model, &quota)));
+        let until = state["modelResults"][model]["restrictedUntil"]
+            .as_i64()
+            .expect("受限时刻必须是整数毫秒");
+        let now = now_millis().max(0.0) as i64;
+        assert!(
+            until > now && until <= now + DAY_MS,
+            "重试时刻必须落在未来 24 小时内：{until}"
+        );
+        assert_eq!(until % DAY_MS, 0, "重试时刻必须对齐 UTC 零点");
+
+        let ok = json!({ "ok": true, "category": "available", "source": "probe" });
+        apply_patch(&mut state, &json!({}), None, Some((model, &ok)));
+        assert!(
+            state["modelResults"][model].get("restrictedUntil").is_none(),
+            "探测通过后不得再带受限时刻"
+        );
+    }
+
+    /// 到点重检只挑「受限已到期、仍在目录、未移除、非付费」的模型：
+    /// 自动重检是自动请求，付费白名单不得进入（数据红线 6）。
+    #[test]
+    fn quota_due_models_skip_removed_paid_and_not_yet_due_entries() {
+        let now = 1_800_000_000_000f64;
+        let models = vec![
+            json!({ "id": "opencode/due" }),
+            json!({ "id": "opencode/later" }),
+            json!({ "id": "opencode/removed" }),
+            json!({ "id": "opencode/paid", "paid": true }),
+            json!({ "id": "opencode/ok" }),
+        ];
+        let results = json!({
+            "opencode/due": { "ok": false, "category": "quota", "restrictedUntil": now - 1.0 },
+            "opencode/later": { "ok": false, "category": "quota", "restrictedUntil": now + 60_000.0 },
+            "opencode/removed": { "ok": false, "category": "quota", "restrictedUntil": now - 1.0 },
+            "opencode/paid": { "ok": false, "category": "quota", "restrictedUntil": now - 1.0 },
+            "opencode/ok": { "ok": true },
+        });
+        let due = quota_due_models(&models, &results, &["opencode/removed".to_string()], now);
+        let ids: Vec<&str> = due.iter().filter_map(|model| model["id"].as_str()).collect();
+        assert_eq!(ids, vec!["opencode/due"]);
     }
 
     /// 发布集必须带出当前权重，否则 `WB · auto` 的选择器看不到降权结果；

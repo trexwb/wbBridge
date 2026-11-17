@@ -4,9 +4,10 @@
 //! 选出该用哪个模型的全限定 id」。选中之后的链路（`prepare` → `backend` → `record`）一字不改，
 //! 因此被选中模型的失败仍走既有判决（`orchestration.rs::record` 的 `validated.remove`）。
 //!
-//! 选择偏好由**速度权重**决定：探测成功时按耗时定权（[`probe_weight`]），真实请求过慢时扣分
-//! （[`decayed_weight`]），选档取同档候选里权重最高者（[`select_weighted_with`]）。权重本身存在
-//! `status.json` 的 `modelResults.<id>.weight`，本模块只提供纯函数，读写与「归零后重检」在编排层。
+//! 选择偏好由**速度权重**决定：探测成功时按耗时定权（[`probe_weight`]），真实请求过慢或超时
+//! 时扣分（[`decayed_weight`] / [`timeout_weight`]），选档取同档候选里权重最高者
+//! （[`select_weighted_with`]）。权重本身存在 `status.json` 的 `modelResults.<id>.weight`，
+//! 本模块只提供纯函数，读写与「归零后重检」在编排层。
 //!
 //! 三条设计约束（详见 `docs/plans/2026-10-10-wb-auto-smart-router.md` §2）：
 //! 1. 返回值必须是**全限定 id**（如 `opencode/glm-4.7-flash-free`），不能是面板用的 client id
@@ -231,20 +232,36 @@ pub fn decayed_weight(current: u32, duration_ms: i64) -> u32 {
     }
 }
 
+/// 超时扣掉的权重：与一次慢请求同额。超时是「慢」的极端情况，用同一把尺子扣分；
+/// 模型没有被判成不可用（见 `orchestration.rs::record` 的 soft 分支），只是排序靠后。
+pub const TIMEOUT_PENALTY: u32 = SLOW_PENALTY;
+
+/// 一次超时扣权重，扣到 0 为止。
+pub fn timeout_weight(current: u32) -> u32 {
+    current.saturating_sub(TIMEOUT_PENALTY)
+}
+
 /// 一次结果对权重的更新。**必须在状态锁内调用**（基于上一份权重计算），否则并发请求
 /// 各自读旧值再写回会丢掉扣分。
 ///
 /// - 探测成功：按本次耗时重新定权（手工「重新检测」也因此能重新分配权重）；
 /// - 真实请求成功：慢请求扣分；
-/// - 失败与其它来源：保持原权重（`None` 表示该模型还没有权重记录）。
+/// - 超时（探测或真实请求）：按 [`TIMEOUT_PENALTY`] 扣分——超时不是「坏」，是「慢」；
+/// - 其余失败与其它来源：保持原权重（`None` 表示该模型还没有权重记录）。
 pub fn next_weight(
     current: Option<u32>,
     ok: bool,
     source: &str,
     duration_ms: i64,
+    timed_out: bool,
 ) -> Option<u32> {
     if !ok {
-        return current;
+        // 失败不重定权，只有超时例外：它表达的是「慢」，正好是权重该反映的维度。
+        return if timed_out {
+            Some(timeout_weight(current.unwrap_or(DEFAULT_WEIGHT)))
+        } else {
+            current
+        };
     }
     match source {
         "probe" => Some(probe_weight(duration_ms)),
@@ -797,21 +814,52 @@ mod tests {
         assert_eq!(decayed_weight(20, SLOW_REQUEST_MS), 0);
         assert_eq!(decayed_weight(10, SLOW_REQUEST_MS), 0, "扣到 0 为止，不回负");
 
-        assert_eq!(next_weight(Some(100), true, "request", 5_000), Some(100));
-        assert_eq!(next_weight(Some(100), true, "request", 45_000), Some(80));
-        assert_eq!(next_weight(None, true, "request", 45_000), Some(80), "旧数据缺权重按满分起步");
-        assert_eq!(next_weight(Some(80), false, "request", 45_000), Some(80), "失败不改变权重");
-        assert_eq!(next_weight(None, false, "request", 45_000), None, "没有历史权重就不凭空造");
+        assert_eq!(next_weight(Some(100), true, "request", 5_000, false), Some(100));
+        assert_eq!(next_weight(Some(100), true, "request", 45_000, false), Some(80));
+        assert_eq!(
+            next_weight(None, true, "request", 45_000, false),
+            Some(80),
+            "旧数据缺权重按满分起步"
+        );
+        assert_eq!(
+            next_weight(Some(80), false, "request", 45_000, false),
+            Some(80),
+            "失败不改变权重"
+        );
+        assert_eq!(
+            next_weight(None, false, "request", 45_000, false),
+            None,
+            "没有历史权重就不凭空造"
+        );
+    }
+
+    /// 超时是「慢」的极端情况：降权而不是判死。缺历史权重时按满分起步扣分，
+    /// 扣到 0 为止不回负；与慢请求同额，连续 5 次超时归零。
+    #[test]
+    fn timeouts_lower_the_weight_instead_of_being_ignored() {
+        assert_eq!(timeout_weight(100), 80);
+        assert_eq!(timeout_weight(10), 0, "扣到 0 为止，不回负");
+        assert_eq!(next_weight(Some(100), false, "request", 60_000, true), Some(80));
+        assert_eq!(
+            next_weight(Some(100), false, "probe", 60_000, true),
+            Some(80),
+            "探测超时同样降权"
+        );
+        assert_eq!(
+            next_weight(None, false, "request", 60_000, true),
+            Some(80),
+            "缺历史权重时按满分起步再扣分"
+        );
     }
 
     /// 探测成功按本次耗时**重新定权**（即使上一份权重更高也会被覆盖），这是「重新分配权重」。
     #[test]
     fn a_successful_probe_reassigns_the_weight_from_its_own_latency() {
-        assert_eq!(next_weight(Some(20), true, "probe", 1_000), Some(100));
-        assert_eq!(next_weight(Some(100), true, "probe", 15_000), Some(40));
-        assert_eq!(next_weight(None, true, "probe", 12_000), Some(40));
+        assert_eq!(next_weight(Some(20), true, "probe", 1_000, false), Some(100));
+        assert_eq!(next_weight(Some(100), true, "probe", 15_000, false), Some(40));
+        assert_eq!(next_weight(None, true, "probe", 12_000, false), Some(40));
         // 探测失败保持原值：模型这次没通过，权重不参与选择，等下次通过再重定。
-        assert_eq!(next_weight(Some(60), false, "probe", 1_000), Some(60));
+        assert_eq!(next_weight(Some(60), false, "probe", 1_000, false), Some(60));
     }
 
     /// 「全池为 0」只在池非空时成立；缺 `weight` 的旧条目按满分处理，不能把旧状态误判成耗尽。
