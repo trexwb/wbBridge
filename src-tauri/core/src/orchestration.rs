@@ -141,17 +141,43 @@ fn now_millis() -> f64 {
         * 1000.0
 }
 
-/// 一昼夜的毫秒数：额度「次日重试」的边界单位。
+/// 一昼夜的毫秒数：失败模型自动重检的冷却单位。
 const DAY_MS: i64 = 86_400_000;
 
-/// 当日额度用尽后的重检时刻：**下一个 UTC 零点**。
+/// 失败模型的自动重检时刻：**失败时刻 + 24 小时**（2026-11-17 用户裁定）。
 ///
-/// 免费平台的日额度普遍按 UTC 或本地零点重置；取 UTC 零点作为统一边界，最晚不超过一天，
-/// 常见时区（如 UTC+8，零点即本地早八点）也在「第二天」范围内，且不引入时区库。
-fn next_day_retry_at() -> i64 {
-    let now = now_millis().max(0.0) as i64;
-    (now / DAY_MS + 1) * DAY_MS
+/// 刻意不再对齐 UTC 零点：那样 23:59 用尽额度的模型几分钟后就会被重检，白烧一次额度。
+/// 从失败时刻起固定 24 小时，保证每个受限 / 不可用模型「每 24 小时最多自动检测一次」。
+fn next_auto_retry_at() -> i64 {
+    now_millis().max(0.0) as i64 + DAY_MS
 }
+
+/// 连续自动重检失败达到该次数后写 `suggestRemove`，面板据此建议移入回收站。
+/// 一次发现失败 + 两次 24 小时重检仍失败 ≈ 两天，足够排除偶发故障，又不会无限烧探测额度。
+const AUTO_RETRY_SUGGEST_LIMIT: u64 = 3;
+
+/// 进入「不可用 / 受限」后值得 24 小时自动重检的失败归类。
+///
+/// 超时（`timeout`）不在其列：它表达「慢」而不是「坏」，模型仍留在发布集、只降权重，
+/// 不按失败模型对待。
+fn auto_retry_category(category: &str) -> bool {
+    matches!(
+        category,
+        crate::model_status::CATEGORY_QUOTA
+            | crate::model_status::CATEGORY_RATE_LIMIT
+            | crate::model_status::CATEGORY_ACCESS
+            | crate::model_status::CATEGORY_ERROR
+    )
+}
+
+/// 全池权重归零后的自愈重检间隔：与失败模型的冷却同为 24 小时。
+///
+/// 「全池为 0」在每次请求后都会重新成立，不做间隔等于每个请求都触发一次全量探测——
+/// 一次全量探测就是目录里每个模型各发一次真实请求。
+const SELF_HEAL_INTERVAL_MS: i64 = DAY_MS;
+
+/// 上次自愈重检的发起时刻（纪元毫秒，0 = 本进程内没跑过）。
+static LAST_SELF_HEAL_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 fn truthy(value: &Value) -> bool {
     match value {
@@ -447,16 +473,16 @@ fn apply_patch(
                 *entry = json!({});
             }
             if let Some(results) = entry.as_object_mut() {
-                // 权重更新必须在这里读上一份值：并发请求各自在锁外读权重再写回会丢掉扣分。
-                let previous_weight = results
-                    .get(model)
-                    .and_then(|entry| entry.get("weight"))
+                // 权重与自动重检记账都必须在锁内读上一份值：并发请求各自在锁外读再写回会丢更新。
+                let previous = results.get(model).cloned().unwrap_or(Value::Null);
+                let previous_weight = previous
+                    .get("weight")
                     .and_then(Value::as_u64)
                     .map(|weight| u32::try_from(weight).unwrap_or(u32::MAX));
                 let ok = result.get("ok") == Some(&Value::Bool(true));
                 let source = result.get("source").and_then(Value::as_str).unwrap_or_default();
                 let duration_ms = result.get("durationMs").and_then(Value::as_i64).unwrap_or(0);
-                // 归类来自 `model_status::model_result`：超时降权（不是判死），额度用尽记次日重试时刻。
+                // 归类来自 `model_status::model_result`：超时降权（不是判死），其余失败进入冷却。
                 let category = result
                     .get("category")
                     .and_then(Value::as_str)
@@ -474,12 +500,23 @@ fn apply_patch(
                         entry.insert("weight".to_string(), json!(weight));
                     }
                 }
-                // 当日额度用尽：不是「坏了」，而是「今天没额度了」。写下次日重试时刻，
-                // 批量探测据此跳过、`spawn_quota_retry` 到点自动重检；探测通过时整条结果
-                // 被覆盖，这个键随之消失，模型自动恢复发布。
-                if !ok && category == crate::model_status::CATEGORY_QUOTA {
+                // 「不可用 / 受限」不是永久判死：写「失败时刻 + 24 小时」的冷却时刻，批量探测与
+                // 启动探测据此跳过，后台任务到点只重检一次（每 24 小时最多一次）。探测通过时整条
+                // 结果被覆盖，冷却、重检计数与移除建议一起消失，模型自动恢复发布。
+                if !ok && auto_retry_category(category) {
                     if let Some(entry) = results.get_mut(model).and_then(Value::as_object_mut) {
-                        entry.insert("restrictedUntil".to_string(), json!(next_day_retry_at()));
+                        // 只有探测失败才累计「自动重检次数」；真实请求失败是使用中的证据，
+                        // 不能当成「又自动检了一次」，否则用户刚用坏就被建议移除。
+                        let retries = previous
+                            .get("probeRetries")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0)
+                            + u64::from(source == "probe");
+                        entry.insert("restrictedUntil".to_string(), json!(next_auto_retry_at()));
+                        entry.insert("probeRetries".to_string(), json!(retries));
+                        if retries >= AUTO_RETRY_SUGGEST_LIMIT {
+                            entry.insert("suggestRemove".to_string(), json!(true));
+                        }
                     }
                 }
             }
@@ -824,21 +861,31 @@ fn reprobe_when_weights_exhausted(source: &str) {
     if !crate::auto::all_weights_exhausted(&usable) {
         return;
     }
+    // 归零状态在下次重检前一直成立：没有这道间隔，之后的每个请求都会重新触发一次全量探测。
+    let now = now_millis().max(0.0) as i64;
+    if now - LAST_SELF_HEAL_MS.load(Ordering::Relaxed) < SELF_HEAL_INTERVAL_MS {
+        return;
+    }
     log_line("WB · auto 的模型权重已全部归零，重新检测全部模型并重新分配权重");
     let started = start_probes(None, false, false, &Scope::All);
-    if started.get("started") != Some(&json!(true)) {
+    if started.get("started") == Some(&json!(true)) {
+        LAST_SELF_HEAL_MS.store(now, Ordering::Relaxed);
+    } else {
         log_line("权重归零后的重新检测未能启动（已有读取或探测在进行）");
     }
 }
 
 // ---------------------------------------------------------------------------
-// 当日额度用尽：跳过与次日自动重检
+// 失败模型的 24 小时冷却：跳过与到点自动重检
 // ---------------------------------------------------------------------------
 
-/// 结果条目是否处于「当日额度用尽、未到重试时刻」的受限态。
-fn quota_restricted(results: &Value, model_id: &str, now: f64) -> bool {
+/// 结果条目是否处于「失败后的冷却期」：批量探测与启动探测据此跳过。
+///
+/// 判据只看 `restrictedUntil` 而不再看归类——所有计入冷却的失败都会写这个键，超时不写
+/// （超时仍须参与批量探测以恢复权重）。
+fn probe_restricted(results: &Value, model_id: &str, now: f64) -> bool {
     results.get(model_id).is_some_and(|entry| {
-        entry.get("category").and_then(Value::as_str) == Some(crate::model_status::CATEGORY_QUOTA)
+        entry.get("ok") == Some(&json!(false))
             && entry
                 .get("restrictedUntil")
                 .and_then(Value::as_f64)
@@ -846,10 +893,10 @@ fn quota_restricted(results: &Value, model_id: &str, now: f64) -> bool {
     })
 }
 
-/// 到点可重检的模型：受限时刻已过、仍在目录里、未移除、非付费白名单。
+/// 到点可重检的模型：冷却时刻已过、仍在目录里、未移除、非付费白名单。
 ///
 /// 自动重检会发真实请求，付费条目按数据红线 6 一律排除（只留给用户手动触发）。
-fn quota_due_models(
+fn auto_retry_due_models(
     models: &[Value],
     results: &Value,
     removed: &[String],
@@ -866,8 +913,7 @@ fn quota_due_models(
                 return false;
             }
             results.get(id).is_some_and(|entry| {
-                entry.get("category").and_then(Value::as_str)
-                    == Some(crate::model_status::CATEGORY_QUOTA)
+                entry.get("ok") == Some(&json!(false))
                     && entry
                         .get("restrictedUntil")
                         .and_then(Value::as_f64)
@@ -878,10 +924,12 @@ fn quota_due_models(
         .collect()
 }
 
-/// 次日额度重检任务：每 60s 看一次是否有到点模型；有就按批量探测跑一轮。
+/// 失败模型的自动重检任务：每 60s 看一次是否有到点模型；有就按批量探测跑一轮。
 ///
+/// 冷却时刻由 `apply_patch` 在失败时写成「失败时刻 + 24 小时」，失败的模型因此每 24 小时
+/// 最多被自动重检一次；重检再失败时冷却被推到新的 24 小时后，不会每分钟重跑一轮。
 /// 与用户触发的批量探测共用 `probing` 互斥与 `probe` 进度，因此面板能看到「自动检测中」。
-fn spawn_quota_retry(app: Arc<App>) {
+fn spawn_auto_retry(app: Arc<App>) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
@@ -891,22 +939,22 @@ fn spawn_quota_retry(app: Arc<App>) {
             if app.probing.load(Ordering::Relaxed) || lock(&app.refresh).is_some() {
                 continue;
             }
-            let due = quota_due_models(
+            let due = auto_retry_due_models(
                 &app.models(),
                 &app.snapshot().get("modelResults").cloned().unwrap_or(Value::Null),
                 &lock(&app.removed).clone(),
                 now_millis(),
             );
             if !due.is_empty() {
-                start_quota_retry(due);
+                start_auto_retry(due);
             }
         }
     });
 }
 
 /// 把到点模型交给批量探测（`auto_import = true`：一轮结束即按新发布集重写配置，
-/// 探测通过的模型自动恢复为可用）。
-fn start_quota_retry(selected: Vec<Value>) -> bool {
+/// 重检通过的模型自动恢复为可用）。
+fn start_auto_retry(selected: Vec<Value>) -> bool {
     let app = global_app();
     if app.stopping.load(Ordering::Relaxed) || lock(&app.refresh).is_some() {
         return false;
@@ -919,7 +967,7 @@ fn start_quota_retry(selected: Vec<Value>) -> bool {
         .filter_map(|model| model.get("id").and_then(Value::as_str).map(str::to_string))
         .collect();
     log_line(&format!(
-        "{} 个模型的当日额度限制已到期，开始自动重新检测",
+        "{} 个模型的失败冷却已到期，开始自动重新检测",
         pending.len()
     ));
     let (done_tx, done_rx) = watch::channel(false);
@@ -932,9 +980,10 @@ fn start_quota_retry(selected: Vec<Value>) -> bool {
     true
 }
 
-/// 换 / 新增平台 Key 等于换了一份额度：清掉该平台模型的受限时刻，
-/// 让随后的导入与探测重新覆盖它们（结果条目本身仍是失败态，直到新探测通过）。
-fn clear_quota_restrictions(provider: &str) {
+/// 换 / 新增平台 Key 等于换了一份额度、也换了一种失败原因：清掉该平台失败模型的 24 小时
+/// 冷却、自动重检计数与移除建议，让随后的导入与探测重新覆盖它们（结果条目本身仍是失败态，
+/// 直到新探测通过）。
+fn clear_retry_restrictions(provider: &str) {
     let app = global_app();
     let mut cleared = 0usize;
     {
@@ -947,12 +996,16 @@ fn clear_quota_restrictions(provider: &str) {
                 continue;
             }
             let Some(object) = entry.as_object_mut() else { continue };
-            if object.get("category").and_then(Value::as_str)
-                != Some(crate::model_status::CATEGORY_QUOTA)
-            {
+            if object.get("ok") != Some(&json!(false)) {
                 continue;
             }
-            if object.remove("restrictedUntil").is_some() {
+            let mut changed = false;
+            for key in ["restrictedUntil", "probeRetries", "suggestRemove"] {
+                if object.remove(key).is_some() {
+                    changed = true;
+                }
+            }
+            if changed {
                 cleared += 1;
             }
         }
@@ -960,7 +1013,7 @@ fn clear_quota_restrictions(provider: &str) {
     if cleared > 0 {
         persist_status(app.snapshot());
         log_line(&format!(
-            "平台 {provider} 的 Key 已更新，{cleared} 个模型的当日额度限制已解除"
+            "平台 {provider} 的 Key 已更新，{cleared} 个失败模型的自动重检冷却已解除"
         ));
     }
 }
@@ -1451,8 +1504,9 @@ fn start_probes(
                 .filter(|model| scope.covers(model))
                 .cloned()
                 .collect();
-            // 当日额度已用尽的模型不重复烧探测时间：到点由后台任务自动重检
-            // （见 `spawn_quota_retry`）。单模型重新检测不受这条限制——那是用户显式点名。
+            // 处于「失败后 24 小时冷却」的模型不重复烧探测（额度、访问、错误一类都算）：
+            // 到点由后台任务自动重检一次（见 `spawn_auto_retry`）。
+            // 单模型重新检测不受这条限制——那是用户显式点名。
             let results = app
                 .snapshot()
                 .get("modelResults")
@@ -1463,7 +1517,7 @@ fn start_probes(
                 .iter()
                 .filter(|model| {
                     let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
-                    !quota_restricted(&results, id, now)
+                    !probe_restricted(&results, id, now)
                 })
                 .cloned()
                 .collect();
@@ -1478,7 +1532,7 @@ fn start_probes(
         let message = if model_id.is_some() {
             "模型不在当前目录中（或已被移除）"
         } else if skipped_quota > 0 {
-            "模型当日额度已用尽，已安排次日自动重新检测"
+            "失败模型还在 24 小时冷却期内，已安排到点自动重新检测"
         } else {
             "没有可检测的模型（可能已被全部移除）"
         };
@@ -1486,7 +1540,7 @@ fn start_probes(
     }
     if skipped_quota > 0 {
         log_line(&format!(
-            "{skipped_quota} 个模型的当日额度已用尽，本轮跳过（次日自动重新检测）"
+            "{skipped_quota} 个模型处于失败后的 24 小时冷却期，本轮跳过（到点自动重新检测）"
         ));
     }
     // 单模型探测不与批量探测互斥：直接 spawn 独立 task，不走 probing 全局锁
@@ -2416,7 +2470,7 @@ pub async fn run(options: StartOptions) -> u8 {
         spawn_parent_watchdog(app.clone(), parent_pid);
     }
     spawn_activity_timer(app.clone());
-    spawn_quota_retry(app.clone());
+    spawn_auto_retry(app.clone());
 
     let startup = startup_sequence(&app).await;
     match startup {
@@ -3389,9 +3443,9 @@ async fn set_provider_key(body: Value) -> Result<Value, BackendError> {
         Ok(providers::status(data_dir))
     })
     .await?;
-    // 新 Key 可能带着新一份额度：解除该平台被「当日额度用尽」挡住的模型，
+    // 新 Key 可能带着新一份额度、也换了一种失败原因：解除该平台失败模型的 24 小时冷却，
     // 让随后的导入 / 探测重新覆盖它们（探测通过即自动恢复发布）。
-    clear_quota_restrictions(&id);
+    clear_retry_restrictions(&id);
     Ok(status)
 }
 
@@ -4135,36 +4189,94 @@ mod tests {
         assert!(!validated_from_results(&models, &plain).contains("opencode/b"));
     }
 
-    /// 额度用尽写「次日 UTC 零点」：落在未来 24 小时内且与日界对齐；
-    /// 探测通过后整条结果被覆盖，受限键随之消失（模型自动恢复）。
+    /// 失败写「失败时刻 + 24 小时」冷却（任何不可用归类都算，超时除外）；
+    /// 探测通过后整条结果被覆盖，冷却、重检计数与移除建议一起消失（模型自动恢复）。
     #[test]
-    fn quota_failures_are_restricted_until_the_next_utc_midnight() {
+    fn failed_models_are_cooled_down_for_24_hours_from_the_failure() {
         let model = "opencode/limited";
         let mut state = json!({ "modelResults": {} });
         let quota = json!({ "ok": false, "category": "quota", "source": "probe" });
         apply_patch(&mut state, &json!({}), None, Some((model, &quota)));
         let until = state["modelResults"][model]["restrictedUntil"]
             .as_i64()
-            .expect("受限时刻必须是整数毫秒");
+            .expect("冷却时刻必须是整数毫秒");
         let now = now_millis().max(0.0) as i64;
         assert!(
-            until > now && until <= now + DAY_MS,
-            "重试时刻必须落在未来 24 小时内：{until}"
+            until > now + DAY_MS - 5_000 && until <= now + DAY_MS + 5_000,
+            "冷却必须是失败时刻 + 24 小时：{until}"
         );
-        assert_eq!(until % DAY_MS, 0, "重试时刻必须对齐 UTC 零点");
+
+        // 非额度类不可用同样进入冷却（否则只有额度用尽的模型才自动重检）。
+        let error = json!({ "ok": false, "category": "error", "source": "request" });
+        apply_patch(&mut state, &json!({}), None, Some((model, &error)));
+        assert!(
+            state["modelResults"][model].get("restrictedUntil").is_some(),
+            "不可用（error）也必须安排 24 小时自动重检"
+        );
+
+        // 超时只降权、不冷却：它仍留在发布集，也不需要按失败模型对待。
+        let timeout = json!({ "ok": false, "category": "timeout", "source": "probe" });
+        apply_patch(&mut state, &json!({}), None, Some((model, &timeout)));
+        assert!(state["modelResults"][model].get("restrictedUntil").is_none());
+        assert!(state["modelResults"][model].get("suggestRemove").is_none());
 
         let ok = json!({ "ok": true, "category": "available", "source": "probe" });
         apply_patch(&mut state, &json!({}), None, Some((model, &ok)));
-        assert!(
-            state["modelResults"][model].get("restrictedUntil").is_none(),
-            "探测通过后不得再带受限时刻"
-        );
+        assert!(state["modelResults"][model].get("restrictedUntil").is_none());
+        assert!(state["modelResults"][model].get("probeRetries").is_none());
     }
 
-    /// 到点重检只挑「受限已到期、仍在目录、未移除、非付费」的模型：
+    /// 连续自动重检失败到限额即写 `suggestRemove`（面板据此建议移入回收站）；
+    /// 真实请求失败只刷新冷却、不累计自动重检次数；通过后计数与建议一起归零。
+    #[test]
+    fn repeated_probe_failures_raise_the_remove_suggestion() {
+        let model = "opencode/dead";
+        let mut state = json!({ "modelResults": {} });
+        let fail = json!({ "ok": false, "category": "error", "source": "probe" });
+        for _ in 0..AUTO_RETRY_SUGGEST_LIMIT {
+            apply_patch(&mut state, &json!({}), None, Some((model, &fail)));
+        }
+        assert_eq!(
+            state["modelResults"][model]["probeRetries"],
+            json!(AUTO_RETRY_SUGGEST_LIMIT)
+        );
+        assert_eq!(state["modelResults"][model]["suggestRemove"], json!(true));
+
+        // 真实请求失败不是一次自动检测：计数不变，但冷却要刷新。
+        let request = json!({ "ok": false, "category": "rate_limit", "source": "request" });
+        apply_patch(&mut state, &json!({}), None, Some((model, &request)));
+        assert_eq!(
+            state["modelResults"][model]["probeRetries"],
+            json!(AUTO_RETRY_SUGGEST_LIMIT)
+        );
+        assert!(state["modelResults"][model].get("restrictedUntil").is_some());
+
+        let ok = json!({ "ok": true, "category": "available", "source": "probe" });
+        apply_patch(&mut state, &json!({}), None, Some((model, &ok)));
+        assert!(state["modelResults"][model].get("probeRetries").is_none());
+        assert!(state["modelResults"][model].get("suggestRemove").is_none());
+    }
+
+    /// 冷却期覆盖所有带 `restrictedUntil` 的失败归类；到期后重新纳入探测。
+    #[test]
+    fn probe_restricted_covers_every_failed_category_until_the_cooldown_ends() {
+        let now = 1_800_000_000_000f64;
+        let results = json!({
+            "opencode/error": { "ok": false, "category": "error", "restrictedUntil": now + 1.0 },
+            "opencode/quota": { "ok": false, "category": "quota", "restrictedUntil": now + 1.0 },
+            "opencode/due": { "ok": false, "category": "error", "restrictedUntil": now - 1.0 },
+            "opencode/ok": { "ok": true },
+        });
+        assert!(probe_restricted(&results, "opencode/error", now));
+        assert!(probe_restricted(&results, "opencode/quota", now));
+        assert!(!probe_restricted(&results, "opencode/due", now));
+        assert!(!probe_restricted(&results, "opencode/ok", now));
+    }
+
+    /// 到点重检只挑「冷却已到期、仍在目录、未移除、非付费」的模型：
     /// 自动重检是自动请求，付费白名单不得进入（数据红线 6）。
     #[test]
-    fn quota_due_models_skip_removed_paid_and_not_yet_due_entries() {
+    fn auto_retry_due_models_skip_removed_paid_and_not_yet_due_entries() {
         let now = 1_800_000_000_000f64;
         let models = vec![
             json!({ "id": "opencode/due" }),
@@ -4174,13 +4286,14 @@ mod tests {
             json!({ "id": "opencode/ok" }),
         ];
         let results = json!({
-            "opencode/due": { "ok": false, "category": "quota", "restrictedUntil": now - 1.0 },
+            "opencode/due": { "ok": false, "category": "error", "restrictedUntil": now - 1.0 },
             "opencode/later": { "ok": false, "category": "quota", "restrictedUntil": now + 60_000.0 },
             "opencode/removed": { "ok": false, "category": "quota", "restrictedUntil": now - 1.0 },
             "opencode/paid": { "ok": false, "category": "quota", "restrictedUntil": now - 1.0 },
             "opencode/ok": { "ok": true },
         });
-        let due = quota_due_models(&models, &results, &["opencode/removed".to_string()], now);
+        let due =
+            auto_retry_due_models(&models, &results, &["opencode/removed".to_string()], now);
         let ids: Vec<&str> = due.iter().filter_map(|model| model["id"].as_str()).collect();
         assert_eq!(ids, vec!["opencode/due"]);
     }

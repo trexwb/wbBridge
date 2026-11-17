@@ -19,7 +19,7 @@ const props = defineProps({
 })
 const emit = defineEmits(['toggle', 'reprobe', 'remove', 'restore'])
 
-const LABELS = { timeout: '检测超时', quota: '额度不足', rate_limit: '请求受限', access: '访问受限' }
+const LABELS = { timeout: '检测超时', quota: '额度不足', rate_limit: '请求受限', access: '访问受限', error: '不可用' }
 
 // 「移除」是破坏性操作（该模型此后不参与检测与发布），沿用运行日志清空的两次点击确认：
 // 首次点击只进入待确认态（3 秒后自动撤回），第二次点击才真正提交；
@@ -49,6 +49,10 @@ onBeforeUnmount(() => clearTimeout(removeTimer))
 // 行内「还没结束」的统一判据：在批量队列里排队/正在检，或这一行的重新检测在飞。
 const busy = computed(() => !props.removed && (props.waiting || props.reprobing))
 
+// 核心在连续多次自动重检失败后标记 suggestRemove：面板只给建议，删不删由用户决定。
+const suggestRemove = computed(() => !props.removed && props.result?.suggestRemove === true)
+const probeRetries = computed(() => (Number.isFinite(props.result?.probeRetries) ? props.result.probeRetries : null))
+
 const statusLabel = computed(() => {
   if (props.removed) return '已移除'
   if (props.reprobing) return '检测中'
@@ -57,16 +61,17 @@ const statusLabel = computed(() => {
   // 超时只降权、不摘除：模型仍在发布集里，只是速度权重比同池其他模型低。
   if (props.available && props.result?.category === 'timeout') return '可用 · 超时降权'
   if (props.available) return props.result?.chatOnly ? '可用 · 仅对话' : '可用'
-  if (props.result?.category === 'quota') {
-    return props.result.restrictedUntil ? '额度不足 · 次日重试' : '额度不足'
-  }
-  return LABELS[props.result?.category] || (props.result?.ok === false ? '不可用' : '待检测')
+  const base = LABELS[props.result?.category] ?? (props.result?.ok === false ? '不可用' : '待检测')
+  // 失败后进入 24 小时冷却：徽章必须交代「什么时候会自动再试」，否则会被读成永久失效。
+  return props.result?.restrictedUntil ? `${base} · 24 小时后重检` : base
 })
 
-// 徽章悬浮说明：受限 / 降权都不是「坏了」，必须交代接下来会发生什么（次日自动重检、通过自动恢复）。
+// 徽章悬浮说明：受限 / 降权都不是「坏了」，必须交代接下来会发生什么（到点自动重检、通过自动恢复）。
 const statusTitle = computed(() => {
-  if (props.result?.category === 'quota' && props.result?.restrictedUntil) {
-    return '当日额度已用尽：已停止发布，次日自动重新检测，通过后自动恢复'
+  if (props.result?.restrictedUntil) {
+    return suggestRemove.value
+      ? '已暂停发布：每 24 小时最多自动重新检测一次；已连续多次失败，建议移入回收站'
+      : '已暂停发布：失败后每 24 小时最多自动重新检测一次，通过后自动恢复'
   }
   if (props.available && props.result?.category === 'timeout') {
     return '最近一次超时：仍可用，但速度权重已调低，WB · auto 会优先选择同档更快的模型'
@@ -141,6 +146,11 @@ const weight = computed(() => {
         class="badge weight"
         :title="`速度权重 ${weight}：WB · auto 优先选择权重最高的可用模型`"
       >权重 {{ weight }}</span>
+      <span
+        v-if="suggestRemove"
+        class="badge suggest"
+        :title="`已连续 ${probeRetries ?? '多'} 次检测失败；建议移入回收站——回收后不再检测、不再发布，可随时恢复`"
+      >建议移除</span>
       <span class="badge" :class="{ unavailable: unavailable && !available, waiting: busy || inRequest, removed }" :title="statusTitle || null">{{ statusLabel }}</span>
       <button
         v-if="canReprobe"
@@ -257,6 +267,8 @@ const weight = computed(() => {
   font-variant-numeric: tabular-nums;
 }
 .unavailable { color: var(--badge-unavailable-fg); background: var(--orange-bg); }
+/* 「建议移除」是劝告而非自动动作：用 danger 色标出它指向的是破坏性入口，删不删由用户决定 */
+.suggest { color: var(--danger); background: var(--danger-bg); }
 /* 进行中的徽章轻微呼吸，与行内 spinner 一起表达「尚未结束」；减弱动效时由全局规则压成静态 */
 .waiting { color: var(--muted-strong); background: var(--panel); animation: badge-pulse 1.6s ease-in-out infinite; }
 @keyframes badge-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .62; } }

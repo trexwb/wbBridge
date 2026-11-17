@@ -32,6 +32,11 @@ const lines = computed(() => {
     ? `推理：支持 · ${variants.length ? '可选档位：' + variants.join(' / ') : '使用默认模式'}`
     : '推理：OpenCode 未声明支持' })
   if (r.error) out.push({ text: r.error, error: true })
+  // 失败不是永久判死：写明下一次自动重检的时刻，以及连续失败后的移除建议由用户决定。
+  if (!r.ok && Number.isFinite(r.restrictedUntil))
+    out.push({ text: `下次自动检测：${new Date(r.restrictedUntil).toLocaleString()} · 失败后每 24 小时最多自动重检一次，通过后自动恢复发布。` })
+  if (r.suggestRemove)
+    out.push({ text: `已连续 ${Number.isInteger(r.probeRetries) ? r.probeRetries : '多'} 次检测失败，建议移入回收站：回收后不再检测、不再发布，可随时恢复。`, error: true })
   out.push({ text: '最近更新：' + (r.time ? new Date(r.time).toLocaleString() : '尚未检测') })
   return out
 })

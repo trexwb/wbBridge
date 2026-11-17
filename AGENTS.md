@@ -277,9 +277,13 @@ models.json → free_models(providers)（免费判定：输入/输出/缓存全 
   → 失败归类（`model_status::model_result` 的 `category`）决定后续动作（2026-11-17 用户裁定）：
      **超时（`timeout`）只降权、不判死**——`record` 若该模型此前已通过校验则保留发布资格并打 `soft: true`
      （重启后 `validated_from_results` 沿用），权重按 `auto::TIMEOUT_PENALTY`（= `SLOW_PENALTY`）扣一档；
-     **额度用尽（`quota`）判不可用**——写入 `modelResults[id].restrictedUntil`（下一个 UTC 零点，`next_day_retry_at`），
-     批量探测跳过尚未到点的受限模型，后台任务 `spawn_quota_retry` 每 60s 检查一次，到点自动重检、通过即恢复发布
-     （付费白名单不进入自动重检；换 Key 时 `clear_quota_restrictions` 解除该平台的受限时刻）
+     **其余不可用（`quota` / `rate_limit` / `access` / `error`）判失败并进入 24 小时冷却**（2026-11-17 用户裁定：
+     降低诊断频率、尽量省 token）——写入 `modelResults[id].restrictedUntil`（**失败时刻 + 24 小时**，`next_auto_retry_at`，
+     不再对齐 UTC 零点）与 `probeRetries`（仅 `source == "probe"` 累计），批量 / 启动 / 读取后的探测都跳过冷却中的模型，
+     后台任务 `spawn_auto_retry` 每 60s 检查一次，**每个失败模型每 24 小时最多被自动重检一次**（重检再失败即把冷却推到
+     新的 24 小时后），通过即恢复发布；`probeRetries >= AUTO_RETRY_SUGGEST_LIMIT`（3）时写 `suggestRemove: true`，
+     面板据此**建议**（不自动执行）用户移入回收站，回收后的模型不再参与任何探测
+     （付费白名单不进入自动重检；换 Key 时 `clear_retry_restrictions` 解除该平台失败模型的冷却 / 计数 / 建议）
   → sync_models（原子写）→ merge_models（保留非本工具条目，只清理/更新 OWNER = 'buddy-bridge-v1' 的条目）
      收敛：真实请求失败（`record()`，超时除外）、批量探测本轮有失败（手工读取也重发）、单模型重检失败都立即重发
   → 生产发布链走 merge_models_auto（`SyncOptions.auto_route = true`）：发布集非空时在末位追加一条 `WB · auto` 合成路由条目，
@@ -341,7 +345,8 @@ start_backend
 | 状态内置版本 | `"0.2.0"`（写入 `status.json`，历史沿革值） | `orchestration.rs` 状态初值 |
 | 格式类失败集合 | `REQUEST_SHAPED_FAILURES`（4 项） | `orchestration.rs` |
 | 超时降权额 | `TIMEOUT_PENALTY = SLOW_PENALTY = 20`（探测与真实请求的超时同额扣分） | `auto.rs` |
-| 额度受限重试 | 下一个 UTC 零点（`next_day_retry_at`，`restrictedUntil` 存于 `modelResults.<id>`）；后台每 60s 检查一次 | `orchestration.rs` |
+| 失败模型自动重检 | 失败时刻 + 24 小时（`next_auto_retry_at`，`restrictedUntil` 存于 `modelResults.<id>`）；后台每 60s 检查一次，每个模型每 24 小时最多重检一次；`probeRetries >= AUTO_RETRY_SUGGEST_LIMIT`（3）写 `suggestRemove` |
+| 自愈重检间隔 | `SELF_HEAL_INTERVAL_MS = DAY_MS`（全池权重归零后最多每 24 小时触发一次全量探测） | `orchestration.rs` |
 | 转写首选名单 | `TRANSLATOR_ORDER`（4 项，须排除刚失败模型） | `orchestration.rs` |
 
 ## 编码规范
@@ -524,9 +529,9 @@ start_backend
 
 | 项 | 值 | 来源 |
 |---|---|---|
-| 版本单一来源 | **1.3.20** | 根 `package.json` 的 `version` |
-| 壳工程同步落点 | **1.3.20** | `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `[package] version` |
-| 核心 crate 版本 | **1.3.20** | `src-tauri/core/Cargo.toml`（`wbbridge-core --version` 输出；随产品版本同步，`version:set`/`version:check` 均覆盖） |
+| 版本单一来源 | **1.3.21** | 根 `package.json` 的 `version` |
+| 壳工程同步落点 | **1.3.21** | `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `[package] version` |
+| 核心 crate 版本 | **1.3.21** | `src-tauri/core/Cargo.toml`（`wbbridge-core --version` 输出；随产品版本同步，`version:set`/`version:check` 均覆盖） |
 
 > `status.json` 内写入的 `version` 是历史沿革值 `0.2.0`，**不属版本落点**，不得在无用户指令的情况下静默改动（见「关键常量」）。
 
