@@ -179,6 +179,13 @@ const SELF_HEAL_INTERVAL_MS: i64 = DAY_MS;
 /// 上次自愈重检的发起时刻（纪元毫秒，0 = 本进程内没跑过）。
 static LAST_SELF_HEAL_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
+/// 定时权重刷新间隔：与失败模型的冷却、自愈重检同为 24 小时。
+///
+/// 权重只会单调走低（慢请求扣分、超时扣分），按最新耗时重新定权只能靠探测；每 24 小时用
+/// 一轮全量探测刷新权重，`WB · auto` 的选择与客户端配置里的条目顺序随之恢复。刻意复用
+/// [`start_probes`] 批量入口：它自带 removed 过滤、24h 冷却跳过与 `probing` 原子互斥。
+const WEIGHT_REFRESH_INTERVAL_MS: i64 = DAY_MS;
+
 fn truthy(value: &Value) -> bool {
     match value {
         Value::Null => false,
@@ -952,6 +959,61 @@ fn spawn_auto_retry(app: Arc<App>) {
     });
 }
 
+/// 定时权重刷新的整轮放弃判据（纯函数，单测钉住数据红线 6 的付费闸门）。
+///
+/// 返回 `Some` 即本轮放弃：
+/// - 发布集为空（目录为空或全部未通过探测）：批量探测会把「没有可检测的模型」当一轮失败
+///   写进日志，先在这里挡住；
+/// - **目录**里任一模型 `paid == true`：比自愈的池级判（`reprobe_when_weights_exhausted` 只看
+///   usable）更严——已放行但尚未通过探测的付费条目不在 usable 里，批量探测却会对它发真实
+///   请求。付费白名单非空时定时刷新整轮不跑，权重只随真实请求的扣分与手动探测更新。
+fn weight_refresh_skip_reason(catalog: &[Value], usable: &[Value]) -> Option<&'static str> {
+    if usable.is_empty() {
+        return Some("发布集为空，无可刷新的权重");
+    }
+    if catalog
+        .iter()
+        .any(|model| model.get("paid") == Some(&json!(true)))
+    {
+        return Some("目录含付费白名单条目，定时刷新整轮放弃");
+    }
+    None
+}
+
+/// 定时权重刷新任务：每 60s 看一次，距上次成功发起满 [`WEIGHT_REFRESH_INTERVAL_MS`] 且当前
+/// 空闲时，用批量探测入口把全池权重按最新耗时重新分配；`auto_import = true` 使收尾恒重发
+/// 配置，插件配置与 DSH 路由表的条目顺序随即按新权重落盘（内容无变化时不写盘，幂等）。
+///
+/// 与 [`spawn_auto_retry`] 同节奏（60s tick）：忙碌错过的轮次最多延迟 60s，不丢轮次；
+/// **只有 `started == true` 才重置计时**（镜像 `LAST_SELF_HEAL_MS` 的「started 才存」），
+/// 抢锁落败或探测全被冷却挡下的 tick 下一轮重试，不会把没跑成的一轮当成已完成。
+/// 计时在任务本地、不跨重启持久化：fresh start 本就全量探测，从每次启动起算 24 小时。
+fn spawn_weight_refresh(app: Arc<App>) {
+    tokio::spawn(async move {
+        let mut last_refresh = Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            if app.stopping.load(Ordering::Relaxed) {
+                return;
+            }
+            if last_refresh.elapsed() < Duration::from_millis(WEIGHT_REFRESH_INTERVAL_MS as u64) {
+                continue;
+            }
+            // 无锁预判：探测被占或读取链在跑时不抢锁（与 spawn_auto_retry 同法，避免锁噪声）。
+            if app.probing.load(Ordering::Relaxed) || lock(&app.refresh).is_some() {
+                continue;
+            }
+            if weight_refresh_skip_reason(&app.models(), &usable_models()).is_some() {
+                continue;
+            }
+            log_line("定时权重刷新：重新检测全部模型并按最新耗时重新分配权重");
+            if start_probes(None, false, true, &Scope::All).get("started") == Some(&json!(true)) {
+                last_refresh = Instant::now();
+            }
+        }
+    });
+}
+
 /// 把到点模型交给批量探测（`auto_import = true`：一轮结束即按新发布集重写配置，
 /// 重检通过的模型自动恢复为可用）。
 fn start_auto_retry(selected: Vec<Value>) -> bool {
@@ -1155,7 +1217,7 @@ fn sync_published(published: Option<Vec<Value>>, allow_empty: bool) {
             let key = key.clone();
             let result = tokio::task::spawn_blocking(move || {
                 // 形态按目标固定：WorkBuddy 保留文档原形态，CodeBuddy 一律写 `{ "models": […] }`。
-                // `auto_route: true`（v1.1.15 用户裁定）：发布集非空时在末位额外写一条
+                // `auto_route: true`（v1.1.15 用户裁定）：发布集非空时在本服务条目块首位写一条
                 // `WB · auto` 合成路由，让插件列表里直接看得见它——此前只有直连本地 HTTP 的
                 // 客户端能用上，用户在 WorkBuddy/CodeBuddy 里根本无从发现。
                 // 闸门与逐模型条目完全相同：`OWNER` 归属、id 冲突不覆盖、发布集转空的下一轮
@@ -2471,6 +2533,7 @@ pub async fn run(options: StartOptions) -> u8 {
     }
     spawn_activity_timer(app.clone());
     spawn_auto_retry(app.clone());
+    spawn_weight_refresh(app.clone());
 
     let startup = startup_sequence(&app).await;
     match startup {
@@ -3830,6 +3893,56 @@ mod tests {
                 "{name} 必须经由公共归宿函数，否则两条入口对同一个模型会给出相反的结论"
             );
         }
+    }
+
+    /// 定时权重刷新的整轮放弃判据（数据红线 6 的付费闸门）：付费白名单非空时批量探测会对
+    /// 付费条目发真实请求，必须在任务入口整轮放弃；发布集为空时没有可刷新的东西，也不该
+    /// 空跑一轮。三态一起钉住。
+    #[test]
+    fn weight_refresh_skips_paid_catalog_and_empty_pool() {
+        let usable = vec![json!({ "id": "vendor/free", "ok": true })];
+        assert_eq!(
+            weight_refresh_skip_reason(&usable, &usable),
+            None,
+            "干净目录（无付费条目、发布集非空）整轮照常"
+        );
+        assert!(
+            weight_refresh_skip_reason(&[], &[]).is_some(),
+            "发布集为空（含目录为空）时不空跑一轮"
+        );
+        let paid_catalog = vec![
+            json!({ "id": "vendor/free", "ok": true }),
+            json!({ "id": "vendor/paid", "paid": true }),
+        ];
+        assert!(
+            weight_refresh_skip_reason(&paid_catalog, &usable).is_some(),
+            "目录里任一付费条目都让整轮放弃——比自愈的池级判更严：未通过探测的付费条目不在 usable 里"
+        );
+    }
+
+    /// 定时权重刷新必须复用批量探测入口（`start_probes`）：它自带 removed 过滤、24h 冷却跳过
+    /// 与 `probing` 原子互斥；谁绕过它直呼 `run_probe_batch(`，谁就丢掉这整套装甲。付费闸门
+    /// （数据红线 6）也必须留在任务入口——批量探测的目录选择不滤付费（实读 1483-1526）。
+    #[test]
+    fn weight_refresh_round_reuses_the_batch_probe_entry() {
+        let source = include_str!("orchestration.rs");
+        let body = source
+            .split_once("fn spawn_weight_refresh(")
+            .and_then(|rest| rest.1.split_once("fn start_auto_retry("))
+            .expect("spawn_weight_refresh 必须存在且排在 start_auto_retry 之前")
+            .0;
+        assert!(
+            body.contains("start_probes(None, false, true, &Scope::All)"),
+            "定时权重刷新必须走批量探测入口（自带 removed 过滤、冷却跳过与 probing 互斥）"
+        );
+        assert!(
+            body.contains("weight_refresh_skip_reason"),
+            "任务入口必须带付费闸门（数据红线 6：批量探测的目录选择不滤付费）"
+        );
+        assert!(
+            !body.contains("run_probe_batch("),
+            "不得绕过批量入口直呼 run_probe_batch（会丢掉冷却跳过与 probing 锁）"
+        );
     }
 
     /// 上一份 `status.json` 的 `modelResults` 形状不对时必须回落空对象：`record` 对整份 map 做

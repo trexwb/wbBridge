@@ -286,7 +286,9 @@ models.json → free_models(providers)（免费判定：输入/输出/缓存全 
      （付费白名单不进入自动重检；换 Key 时 `clear_retry_restrictions` 解除该平台失败模型的冷却 / 计数 / 建议）
   → sync_models（原子写）→ merge_models（保留非本工具条目，只清理/更新 OWNER = 'buddy-bridge-v1' 的条目）
      收敛：真实请求失败（`record()`，超时除外）、批量探测本轮有失败（手工读取也重发）、单模型重检失败都立即重发
-  → 生产发布链走 merge_models_auto（`SyncOptions.auto_route = true`）：发布集非空时在末位追加一条 `WB · auto` 合成路由条目，
+  → 生产发布链走 merge_models_auto（`SyncOptions.auto_route = true`）：发布集非空时在本服务条目块**首位**写一条 `WB · auto` 合成路由条目
+    （合并式 = 用户手动条目(原位不动) ++ [WB · auto] ++ 逐模型条目；与 `/v1/models` 的末位追加口径刻意分叉），
+    逐模型条目按**速度权重降序**重排（缺省 100、同权重稳定序，`auto::sort_by_weight_desc` 与 DSH 路由表共用同一比较器）；
     使 WorkBuddy/CodeBuddy 里看得见这个入口；该条目不计入 `sync.count`，也不进 `status.json` 的模型列表。
     能力声明按**免费池**如实统计（2026-11-17 用户推翻 supportsImages 恒 false 的保守裁定）：
     `supportsToolCall` / `supportsImages` / `supportsVideo` = `auto::any_tool_capable` / `any_image_capable` / `any_video_capable`，
@@ -347,6 +349,7 @@ start_backend
 | 超时降权额 | `TIMEOUT_PENALTY = SLOW_PENALTY = 20`（探测与真实请求的超时同额扣分） | `auto.rs` |
 | 失败模型自动重检 | 失败时刻 + 24 小时（`next_auto_retry_at`，`restrictedUntil` 存于 `modelResults.<id>`）；后台每 60s 检查一次，每个模型每 24 小时最多重检一次；`probeRetries >= AUTO_RETRY_SUGGEST_LIMIT`（3）写 `suggestRemove` |
 | 自愈重检间隔 | `SELF_HEAL_INTERVAL_MS = DAY_MS`（全池权重归零后最多每 24 小时触发一次全量探测） | `orchestration.rs` |
+| 定时权重刷新 | `WEIGHT_REFRESH_INTERVAL_MS = DAY_MS`（每 24h 由 `spawn_weight_refresh` 复用 `start_probes(None, false, true, Scope::All)` 批量入口全量刷新权重并重发配置；**目录**含付费条目整轮放弃——数据红线 6，`weight_refresh_skip_reason`） | `orchestration.rs` |
 | 转写首选名单 | `TRANSLATOR_ORDER`（4 项，须排除刚失败模型） | `orchestration.rs` |
 
 ## 编码规范
@@ -377,7 +380,7 @@ start_backend
 
 ### 核心特例约束（发布链别名与备份清扫）
 
-- **`WB · auto` 合成路由条目只在生产发布链写入插件配置**：`sync.rs::merge_models_auto` 走 `SyncOptions.auto_route`，该字段**默认 `false`**——JS 侧从来没有这一条，`tests/js_parity.rs::sync_options` 显式钉 `false`，因此对拍路径逐字节不变（把默认值翻成 `true`，`tests/fixtures/sync.json` 会立刻失败，那是**预期护栏生效**，不是要修的测试）。条目 `id` 刻意**绕过** `client_model_id`（否则变成 `OC · WB · auto`，与 `server.rs::chat()` 的字面比较永不匹配 ⇒ 改写不生效）。`sync.rs::owned_count` **必须排除别名**，否则 `sync.count` / `status.json` 的 `sync.targets.<目标>.count` 不再是「发布的模型数」。别名只进插件文档的 `availableModels`，**不进** `status.json` 的模型列表，面板因此没有也别新增这一行。`supportsToolCall` 必须取自 `auto::any_tool_capable(models)`，不得写成固定 `true`。`supportsImages` / `supportsVideo` / 推理声明同理：分别取 `auto::any_image_capable` / `any_video_capable` / `auto::auto_reasoning`（v1.1.15 起「`supportsImages` 恒 `false`」的保守裁定已于 **2026-11-17 被用户推翻**，改为按池如实声明）。三者的**统计域都是免费池**（`auto::free_pool` 剔除付费白名单条目后的发布集）——`server.rs::chat()` 改写 `WB · auto` 时只在免费池里选模型（数据红线 #6），付费独家的能力 / 档位若按全发布集声明，插件会发出一个「选择器永远选不出落点」的请求（DSH 侧 `auto_levels` 同一口径）；选择器按请求携带的能力 / 档位过滤候选，因此如实声明后插件声明的每一种组合在免费池里都至少有一个落点（候选层为空退全池，判决交回 `prepare` 的既有 400）。
+- **`WB · auto` 合成路由条目只在生产发布链写入插件配置**：`sync.rs::merge_models_auto` 走 `SyncOptions.auto_route`，该字段**默认 `false`**——JS 侧从来没有这一条，`tests/js_parity.rs::sync_options` 显式钉 `false`，因此对拍路径逐字节不变（把默认值翻成 `true`，`tests/fixtures/sync.json` 会立刻失败，那是**预期护栏生效**，不是要修的测试）。条目 `id` 刻意**绕过** `client_model_id`（否则变成 `OC · WB · auto`，与 `server.rs::chat()` 的字面比较永不匹配 ⇒ 改写不生效）。`sync.rs::owned_count` **必须排除别名**，否则 `sync.count` / `status.json` 的 `sync.targets.<目标>.count` 不再是「发布的模型数」。别名只进插件文档的 `availableModels`，**不进** `status.json` 的模型列表，面板因此没有也别新增这一行。`supportsToolCall` 必须取自 `auto::any_tool_capable(models)`，不得写成固定 `true`。`supportsImages` / `supportsVideo` / 推理声明同理：分别取 `auto::any_image_capable` / `any_video_capable` / `auto::auto_reasoning`（v1.1.15 起「`supportsImages` 恒 `false`」的保守裁定已于 **2026-11-17 被用户推翻**，改为按池如实声明）。三者的**统计域都是免费池**（`auto::free_pool` 剔除付费白名单条目后的发布集）——`server.rs::chat()` 改写 `WB · auto` 时只在免费池里选模型（数据红线 #6），付费独家的能力 / 档位若按全发布集声明，插件会发出一个「选择器永远选不出落点」的请求（DSH 侧 `auto_levels` 同一口径）；选择器按请求携带的能力 / 档位过滤候选，因此如实声明后插件声明的每一种组合在免费池里都至少有一个落点（候选层为空退全池，判决交回 `prepare` 的既有 400）。条目**顺序**（v1.3.22）：别名排在逐模型条目**之前**（本服务条目块首位，用户手动条目原位不动——刻意不插到合并结果的绝对第 0 位，那会移动用户条目、违反数据红线 1）；逐模型条目经 `auto::sort_by_weight_desc` 按**速度权重降序**重排（缺省 100、同权重稳定序），DSH 路由表（`dsh.rs::route_models`）用同一比较器，两处投影不得有两种顺序口径；对拍路径（`merge_models` / `auto_route = false`）不排序。
 - **插件配置写入不再产生任何备份**：`sync.rs` 写路径现存的是 `sweep_old_backups(file)`——在**两条出口**都调用（`atomic_write_with` 成功之后，以及内容无变化的早退之前），按**逐段白名单**（文件名以 `<配置文件名>.buddy-bridge-` 开头、以 `.bak` 结尾、中段全是 ASCII 数字、必须是普通文件；跳过目录、`read_dir` 失败静默）只清理本工具**旧版**攒下的存量备份。不得新增备份逻辑，也不得把判定放宽成通配删除（用户自己命名的 `*.bak`、`*.tmp` 一律不碰）。写盘保护只剩三道：文件锁 + 写前二次读取 + 原子替换（同目录临时文件再 `rename`）。
 - **付费白名单（v1.3.5）只能显式逐条放行，且绝不进入任何自动路径**：`backend::models_in(providers, namespace, allowed_paid)` 是唯一放行点——白名单内的全限定 id 可绕过「标价全 0」过滤，条目带 `paid: true`；免费条目**不得**带该键（否则 `tests/js_parity.rs` 的夹具会变）。白名单来源是 `settings.json` 的 `paidModels`（`/admin/set-paid-models` 全量替换，最多 64 条、前缀必须在 `providers::PROVIDERS` 内），写入后必须同步 `Backend::set_paid_models` 与 `status.json` 的 `paidModels`。**所有会产生真实账单的自动路径都必须排除 `paid: true`**：`server.rs::chat()` 的 `WB · auto` 选择域（`auto::free_pool`）、`attach_translator` 的转写候选、`reprobe_when_weights_exhausted` 的自愈重检；新增自动选模 / 自动请求逻辑时必须沿用同一过滤，不得直接遍历 `app.models`。用户手动指定付费模型仍照常请求与计费（这是白名单授权本身）。
 - **免密平台（2026-11-16 新增 `kilo`，同日把 `opencode` 也登记为免密）**：`Provider.keyless = true` 时 `providers::set_key` / `clear_key` / `reveal_key` 一律拒绝（面板也不显示 Key 表单），`status()` 把 `configured` 置 true 并带 `keyless: true`，`models` 必须留空（走 catalog 声明，免费判定仍按标价全 0，付费条目照旧被挡）。注入面按 `Provider::injected()` 分两类：
@@ -529,9 +532,9 @@ start_backend
 
 | 项 | 值 | 来源 |
 |---|---|---|
-| 版本单一来源 | **1.3.21** | 根 `package.json` 的 `version` |
-| 壳工程同步落点 | **1.3.21** | `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `[package] version` |
-| 核心 crate 版本 | **1.3.21** | `src-tauri/core/Cargo.toml`（`wbbridge-core --version` 输出；随产品版本同步，`version:set`/`version:check` 均覆盖） |
+| 版本单一来源 | **1.3.23** | 根 `package.json` 的 `version` |
+| 壳工程同步落点 | **1.3.23** | `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `[package] version` |
+| 核心 crate 版本 | **1.3.23** | `src-tauri/core/Cargo.toml`（`wbbridge-core --version` 输出；随产品版本同步，`version:set`/`version:check` 均覆盖） |
 
 > `status.json` 内写入的 `version` 是历史沿革值 `0.2.0`，**不属版本落点**，不得在无用户指令的情况下静默改动（见「关键常量」）。
 

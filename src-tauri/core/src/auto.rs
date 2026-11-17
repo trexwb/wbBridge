@@ -223,6 +223,17 @@ pub fn weight_of(model: &Value) -> u32 {
         .unwrap_or(DEFAULT_WEIGHT)
 }
 
+/// 把发布集按速度权重**降序**重排（缺 `weight` 按满分 [`DEFAULT_WEIGHT`] 参与，同权重稳定序）。
+///
+/// 插件配置（`sync.rs::merge_models_auto`）与 DSH 路由表（`dsh.rs::route_models`）是同一份
+/// 发布集的两个投影，必须共用这一个比较器，避免两处各自实现、口径漂移；取值复用
+/// [`weight_of`] 而不是新写一份——「缺失权重按满分处理」与 `WB · auto` 选择器、全池耗尽判定
+/// 同源。`sort_by` 是稳定排序：同权重条目保持发布集的既有顺序（发现聚合序），跨次同步输出
+/// 确定、幂等成立。
+pub fn sort_by_weight_desc(models: &mut [Value]) {
+    models.sort_by_key(|model| std::cmp::Reverse(weight_of(model)));
+}
+
 /// 慢请求扣权重，快请求不动；扣到 0 为止，不回负。
 pub fn decayed_weight(current: u32, duration_ms: i64) -> u32 {
     if duration_ms >= SLOW_REQUEST_MS {
@@ -875,6 +886,32 @@ mod tests {
             weighted("opencode/a", 0, false, false, false),
             weighted("opencode/b", 0, false, false, false),
         ]));
+    }
+
+    /// 发布集重排的三条规则一起钉住（插件配置与 DSH 路由表共用这一个比较器）：
+    /// 降序、缺 `weight` 按满分 100 参与、同权重保持输入序（稳定）。
+    #[test]
+    fn sort_by_weight_desc_orders_by_weight_with_default_and_stable_ties() {
+        let mut models = vec![
+            json!({ "id": "vendor/low", "weight": 30 }),
+            json!({ "id": "vendor/default" }),
+            json!({ "id": "vendor/high-a", "weight": 90 }),
+            json!({ "id": "vendor/high-b", "weight": 90 }),
+        ];
+        sort_by_weight_desc(&mut models);
+        let ids: Vec<&str> = models.iter().filter_map(|m| m["id"].as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["vendor/default", "vendor/high-a", "vendor/high-b", "vendor/low"],
+            "降序；缺 weight 按满分 100；同权重（90a/90b）保持输入序"
+        );
+        // 空表与单条是平凡情形，不得 panic。
+        let mut empty: Vec<Value> = Vec::new();
+        sort_by_weight_desc(&mut empty);
+        assert!(empty.is_empty());
+        let mut single = vec![json!({ "id": "vendor/one", "weight": 5 })];
+        sort_by_weight_desc(&mut single);
+        assert_eq!(single[0]["id"], json!("vendor/one"));
     }
 
     /// 默认选择必须落在**权重最高**的模型上，而不是随机分散到全池。

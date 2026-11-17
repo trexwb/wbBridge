@@ -157,7 +157,7 @@ struct RouteModel {
     levels: Vec<&'static str>,
 }
 
-/// 本轮要写进 DSH 的模型：`WB · auto` 在前，其余按发布集顺序（按 id 去重）。
+/// 本轮要写进 DSH 的模型：`WB · auto` 恒在前，其余按速度权重降序（按 id 去重，高权重者优先）。
 ///
 /// `WB · auto` 只在发布集非空时加——空池时它必然 400，写进去只会给用户一个坏入口。
 fn route_models(models: &[Value]) -> Vec<RouteModel> {
@@ -165,12 +165,17 @@ fn route_models(models: &[Value]) -> Vec<RouteModel> {
     if models.is_empty() {
         return rows;
     }
+    // 逐模型行按速度权重降序（缺省 100、同权重稳定序，v1.3.22）：与插件配置
+    // （`sync.rs::merge_models_auto`）共用 [`crate::auto::sort_by_weight_desc`] 同一比较器，
+    // 同一份发布集的两个投影不得有两种顺序口径；去重的 first-wins 随之变为「高权重者优先」。
+    let mut ordered = models.to_vec();
+    crate::auto::sort_by_weight_desc(&mut ordered);
     rows.push(RouteModel {
         id: AUTO_MODEL_ID.to_string(),
         name: AUTO_MODEL_ID.to_string(),
         levels: auto_levels(models),
     });
-    for model in models {
+    for model in &ordered {
         let id = client_model_id(model);
         if rows.iter().any(|row| row.id == id) {
             continue;
@@ -597,6 +602,38 @@ mod tests {
         );
         // 幂等：再合并一次逐字节相同。
         assert_eq!(merge_patch(&merged, "http://127.0.0.1:41980/v1", &models()).unwrap(), merged);
+    }
+
+    // 路由行顺序（v1.3.22）：`WB · auto` 行恒在最前，逐模型行按速度权重降序
+    // （缺省 100、同权重稳定序），与插件配置（merge_models_auto）共用同一比较器。
+    // 去重的 first-wins 在排序后变为「高权重者优先」。
+    #[test]
+    fn route_rows_follow_weight_order_after_the_auto_row() {
+        let pool = vec![
+            json!({ "id": "opencode/low", "name": "Low", "weight": 30 }),
+            json!({ "id": "opencode/default", "name": "Default" }),
+            json!({ "id": "opencode/high-a", "name": "High A", "weight": 90 }),
+            json!({ "id": "opencode/high-b", "name": "High B", "weight": 90 }),
+        ];
+        let rows = route_models(&pool);
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                AUTO_MODEL_ID,
+                "OC · Default",
+                "OC · High A",
+                "OC · High B",
+                "OC · Low",
+            ],
+            "别名恒在最前；逐模型按权重降序（缺省 100），同权重保持输入序"
+        );
+        // 经 merge_patch 的端到端形态：文本里 WB · auto 行也在逐模型行之前，且低权重垫底。
+        let merged = merge_patch("[]\n", "http://127.0.0.1:41980/v1", &pool).expect("可合并");
+        let auto_pos = merged.find("- id: 'WB · auto'").expect("别名行存在");
+        let default_pos = merged.find("- id: 'OC · Default'").expect("缺省权重行存在");
+        let low_pos = merged.find("- id: 'OC · Low'").expect("低权重行存在");
+        assert!(auto_pos < default_pos && default_pos < low_pos, "{merged}");
     }
 
     #[test]

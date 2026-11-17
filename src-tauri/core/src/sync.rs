@@ -391,10 +391,16 @@ pub fn merge_models(
     )
 }
 
-/// [`merge_models`] + 发布集非空时在末位追加一条 [`auto_entry`]（`WB · auto` 合成路由）。
+/// [`merge_models`] + 发布集非空时在**本服务条目块首位**写一条 [`auto_entry`]（`WB · auto`
+/// 合成路由），并把逐模型条目按速度权重降序重排（缺省 100、同权重稳定序，比较器见
+/// [`crate::auto::sort_by_weight_desc`]）。
 ///
-/// 追加发生在逐模型条目之后、冲突判定之内：用户自己有一条 `id` 为 `WB · auto` 的手动条目时
-/// **不覆盖**（数据红线：手动条目 ID 冲突时不得擅自覆盖）。
+/// 排序只发生在这一步（克隆后重排输入）：[`merge_models`] / `auto_route = false` 的对拍路径
+/// 一字不动。合并式为 `kept(用户手动条目, 原位不动) ++ [别名] ++ 逐模型条目(权重降序)`——
+/// 别名排在逐模型条目**之前**，与 `/v1/models` 的末位追加口径刻意分叉（插件配置里本工具
+/// 名下的条目聚在一起，自动路由入口居首）；刻意不插到合并结果的绝对第 0 位，那会移动用户
+/// 手动条目的既有位置（数据红线 1：其他条目原样保留）。用户自己有一条 `id` 为 `WB · auto`
+/// 的手动条目时**不覆盖**（数据红线：手动条目 ID 冲突时不得擅自覆盖）。
 pub fn merge_models_auto(
     document: &Value,
     models: &[Value],
@@ -403,8 +409,10 @@ pub fn merge_models_auto(
     allow_empty: bool,
     shape: DocumentShape,
 ) -> Result<Value, SyncError> {
+    let mut ordered = models.to_vec();
+    crate::auto::sort_by_weight_desc(&mut ordered);
     merge_with_auto(
-        document, models, endpoint, key, allow_empty, shape, true,
+        document, &ordered, endpoint, key, allow_empty, shape, true,
     )
 }
 
@@ -448,13 +456,15 @@ fn merge_with_auto(
         }
         entries.push(model_entry(model, &client_id, endpoint, key));
     }
-    // 合成路由条目排在逐模型条目之后：与 `/v1/models` 的末位追加同一口径。
-    // 判定用 `models.is_empty()` 而不是 `entries.is_empty()`——后者会因全部条目撞 id 而为空，
-    // 那种情况下发布集其实非空，别名仍该出现。
+    // 合成路由条目排在逐模型条目**之前**（本服务条目块首位，v1.3.22）：与 `/v1/models` 的
+    // 末位追加口径刻意分叉——插件配置里本工具名下的条目聚在一起，别名居首、逐模型条目随后；
+    // 用户手动条目（kept）在合并式里仍居其原有位置，不得移动。判定用 `models.is_empty()`
+    // 而不是 `entries.is_empty()`——后者会因全部条目撞 id 而为空，那种情况下发布集其实非空，
+    // 别名仍该出现。
     if auto_route && !models.is_empty() {
         let entry = auto_entry(models, endpoint, key);
         if !conflicts(entry.get("id")) {
-            entries.push(entry);
+            entries.insert(0, entry);
         }
     }
 
@@ -1570,6 +1580,37 @@ mod tests {
             .expect("合并成功")
     }
 
+    // 插件配置的条目顺序（v1.3.22）：合并式 = 手动条目(原位) ++ [别名] ++ 逐模型条目(权重降序)。
+    // 三条排序规则一起钉住：缺失权重取 DEFAULT_WEIGHT = 100、降序、同权重稳定序；
+    // 与 DSH 路由表（dsh.rs::route_models）共用同一比较器，两侧口径不得分叉。
+    #[test]
+    fn auto_route_orders_models_by_weight_descending_with_default_and_stable_ties() {
+        let models = vec![
+            json!({ "id": "vendor/low", "name": "low", "weight": 30 }),
+            json!({ "id": "vendor/default", "name": "default" }),
+            json!({ "id": "vendor/high-a", "name": "high-a", "weight": 90 }),
+            json!({ "id": "vendor/high-b", "name": "high-b", "weight": 90 }),
+        ];
+        let merged = merge_auto(&json!([]), &models);
+        let ids: Vec<Value> = merged
+            .as_array()
+            .expect("数组")
+            .iter()
+            .map(|item| item["id"].clone())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                json!(crate::auto::AUTO_MODEL_ID),
+                json!("OC · default"),
+                json!("OC · high-a"),
+                json!("OC · high-b"),
+                json!("OC · low"),
+            ],
+            "别名在本服务条目块首位；逐模型按权重降序（缺省 100），同权重保持输入序"
+        );
+    }
+
     // 🔴 混搭池的护栏：专用小模型（OCR 一类，toolcall=false、上下文极小）曾经把整条别名
     // 的 `maxInputTokens` 拉到 8192，而同池有 1000000 的长上下文模型——122 倍容量被一个
     // 永远不会被选中去干这件事的模型锁死（真实池观测：`siliconflow-cn/deepseek-ai/DeepSeek-OCR`）。
@@ -1584,7 +1625,7 @@ mod tests {
                 json!({ "id": "v/mid", "name": "mid", "input": 128_000, "toolcall": true }),
             ],
         );
-        let alias = &merged.as_array().expect("数组")[3];
+        let alias = &merged.as_array().expect("数组")[0];
         assert_eq!(
             alias["maxInputTokens"],
             json!(128_000),
@@ -1604,17 +1645,17 @@ mod tests {
                 json!({ "id": "v/chat", "name": "chat", "input": 32_000, "chatOnly": true }),
             ],
         );
-        let alias = &merged.as_array().expect("数组")[2];
+        let alias = &merged.as_array().expect("数组")[0];
         assert_eq!(alias["maxInputTokens"], json!(8_192), "全池无工具候选时回全池最小值");
         assert_eq!(alias["supportsToolCall"], json!(false), "此时也不声明工具能力");
     }
 
     #[test]
-    fn the_auto_route_entry_is_appended_last_with_a_conservative_declaration() {
+    fn the_auto_route_entry_leads_the_owned_block_with_a_conservative_declaration() {
         let merged = merge_auto(&json!([]), &pool(&[32_000, 128_000], true));
         let items = merged.as_array().expect("数组");
         assert_eq!(items.len(), 3, "两条模型 + 一条别名");
-        let alias = &items[2];
+        let alias = &items[0];
         // id 逐字等于路由名：插件发出的 model 就是它，server.rs 的改写判定比对的也是它。
         assert_eq!(alias["id"], json!(crate::auto::AUTO_MODEL_ID));
         assert_eq!(alias["name"], json!(crate::auto::AUTO_MODEL_ID));
@@ -1669,7 +1710,7 @@ mod tests {
             json!({ "id": "vendor/b", "name": "b", "chatOnly": true }),
         ];
         let merged = merge_auto(&json!([]), &chat_only);
-        let alias = &merged.as_array().expect("数组")[2];
+        let alias = &merged.as_array().expect("数组")[0];
         assert_eq!(alias["id"], json!(crate::auto::AUTO_MODEL_ID));
         assert_eq!(alias["supportsToolCall"], json!(false));
 
@@ -1678,7 +1719,7 @@ mod tests {
             json!({ "id": "vendor/c", "name": "c", "toolcall": true }),
         ];
         let merged = merge_auto(&json!([]), &one_can);
-        let alias = &merged.as_array().expect("数组")[2];
+        let alias = &merged.as_array().expect("数组")[0];
         assert_eq!(alias["supportsToolCall"], json!(true));
     }
 
@@ -1693,7 +1734,7 @@ mod tests {
             json!({ "id": "vendor/free", "name": "free", "input": 32_000 }),
         ];
         let merged = merge_auto(&json!([]), &paid_only_tools);
-        let alias = &merged.as_array().expect("数组")[2];
+        let alias = &merged.as_array().expect("数组")[0];
         assert_eq!(
             alias["supportsToolCall"],
             json!(false),
@@ -1711,7 +1752,7 @@ mod tests {
             json!({ "id": "vendor/free", "name": "free", "input": 32_000 }),
         ];
         let merged = merge_auto(&json!([]), &paid_turned_free);
-        let alias = &merged.as_array().expect("数组")[2];
+        let alias = &merged.as_array().expect("数组")[0];
         assert_eq!(alias["supportsToolCall"], json!(true));
         assert_eq!(alias["maxInputTokens"], json!(8_192));
     }
@@ -1734,7 +1775,7 @@ mod tests {
         let merged = merge_auto(&json!([]), &paid);
         let items = merged.as_array().expect("数组");
         assert_eq!(items.len(), 2, "付费条目照常发布（用户白名单授权），别名照常出现");
-        let alias = &items[1];
+        let alias = &items[0];
         assert_eq!(alias["id"], json!(crate::auto::AUTO_MODEL_ID));
         assert_eq!(alias["supportsToolCall"], json!(false));
         assert_eq!(alias["supportsImages"], json!(false), "免费池为空时不声明图片能力");
@@ -1761,7 +1802,7 @@ mod tests {
             json!({ "id": "vendor/free", "name": "free" }),
         ];
         let merged = merge_auto(&json!([]), &paid_only_vision);
-        let alias = &merged.as_array().expect("数组")[2];
+        let alias = &merged.as_array().expect("数组")[0];
         assert_eq!(alias["supportsImages"], json!(false), "图片候选只在付费条目上，不点亮");
         assert_eq!(alias["supportsVideo"], json!(false), "视频候选只在付费条目上，不点亮");
 
@@ -1771,7 +1812,7 @@ mod tests {
             json!({ "id": "vendor/free", "name": "free" }),
         ];
         let merged = merge_auto(&json!([]), &turned_free);
-        let alias = &merged.as_array().expect("数组")[2];
+        let alias = &merged.as_array().expect("数组")[0];
         assert_eq!(alias["supportsImages"], json!(true));
         assert_eq!(alias["supportsVideo"], json!(true));
     }
@@ -1787,7 +1828,7 @@ mod tests {
             json!({ "id": "vendor/b", "name": "b", "chatOnly": true, "images": false, "video": false }),
         ];
         let merged = merge_auto(&json!([]), &chat);
-        let alias = &merged.as_array().expect("数组")[2];
+        let alias = &merged.as_array().expect("数组")[0];
         assert_eq!(alias["id"], json!(crate::auto::AUTO_MODEL_ID));
         assert_eq!(alias["supportsToolCall"], json!(false), "工具维度本就诚实");
         assert_eq!(alias["supportsImages"], json!(false), "chatOnly 短路不得把图片声明成 true");
@@ -1804,7 +1845,7 @@ mod tests {
                     "variants": { "max": { "reasoningEffort": "max" } } }),
         ];
         let merged = merge_auto(&json!([]), &pool);
-        let alias = &merged.as_array().expect("数组")[2];
+        let alias = &merged.as_array().expect("数组")[0];
         assert_eq!(
             alias["supportsReasoning"],
             json!(true),
@@ -1828,7 +1869,7 @@ mod tests {
         assert_eq!(alias["reasoning"]["defaultEffort"], json!("low"), "没有 medium 时取首个非 none 档");
 
         // 逐模型条目仍按各自 variant 声明档位（用户手动选中时可用）。
-        let paid_entry = &merged.as_array().expect("数组")[1];
+        let paid_entry = &merged.as_array().expect("数组")[2];
         assert_eq!(paid_entry["reasoning"]["supportedEfforts"], json!(["max"]));
     }
 
@@ -1876,7 +1917,8 @@ mod tests {
     }
 
     // 生产路径就是「CodeBuddy 形态 × auto_route」的组合：别名要落进 `{ "models": […] }`
-    // 的末位，且与 Preserve 形态一样幂等（对拍夹具不覆盖该组合，这里由单测钉住）。
+    // 里本服务条目块的首位（手动条目原位不动），且与 Preserve 形态一样幂等
+    // （对拍夹具不覆盖该组合，这里由单测钉住）。
     #[test]
     fn a_codebuddy_shaped_auto_route_puts_the_alias_inside_the_models_object() {
         let document = json!({ "models": [{ "id": "mine", "name": "手动条目" }] });
@@ -1891,7 +1933,7 @@ mod tests {
         .expect("合并成功");
         let items = merged["models"].as_array().expect("数组");
         assert_eq!(items.len(), 3, "手动条目 + 一条模型 + 一条别名");
-        assert_eq!(items[2]["id"], json!(crate::auto::AUTO_MODEL_ID), "别名在末位");
+        assert_eq!(items[1]["id"], json!(crate::auto::AUTO_MODEL_ID), "别名在本服务条目块首位");
         assert_eq!(items[0]["id"], json!("mine"), "手动条目原样保留");
 
         let again = merge_models_auto(
@@ -1929,7 +1971,7 @@ mod tests {
             "逐模型 id 与别名都要进可选项"
         );
         assert_eq!(
-            document["availableModels"][1],
+            document["availableModels"][0],
             json!(crate::auto::AUTO_MODEL_ID)
         );
 
@@ -1957,16 +1999,32 @@ mod tests {
     #[test]
     fn the_plain_merge_still_writes_no_alias() {
         // `SyncOptions::default()` 与全部对拍入口都从这里过：默认关，输出逐字节不变。
+        // 输入带 weight 字段也照旧：排序严格只挂在 merge_models_auto（auto_route = true），
+        // 对拍路径不重排——这里与 js_parity 的 sync_options 固定 false 互为双保险。
+        let weighted = vec![
+            json!({ "id": "vendor/low", "name": "low", "weight": 30 }),
+            json!({ "id": "vendor/high", "name": "high", "weight": 90 }),
+        ];
         let merged = merge_models(
             &json!([]),
-            &pool(&[32_000], true),
+            &weighted,
             "http://e",
             "k",
             false,
             DocumentShape::Preserve,
         )
         .expect("合并");
-        assert_eq!(merged.as_array().expect("数组").len(), 1);
+        let ids: Vec<&Value> = merged
+            .as_array()
+            .expect("数组")
+            .iter()
+            .map(|item| &item["id"])
+            .collect();
+        assert_eq!(
+            ids,
+            vec![&json!("OC · low"), &json!("OC · high")],
+            "对拍路径不做任何排序：权重悬殊的输入仍按输入顺序输出"
+        );
         assert!(!json::js_stringify(&merged).contains(crate::auto::AUTO_MODEL_ID));
     }
 }
