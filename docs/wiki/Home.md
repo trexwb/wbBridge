@@ -1,12 +1,12 @@
 # WB Bridge 文档
 
-WB Bridge 是一个**跨平台托盘应用**（Tauri 2 桌面壳 + 同进程内嵌 Rust 核心），通过**隔离托管**的 OpenCode 运行时，为 [WorkBuddy](https://www.workbuddy.cn) 提供免费模型服务。
+WB Bridge 是一个**跨平台托盘应用**（Tauri 2 桌面壳 + 同进程内嵌 Rust 核心），通过**隔离托管**的 OpenCode 运行时，为 [WorkBuddy](https://www.workbuddy.cn) 等各类 AI 工具与插件提供免费模型与白名单付费模型服务。
 
 它做三件事：
 
 1. **托管一个隔离的 OpenCode 运行时**——优先复用本机已有的 `opencode`，否则从 npm 官方源（失败回退国内镜像）下载官方 tarball，校验 `sha512-` 完整性后解包，用隔离环境变量 + 独立随机端口以 `serve --pure` 启动，不污染用户自己的 OpenCode 配置、数据、缓存与登录态。
 2. **对外暴露 OpenAI 兼容 API**——在本地 `127.0.0.1:<port>` 提供 `/v1/models` 与 `/v1/chat/completions`（含 SSE 流式），强制 `Authorization: Bearer <api-key>` 鉴权，拒绝一切浏览器 Origin，最多 8 个并发请求（上限值由 `red_lines` 断言钉死）。
-3. **把可用模型同步给 WorkBuddy / CodeBuddy**——自动发现免费模型 → 逐模型真实探测 → 只把探测通过的模型发布给插件（原子写 + 增量合并 `models.json`，只增删自己名下的条目）。
+3. **把可用模型同步给 WorkBuddy / CodeBuddy / DSH**——自动发现免费模型 → 逐模型真实探测 → 只把探测通过的模型发布给客户端（WorkBuddy / CodeBuddy 走 `models.json` 原子写 + 增量合并，DSH 走 profile 用户补丁里的 `wbbridge` 路由；只增删自己名下的条目）。
 
 ---
 
@@ -34,7 +34,7 @@ WB Bridge 是一个**跨平台托盘应用**（Tauri 2 桌面壳 + 同进程内�
 | 免费模型发现与真实探测 | 刷新免费目录 → 对每个模型发送简短真实请求 | 面板「读取免费模型」→「检测全部」后，模型行出现通过 / 失败状态与失败原因 |
 | OpenAI 兼容接口 | `/v1/models`、`/v1/chat/completions`（含 SSE），Bearer 鉴权、任何非空 `Origin` → 403、请求体 ≤8MB、并发 ≤8 | `curl -H "Authorization: Bearer $(cat <数据目录>/api-key)" http://127.0.0.1:<port>/v1/models` 返回模型列表；不带 key 返回 401 |
 | `WB · auto` 智能路由 | `model` 填 `WB · auto` 时按请求内容在可用池里选真实模型；响应 `model` 为实际模型的全限定 id | `/v1/models` 列表末位出现 `WB · auto`（池为空时不出现）；请求后数据目录 `status.json` 的 `usage` 记在实际模型上 |
-| 插件配置合并写入 | 只增删自己名下的条目写入 WorkBuddy / CodeBuddy 的 `models.json`（原子替换、不写备份） | 面板「导入」后插件模型选择器出现新模型；本工具名下条目的增删不影响用户手动添加的条目 |
+| 插件配置合并写入 | 只增删自己名下的条目写入 WorkBuddy / CodeBuddy 的 `models.json`（原子替换、不写备份）与 DSH 的 profile 用户补丁（`wbbridge` 路由，随发布自动写入） | 面板「导入」后插件模型选择器出现新模型；本工具名下条目的增删不影响用户手动添加的条目 |
 | 平台 Key 接入（可选） | 侧栏「平台」视图填 ModelScope / SiliconFlow / 腾讯混元 TokenHub / 智谱 / 爱思 Agnes / 商汤 SenseNova / NVIDIA NIM / OpenRouter / Hugging Face Key；另有免密直连的 Kilo 与 OpenCode（无需 Key） | 保存后该平台免费模型被一起发现；视图只显示「已配置 / 未配置」（Kilo / OpenCode 显示「免密直连」），Key 落数据目录 `providers.json`（`0600`）、不回显 |
 | AI 助手（自然语言代管） | 侧栏「AI 助手」：只读工具立即执行，写入工具先作为**提案**、逐条勾选确认后才执行；大脑默认本机免费模型（`WB · auto`），可切任意 OpenAI 兼容端点 | 问一句「现在服务状态怎么样」应得到取自壳推送快照的回答；让助手「检测全部模型」应先弹出确认条目、勾选后才发起 `probe`；⚠ **从未在真实 WebView 与真实端点跑过**（见[已知限制与未验证项](已知限制与未验证项) 第 17 项） |
 | 提示词优化（固定 `WB · auto`） | 侧栏「提示词优化」：系统 / 用户两种提示词对象、7 个内置模板、逐版迭代的版本链、原占位符缺失 / 新增比对，以及用同一份测试输入分别跑源提示词与当前版本的对比测试；提交即显示等待态与独立「停止」，所有提交有在飞互斥与节流；提示词与结果只保存在会话内存 | 点「开始优化」后按钮立即进入等待态、可停止；出结果后可复制、设为源提示词或按补充要求继续优化；⚠ **只有单测与构建证据，从未在真实 WebView 与真实免费模型端点跑过**（见[已知限制与未验证项](已知限制与未验证项) 第 24 项） |

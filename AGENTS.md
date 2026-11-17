@@ -252,8 +252,8 @@ wbBridge/
 ```
 WorkBuddy
   → server.rs：Bearer 鉴权（timing-safe）→ 拒绝 Origin（403）→ 限流（>8 并发 429 busy）→ 读体（>8MB 413、>20s 408）
-  → WB · auto：读体之后、记账键取读之前，若 body.model == "WB · auto" 则用 auto::auto_select（池快照只取读一次）改写为实际模型全限定 id；选不出（池空）即不改写。候选先按能力档位、再按请求携带的推理档位过滤（`auto::requested_effort` / `accepts_effort`，与 `prepare` 的 400 `unsupported_reasoning_effort` 同源），档位层为空退全池
-  → protocol::prepare(body, models)：模型匹配 / messages 校验 / n=1 / tool 定义唯一性 / 图片 mime 白名单（png·jpeg·webp·gif）
+  → WB · auto：读体之后、记账键取读之前，若 body.model == "WB · auto" 则用 auto::auto_select（池快照只取读一次）改写为实际模型全限定 id；选不出（池空）即不改写。候选先按能力档位（图片 / 视频：`image_url` part 按 data URL 的 `data:video/` 前缀分流——OpenAI 兼容层没有独立的视频 part，视频档要求模型 `video == true`）、再按请求携带的推理档位过滤（`auto::requested_effort` / `accepts_effort`，与 `prepare` 的 400 `unsupported_reasoning_effort` 同源），档位层为空退全池
+  → protocol::prepare(body, models)：模型匹配 / messages 校验 / n=1 / tool 定义唯一性 / 图片 mime 白名单（png·jpeg·webp·gif）与视频容器白名单（mp4·webm·quicktime，`data:video/` 前缀经 image_url 通道分流后按 `parse_video_data_url` 校验，未收录容器与非规范 base64 → 400 `unsupported_content`）
   → backend::complete(...)：OpenCode 会话 + 消息 + 事件流
         ├─ 原生工具调用 → native_permissions（'*': 'ask'，question/websearch/codesearch/webfetch/task/plan_enter/plan_exit/todowrite: 'deny'）
         │    → 阻塞并交回客户端（handoff），模型不得自行执行本地动作
@@ -272,12 +272,22 @@ WorkBuddy
 models.json → free_models(providers)（免费判定：输入/输出/缓存全 0、输出支持文本、非 deprecated）
   → 逐模型探测（probe_model：工具调用类 + 纯文本类，失败可重试 1 次）
   → 仅 ok 的模型进入发布集（客户端 ID = `<前缀> · <name>`：注册表平台用各自两字母短前缀，`opencode` 与未注册命名空间回落 `OC`）
-     `publishable_models` 同时要求「已校验」且 `modelResults[id].ok === true`：失败 / 超时 / 不可用的模型
-     既不写入两个插件配置，也不进 `/v1/models` 与 `WB · auto` 的选择域
+     `publishable_models` 同时要求「已校验」且「`modelResults[id].ok === true` 或带 `soft: true`」：
+     失败 / 额度用尽 / 从未通过探测的模型既不写入两个插件配置，也不进 `/v1/models` 与 `WB · auto` 的选择域
+  → 失败归类（`model_status::model_result` 的 `category`）决定后续动作（2026-11-17 用户裁定）：
+     **超时（`timeout`）只降权、不判死**——`record` 若该模型此前已通过校验则保留发布资格并打 `soft: true`
+     （重启后 `validated_from_results` 沿用），权重按 `auto::TIMEOUT_PENALTY`（= `SLOW_PENALTY`）扣一档；
+     **额度用尽（`quota`）判不可用**——写入 `modelResults[id].restrictedUntil`（下一个 UTC 零点，`next_day_retry_at`），
+     批量探测跳过尚未到点的受限模型，后台任务 `spawn_quota_retry` 每 60s 检查一次，到点自动重检、通过即恢复发布
+     （付费白名单不进入自动重检；换 Key 时 `clear_quota_restrictions` 解除该平台的受限时刻）
   → sync_models（原子写）→ merge_models（保留非本工具条目，只清理/更新 OWNER = 'buddy-bridge-v1' 的条目）
-     收敛：真实请求失败（`record()`）、批量探测本轮有失败（手工读取也重发）、单模型重检失败都立即重发
+     收敛：真实请求失败（`record()`，超时除外）、批量探测本轮有失败（手工读取也重发）、单模型重检失败都立即重发
   → 生产发布链走 merge_models_auto（`SyncOptions.auto_route = true`）：发布集非空时在末位追加一条 `WB · auto` 合成路由条目，
-    使 WorkBuddy/CodeBuddy 里看得见这个入口；该条目不计入 `sync.count`，也不进 `status.json` 的模型列表
+    使 WorkBuddy/CodeBuddy 里看得见这个入口；该条目不计入 `sync.count`，也不进 `status.json` 的模型列表。
+    能力声明按**免费池**如实统计（2026-11-17 用户推翻 supportsImages 恒 false 的保守裁定）：
+    `supportsToolCall` / `supportsImages` / `supportsVideo` = `auto::any_tool_capable` / `any_image_capable` / `any_video_capable`，
+    推理声明 = `auto::auto_reasoning`（EFFORT_LEVELS 序并集、medium 优先默认档），键形态与逐模型条目同形；
+    逐模型条目新增**条件键** `supportsVideo`（仅该模型 `video == true` 时写入，镜像 `paid` 的条件模式，对拍夹具零影响）
   → DSH（`dsh.rs`，检测到 `$DSH_HOME/profiles/<名称>/cordis.patch.yml` 时）：只改 `id: llm-pi-ai` 行的
     `config.providers.wbbridge`（`api: openai-completions`、`baseURL` = 本服务 `<endpoint>/v1`、
     `apiKeyEnv: WB_BRIDGE_API_KEY`），并保证 `.credentials.yaml` 的该引用 = 本服务 api-key；
@@ -330,6 +340,8 @@ start_backend
 | `status.json` 顶层 `usage` | `{since, total:{requests,ok,failed}, models:{<clientModelId>:{requests,ok,failed,lastMs,avgMs}}}`；**只累计真实请求**（`source == "request"`，客户端取消的不计为成功），跨重启延续 | `orchestration.rs` |
 | 状态内置版本 | `"0.2.0"`（写入 `status.json`，历史沿革值） | `orchestration.rs` 状态初值 |
 | 格式类失败集合 | `REQUEST_SHAPED_FAILURES`（4 项） | `orchestration.rs` |
+| 超时降权额 | `TIMEOUT_PENALTY = SLOW_PENALTY = 20`（探测与真实请求的超时同额扣分） | `auto.rs` |
+| 额度受限重试 | 下一个 UTC 零点（`next_day_retry_at`，`restrictedUntil` 存于 `modelResults.<id>`）；后台每 60s 检查一次 | `orchestration.rs` |
 | 转写首选名单 | `TRANSLATOR_ORDER`（4 项，须排除刚失败模型） | `orchestration.rs` |
 
 ## 编码规范
@@ -360,7 +372,7 @@ start_backend
 
 ### 核心特例约束（发布链别名与备份清扫）
 
-- **`WB · auto` 合成路由条目只在生产发布链写入插件配置**：`sync.rs::merge_models_auto` 走 `SyncOptions.auto_route`，该字段**默认 `false`**——JS 侧从来没有这一条，`tests/js_parity.rs::sync_options` 显式钉 `false`，因此对拍路径逐字节不变（把默认值翻成 `true`，`tests/fixtures/sync.json` 会立刻失败，那是**预期护栏生效**，不是要修的测试）。条目 `id` 刻意**绕过** `client_model_id`（否则变成 `OC · WB · auto`，与 `server.rs::chat()` 的字面比较永不匹配 ⇒ 改写不生效）。`sync.rs::owned_count` **必须排除别名**，否则 `sync.count` / `status.json` 的 `sync.targets.<目标>.count` 不再是「发布的模型数」。别名只进插件文档的 `availableModels`，**不进** `status.json` 的模型列表，面板因此没有也别新增这一行。`supportsToolCall` 必须取自 `auto::any_tool_capable(models)`，不得写成固定 `true`。
+- **`WB · auto` 合成路由条目只在生产发布链写入插件配置**：`sync.rs::merge_models_auto` 走 `SyncOptions.auto_route`，该字段**默认 `false`**——JS 侧从来没有这一条，`tests/js_parity.rs::sync_options` 显式钉 `false`，因此对拍路径逐字节不变（把默认值翻成 `true`，`tests/fixtures/sync.json` 会立刻失败，那是**预期护栏生效**，不是要修的测试）。条目 `id` 刻意**绕过** `client_model_id`（否则变成 `OC · WB · auto`，与 `server.rs::chat()` 的字面比较永不匹配 ⇒ 改写不生效）。`sync.rs::owned_count` **必须排除别名**，否则 `sync.count` / `status.json` 的 `sync.targets.<目标>.count` 不再是「发布的模型数」。别名只进插件文档的 `availableModels`，**不进** `status.json` 的模型列表，面板因此没有也别新增这一行。`supportsToolCall` 必须取自 `auto::any_tool_capable(models)`，不得写成固定 `true`。`supportsImages` / `supportsVideo` / 推理声明同理：分别取 `auto::any_image_capable` / `any_video_capable` / `auto::auto_reasoning`（v1.1.15 起「`supportsImages` 恒 `false`」的保守裁定已于 **2026-11-17 被用户推翻**，改为按池如实声明）。三者的**统计域都是免费池**（`auto::free_pool` 剔除付费白名单条目后的发布集）——`server.rs::chat()` 改写 `WB · auto` 时只在免费池里选模型（数据红线 #6），付费独家的能力 / 档位若按全发布集声明，插件会发出一个「选择器永远选不出落点」的请求（DSH 侧 `auto_levels` 同一口径）；选择器按请求携带的能力 / 档位过滤候选，因此如实声明后插件声明的每一种组合在免费池里都至少有一个落点（候选层为空退全池，判决交回 `prepare` 的既有 400）。
 - **插件配置写入不再产生任何备份**：`sync.rs` 写路径现存的是 `sweep_old_backups(file)`——在**两条出口**都调用（`atomic_write_with` 成功之后，以及内容无变化的早退之前），按**逐段白名单**（文件名以 `<配置文件名>.buddy-bridge-` 开头、以 `.bak` 结尾、中段全是 ASCII 数字、必须是普通文件；跳过目录、`read_dir` 失败静默）只清理本工具**旧版**攒下的存量备份。不得新增备份逻辑，也不得把判定放宽成通配删除（用户自己命名的 `*.bak`、`*.tmp` 一律不碰）。写盘保护只剩三道：文件锁 + 写前二次读取 + 原子替换（同目录临时文件再 `rename`）。
 - **付费白名单（v1.3.5）只能显式逐条放行，且绝不进入任何自动路径**：`backend::models_in(providers, namespace, allowed_paid)` 是唯一放行点——白名单内的全限定 id 可绕过「标价全 0」过滤，条目带 `paid: true`；免费条目**不得**带该键（否则 `tests/js_parity.rs` 的夹具会变）。白名单来源是 `settings.json` 的 `paidModels`（`/admin/set-paid-models` 全量替换，最多 64 条、前缀必须在 `providers::PROVIDERS` 内），写入后必须同步 `Backend::set_paid_models` 与 `status.json` 的 `paidModels`。**所有会产生真实账单的自动路径都必须排除 `paid: true`**：`server.rs::chat()` 的 `WB · auto` 选择域（`auto::free_pool`）、`attach_translator` 的转写候选、`reprobe_when_weights_exhausted` 的自愈重检；新增自动选模 / 自动请求逻辑时必须沿用同一过滤，不得直接遍历 `app.models`。用户手动指定付费模型仍照常请求与计费（这是白名单授权本身）。
 - **免密平台（2026-11-16 新增 `kilo`，同日把 `opencode` 也登记为免密）**：`Provider.keyless = true` 时 `providers::set_key` / `clear_key` / `reveal_key` 一律拒绝（面板也不显示 Key 表单），`status()` 把 `configured` 置 true 并带 `keyless: true`，`models` 必须留空（走 catalog 声明，免费判定仍按标价全 0，付费条目照旧被挡）。注入面按 `Provider::injected()` 分两类：
@@ -412,7 +424,7 @@ start_backend
   禁止新增按宽度堆叠的媒体查询或 `<900px` 降级分支——`src/` 内现存的媒体查询只有 `prefers-color-scheme`（`variables.css`）与
   `prefers-reduced-motion`（`base.css`）两处。收起详情有三条等价路径：`Esc`（`App.vue::onKeydown`）、详情头部「收起详情」按钮、
   窗口失焦（`onDismiss`）；收起即清空选中，列表占满主区宽度。
-- **侧栏是分组导航**：分组为「模型 / 运行 / 集成 / 其他」，底部为「运行设置」（系统代理开关 + 版本号）。**8 个入口都是已实现的视图**（视图 ID 的唯一名单是 `prefs.js` 的 `VIEW_IDS`，视图状态由 `src/App.vue` 的 `view` 持有，侧栏按 `current` 高亮并带 `aria-current="page"`）：
+- **侧栏是分组导航**：分组为「模型 / 运行 / 其他」，底部为「运行设置」（系统代理开关 + 版本号）。**8 个入口都是已实现的视图**（视图 ID 的唯一名单是 `prefs.js` 的 `VIEW_IDS`，视图状态由 `src/App.vue` 的 `view` 持有，侧栏按 `current` 高亮并带 `aria-current="page"`）：
   模型与服务（`.top` + `.content`，保留主从两栏；工具条的「回收站」按钮在页内切到独立回收站面板 `src/views/ModelRecycleBin.vue`，已移除模型不混进主列表）、平台（`src/views/ProvidersView.vue`，十一家平台各占一行摘要「名称 / 注册表 id / 已配置或未配置 / 付费放行数」——Kilo 与 OpenCode 是免密平台：徽章显示「免密直连」，弹窗只给生效方式与隐私提示（按平台的 `keylessNote` 分文案：Kilo 说明核心恒常注入，OpenCode 说明是运行时自带命名空间、不额外注入），不显示 Key 表单、申请引导与付费白名单；点「管理配置」进同一张弹窗，内分申请引导、Key 表单与付费白名单三块——**打开弹窗即经 `reveal-provider-key` 尝试取回该平台已保存的 Key 并掩码回填**（一次一条；不按「已配置」徽章决定——徽章可能滞后；「尚未配置」静默，其余失败在弹窗内显示原因并可点眼睛重试；回填后保存按钮禁用，避免原样重写触发重检），点眼睛在掩码 / 明文间切换（**纯本地即时切换**：不改 `revealing` 之外的状态、不等待回读、读回在飞时也不禁用；**入口绑 `pointerdown` 而非 `click`**——弹窗入场动画期间按下与松开的落点会差开，`click` 会落到共同祖先甚至不派发，键盘 / 辅助技术仍走 `click`，两者用 700ms 时间戳互斥保证一次操作只翻一下；收起明文不清空；读回值回来后按当前模式呈现；读回中的提示只走输入框占位文案，不插入额外行、不改变弹窗高度），值仅组件内存、关弹窗即清出；弹窗具备 `role="dialog"` + Tab 焦点陷阱 + Esc 关闭与焦点归还）；付费白名单的模型输入框是**可编辑选择器**（`<input list>` + `<datalist>`），默认候选取 `state.models` 里该平台命名空间下的已知模型（去重排序，值只填模型 key、保留 key 自身的 `/`），不在候选里的模型仍可手动输入；跨平台拒绝只认「首段命中别家注册表平台 id」，不得按第一个 `/` 粗暴切前缀）、运行日志（`src/views/LogsView.vue`，经 `read_log` 只读拉取日志尾部，另可经 `clear_log` 两段式确认后截断 `opencode.log`——文件缺失视为已清空，不动 `opencode.log.previous`）、用量与额度（`src/views/UsageView.vue`，渲染 `status.json` 顶层 `usage`）、
   WorkBuddy 集成（`src/views/IntegrationView.vue`，只读展示配置定位与最近发布结果——WorkBuddy / CodeBuddy 的 `models.json` 与 DSH 的 profile patch 列表，唯一动作是复用既有 `import`；DSH 没有导入入口，检测到 profile 就随每次发布自动写入）、**提示词优化**（`src/views/PromptView.vue` + `src/core/prompt.js` + `src/core/promptSession.js`：固定本机 `WB · auto`；系统 / 用户提示词、7 个内置模板、版本链与迭代、占位符缺失 / 新增提示、「同一输入分别跑源提示词 / 当前版本」的对比测试；内容只存会话内存；与 AI 助手共用壳侧 AI 通道并互斥；提交有在飞互斥、500ms 前沿节流与逐次拒绝文案）、**AI 助手**（`src/views/AssistantView.vue` + `src/core/ai.js`：自然语言入口，只读工具立即执行、写入工具一律先作提案再逐条确认；大脑默认本机 `WB · auto`，也可切外部 OpenAI 兼容端点；端点 Key **只在会话内存**（见 `prefs.js` 的 `ai` 键白名单），**对话记录默认记在本机 IndexedDB**（`src/core/chatSession.js`，可在「设置」关掉、可「清空」；工具入参不落盘）；**模型就位前输入区整块禁用**，横幅给出原因与出路）、关于与更新（`src/views/AboutView.vue`，版本与数据目录只读 + **自动更新区**：启动后静默检查、发现新版本才出现更新条、由用户点「下载并安装」，进度百分比只在上游给出 `contentLength` 时显示，装完点「重启应用」经 `process.relaunch` 走 `ExitRequested` 的有界停止）。
   **禁止**再出现「规划中」标签、禁用占位或可点击却无响应的假入口。
@@ -512,9 +524,9 @@ start_backend
 
 | 项 | 值 | 来源 |
 |---|---|---|
-| 版本单一来源 | **1.3.16** | 根 `package.json` 的 `version` |
-| 壳工程同步落点 | **1.3.16** | `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `[package] version` |
-| 核心 crate 版本 | **1.3.16** | `src-tauri/core/Cargo.toml`（`wbbridge-core --version` 输出；随产品版本同步，`version:set`/`version:check` 均覆盖） |
+| 版本单一来源 | **1.3.20** | 根 `package.json` 的 `version` |
+| 壳工程同步落点 | **1.3.20** | `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `[package] version` |
+| 核心 crate 版本 | **1.3.20** | `src-tauri/core/Cargo.toml`（`wbbridge-core --version` 输出；随产品版本同步，`version:set`/`version:check` 均覆盖） |
 
 > `status.json` 内写入的 `version` 是历史沿革值 `0.2.0`，**不属版本落点**，不得在无用户指令的情况下静默改动（见「关键常量」）。
 

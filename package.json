@@ -1,8 +1,8 @@
 {
   "name": "wb-bridge",
-  "version": "1.3.16",
+  "version": "1.3.20",
   "private": true,
-  "description": "WB Bridge — 基于 Tauri 的跨平台桌面应用，通过隔离的 OpenCode 为 WorkBuddy 提供免费模型",
+  "description": "WB Bridge — 基于 Tauri 的跨平台桌面应用，为各类 AI 工具接入多平台的免费与付费模型",
   "type": "module",
   "engines": {
     "node": ">=24"

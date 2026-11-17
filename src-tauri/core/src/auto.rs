@@ -4,18 +4,21 @@
 //! 选出该用哪个模型的全限定 id」。选中之后的链路（`prepare` → `backend` → `record`）一字不改，
 //! 因此被选中模型的失败仍走既有判决（`orchestration.rs::record` 的 `validated.remove`）。
 //!
-//! 选择偏好由**速度权重**决定：探测成功时按耗时定权（[`probe_weight`]），真实请求过慢时扣分
-//! （[`decayed_weight`]），选档取同档候选里权重最高者（[`select_weighted_with`]）。权重本身存在
-//! `status.json` 的 `modelResults.<id>.weight`，本模块只提供纯函数，读写与「归零后重检」在编排层。
+//! 选择偏好由**速度权重**决定：探测成功时按耗时定权（[`probe_weight`]），真实请求过慢或超时
+//! 时扣分（[`decayed_weight`] / [`timeout_weight`]），选档取同档候选里权重最高者
+//! （[`select_weighted_with`]）。权重本身存在 `status.json` 的 `modelResults.<id>.weight`，
+//! 本模块只提供纯函数，读写与「归零后重检」在编排层。
 //!
 //! 三条设计约束（详见 `docs/plans/2026-10-10-wb-auto-smart-router.md` §2）：
 //! 1. 返回值必须是**全限定 id**（如 `opencode/glm-4.7-flash-free`），不能是面板用的 client id
 //!    （`OC · 名称`）——记账键与实际模型必须是同一个值，否则失败判决打在假键上。
 //! 2. 能力谓词一律按「缺键即 false」比较（`== Some(&json!(true))`），与
-//!    `backend.rs::free_models_in` 归一出来的 `images` / `toolcall` 布尔值同形态。
-//! 3. 图片与工具混合请求单列一档：`prepare` 的两个闸门（图片 → 400 `unsupported_content`，
-//!    chatOnly 带 tools → 400 `tools_not_supported`）都是**服务端本地拒绝**，选错档位会让
-//!    「带截图 + 带工具定义」这种常见 agent 请求注定 400。
+//!    `backend.rs::free_models_in` 归一出来的 `images` / `video` / `toolcall` 布尔值同形态。
+//! 3. 请求要求的能力（图片 / 视频 / 工具）按**子集判定**过滤候选：`prepare` 的各道闸门
+//!    （图片/视频 → 400 `unsupported_content`，chatOnly 带 tools → 400 `tools_not_supported`）
+//!    都是**服务端本地拒绝**，选错档位会让「带截图 + 带工具定义」这种常见 agent 请求注定 400。
+//!    图片与视频同走 `image_url` 通道（OpenAI 兼容层没有独立的视频 part），按 data URL 的
+//!    mime 前缀分流（[`has_images`] / [`has_videos`]）。
 //! 4. 带推理档位的请求再叠一层档位过滤（[`accepts_effort`]，与 `prepare` 的
 //!    `unsupported_reasoning_effort` 判决同源）：DSH 里选中的档位随请求进来，自动路由若落到
 //!    没有该 variant 的模型上，就是一个注定 400 的落点。
@@ -27,8 +30,12 @@ use serde_json::{json, Value};
 /// 对外暴露的唯一字面量：客户端把 `model` 配成它即可获得自动路由。
 pub const AUTO_MODEL_ID: &str = "WB · auto";
 
-/// 请求是否携带图片：任一 message 的 `content` 是数组且含 `type == "image_url"` 的 part。
-/// 字符串 content 恒为 false —— 与 `prepare` 的多模态解析同形态（`protocol.rs` 的 content 分支）。
+/// 请求是否携带图片：任一 message 的 `content` 是数组且含 `type == "image_url"` 的 part，
+/// 且该 part 的 `url` **不是**视频 data URL——OpenAI 兼容层没有独立的视频 part 形态，视频与图片
+/// 同走 `image_url` 通道（`protocol.rs::prepare` 按 data URL 的 mime 前缀分流），不排除
+/// `data:video/` 的话纯视频请求会被误当成图片档去选模型。`url` 缺失 / 非字符串仍按图片计：
+/// 那种 part 在 `prepare` 里落进图片报错路径，选择器要与该判决一致。字符串 content 恒为 false
+/// —— 与 `prepare` 的多模态解析同形态（`protocol.rs` 的 content 分支）。
 pub fn has_images(messages: &[Value]) -> bool {
     messages.iter().any(|message| {
         message
@@ -37,6 +44,32 @@ pub fn has_images(messages: &[Value]) -> bool {
             .is_some_and(|parts| {
                 parts.iter().any(|part| {
                     part.get("type").and_then(Value::as_str) == Some("image_url")
+                        && !part
+                            .get("image_url")
+                            .and_then(|image| image.get("url"))
+                            .and_then(Value::as_str)
+                            .is_some_and(|url| url.starts_with("data:video/"))
+                })
+            })
+    })
+}
+
+/// 请求是否携带视频：任一 `image_url` part 的 `url` 是以 `data:video/` 开头的字符串。
+/// 只按前缀分流、不在这里校验容器格式——mime 是否受支持由 `prepare` 的
+/// `parse_video_data_url` 判决，选档层只需要知道「这是视频请求」。
+pub fn has_videos(messages: &[Value]) -> bool {
+    messages.iter().any(|message| {
+        message
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    part.get("type").and_then(Value::as_str) == Some("image_url")
+                        && part
+                            .get("image_url")
+                            .and_then(|image| image.get("url"))
+                            .and_then(Value::as_str)
+                            .is_some_and(|url| url.starts_with("data:video/"))
                 })
             })
     })
@@ -55,32 +88,102 @@ fn flag(model: &Value, key: &str) -> bool {
     model.get(key) == Some(&json!(true))
 }
 
-/// 按请求内容判定单个候选模型是否合格。
-fn fits(model: &Value, images: bool, tools: bool) -> bool {
+/// 按请求内容判定单个候选模型是否合格：**子集判定**——请求要求的每一项能力（图片 / 视频 /
+/// 工具），模型的对应能力位都必须为真（缺键即 false，与 [`flag`] 同源）。子集写法与旧的
+/// `images`/`tools` 组合真值表逐字节等价（不要求的项不设门槛），只是把视频这一维并进来。
+fn fits(model: &Value, images: bool, videos: bool, tools: bool) -> bool {
     if flag(model, "chatOnly") {
-        // chatOnly 模型没有工具能力（`prepare` 会当场 400），只能服务不含 tools 的请求。
+        // chatOnly 模型没有工具能力（`prepare` 会当场 400），只能服务不含 tools 的请求；
+        // 其余能力位不参与判定（与旧实现一致，chatOnly 条目按该分支短路）。
         return !tools;
     }
-    if images && tools {
-        return flag(model, "images") && flag(model, "toolcall");
-    }
-    if images {
-        return flag(model, "images");
-    }
-    if tools {
-        return flag(model, "toolcall");
-    }
-    true
+    (!images || flag(model, "images"))
+        && (!videos || flag(model, "video"))
+        && (!tools || flag(model, "toolcall"))
 }
 
-/// 池里是否存在**能接工具调用请求**的候选（即 `fits(model, false, true)` 为真）。
+/// 池里是否存在**能接工具调用请求**的候选（即 `fits(model, false, false, true)` 为真）。
 ///
 /// 唯一的消费者是插件配置里那条 `WB · auto` 的 `supportsToolCall`（`sync.rs::auto_entry`）：
 /// 全池都是 chatOnly 时把该字段写成 true，插件就会按工具形态发请求，而工具档没有候选 → 按 D3
 /// 退回全池 → 落到 chatOnly 上被 `prepare` 当场 400，这条别名于是恒定失败。声明口径必须与
 /// 选择器的档位谓词同源，否则「插件以为能给」和「核心选得出」会分叉。
 pub fn any_tool_capable(models: &[Value]) -> bool {
-    models.iter().any(|model| fits(model, false, true))
+    models.iter().any(|model| fits(model, false, false, true))
+}
+
+/// 池里是否存在**能接图片请求**的候选：声明口径与 `prepare` 的图片闸门同源——模型声明
+/// `images == true` 就能接住（chatOnly 条目同样适用，`prepare` 的图片路径先于 chatOnly 分支）。
+///
+/// 唯一的消费者是插件配置里那条 `WB · auto` 的 `supportsImages`（`sync.rs::auto_entry`）。
+/// 刻意**不走** [`fits`] 的 chatOnly 短路：路由的图片档放行 chatOnly 条目（旧真值表冻结的行为），
+/// 但未声明 `images` 的模型随后必被 `prepare` 判 400 `unsupported_content`——把短路的 true
+/// 声明出去就是「声明了却没有落点」，正是 [`any_tool_capable`] 文档警告的那类恒定失败入口。
+/// 统计域由调用方决定（生产链传剔除付费后的免费池）。
+pub fn any_image_capable(models: &[Value]) -> bool {
+    models.iter().any(|model| flag(model, "images"))
+}
+
+/// 池里是否存在**能接视频请求**的候选：与 [`any_image_capable`] 同法，声明口径与 `prepare`
+/// 的视频闸门同源（`video == true` 即能接住，chatOnly 条目同样适用）。
+///
+/// 唯一的消费者是插件配置里那条 `WB · auto` 的 `supportsVideo`（`sync.rs::auto_entry`）。
+/// 统计域由调用方决定（生产链传剔除付费后的免费池）。
+pub fn any_video_capable(models: &[Value]) -> bool {
+    models.iter().any(|model| flag(model, "video"))
+}
+
+/// `WB · auto` 在插件配置里的推理档位声明：池内各推理模型 `reasoning_efforts` 键集的并集。
+///
+/// 形态与逐模型条目的 [`crate::reasoning::work_buddy_reasoning`] 同形（WorkBuddy 消费的是同一套键）：
+/// - 池里没有 `reasoning == true` 的模型 → `{ supportsReasoning: false }`；
+/// - 并集里没有任何非 `none` 档（全是固定推理 / 仅 `none` 的模型）→ 复用
+///   [`crate::reasoning::work_buddy_reasoning`] 对「无可用档位」的形态：只声明会推理，
+///   不写 `defaultEffort`，`supportedEfforts` 为空；
+/// - 其余 → 完整块：`supportedEfforts` 按 [`crate::reasoning::EFFORT_LEVELS`] 顺序取并集（含 `none`），
+///   `defaultEffort` 优先 `medium`、否则首个非 `none` 档，`canDisableThinking` = 并集含 `none`，
+///   `onlyReasoning` 与逐模型 [`crate::reasoning::work_buddy_reasoning`] 同式（`!canDisableThinking`，
+///   并集不含 `none` 即「只推理」）——同一能力集在 `models.json` 里不得有两种说法。
+///
+/// 统计域由调用方决定（生产链传剔除付费后的免费池）：付费模型独有的档位不进并集，
+/// 否则插件会发出一个「选择器选不出落点」的档位请求——与 DSH 的 `auto_levels` 同一口径。
+/// 并集里的每一档都至少有一个免费模型能接住（`candidates` 按请求档位过滤），因此声明即可达。
+pub fn auto_reasoning(models: &[Value]) -> Value {
+    // 与 dsh.rs::auto_levels 同构：按 EFFORT_LEVELS 的既定顺序过滤出并集，而不是先收集合再排序。
+    let efforts_of: Vec<_> = models
+        .iter()
+        .filter(|model| flag(model, "reasoning"))
+        .map(crate::reasoning::reasoning_efforts)
+        .collect();
+    if efforts_of.is_empty() {
+        return json!({ "supportsReasoning": false });
+    }
+    let levels: Vec<&str> = crate::reasoning::EFFORT_LEVELS
+        .into_iter()
+        .filter(|level| {
+            efforts_of
+                .iter()
+                .any(|efforts| efforts.contains_key(*level))
+        })
+        .collect();
+    let enabled: Vec<&str> = levels.iter().copied().filter(|level| *level != "none").collect();
+    if enabled.is_empty() {
+        return json!({
+            "supportsReasoning": true,
+            "onlyReasoning": true,
+            "reasoning": { "supportedEfforts": [], "canDisableThinking": false },
+        });
+    }
+    let default_effort = if enabled.contains(&"medium") { "medium" } else { enabled[0] };
+    json!({
+        "supportsReasoning": true,
+        "onlyReasoning": !levels.contains(&"none"),
+        "reasoning": {
+            "supportedEfforts": levels,
+            "defaultEffort": default_effort,
+            "canDisableThinking": levels.contains(&"none"),
+        },
+    })
 }
 
 /// 没有权重记录时的默认权重（满分）。旧版 `status.json` 的 `modelResults` 没有 `weight`，
@@ -129,20 +232,36 @@ pub fn decayed_weight(current: u32, duration_ms: i64) -> u32 {
     }
 }
 
+/// 超时扣掉的权重：与一次慢请求同额。超时是「慢」的极端情况，用同一把尺子扣分；
+/// 模型没有被判成不可用（见 `orchestration.rs::record` 的 soft 分支），只是排序靠后。
+pub const TIMEOUT_PENALTY: u32 = SLOW_PENALTY;
+
+/// 一次超时扣权重，扣到 0 为止。
+pub fn timeout_weight(current: u32) -> u32 {
+    current.saturating_sub(TIMEOUT_PENALTY)
+}
+
 /// 一次结果对权重的更新。**必须在状态锁内调用**（基于上一份权重计算），否则并发请求
 /// 各自读旧值再写回会丢掉扣分。
 ///
 /// - 探测成功：按本次耗时重新定权（手工「重新检测」也因此能重新分配权重）；
 /// - 真实请求成功：慢请求扣分；
-/// - 失败与其它来源：保持原权重（`None` 表示该模型还没有权重记录）。
+/// - 超时（探测或真实请求）：按 [`TIMEOUT_PENALTY`] 扣分——超时不是「坏」，是「慢」；
+/// - 其余失败与其它来源：保持原权重（`None` 表示该模型还没有权重记录）。
 pub fn next_weight(
     current: Option<u32>,
     ok: bool,
     source: &str,
     duration_ms: i64,
+    timed_out: bool,
 ) -> Option<u32> {
     if !ok {
-        return current;
+        // 失败不重定权，只有超时例外：它表达的是「慢」，正好是权重该反映的维度。
+        return if timed_out {
+            Some(timeout_weight(current.unwrap_or(DEFAULT_WEIGHT)))
+        } else {
+            current
+        };
     }
     match source {
         "probe" => Some(probe_weight(duration_ms)),
@@ -185,8 +304,11 @@ pub fn requested_effort(body: &Value) -> Option<&str> {
 }
 
 /// 模型能否接住该档位——镜像 `protocol::prepare` 的三条判决：必须声明 `reasoning`；
-/// 有 variant 时只认 variant 覆盖的档位；没有 variant 的固定推理模型认
+/// 有 variant 时只认 variant 覆盖的档位；`variants` 键数为 0 的固定推理模型认
 /// [`DEFAULT_EFFORTS`]（WorkBuddy 对这类模型固定带 high 兜底，走的正是这条免除路径）。
+/// 豁免的第三个条件必须连「没有任何 variants 键」一起判——`variants` 非空但全部被禁用 /
+/// 缺合法 `reasoningEffort` 时 `reasoning_efforts` 也是空 map，而 `prepare` 对那种模型不给豁免
+///（判 400 `unsupported_reasoning_effort`），路由放行就会把带档位的请求送进注定 400 的落点。
 fn accepts_effort(model: &Value, effort: &str) -> bool {
     if !flag(model, "reasoning") {
         return false;
@@ -195,7 +317,7 @@ fn accepts_effort(model: &Value, effort: &str) -> bool {
     if efforts.contains_key(effort) {
         return true;
     }
-    efforts.is_empty() && DEFAULT_EFFORTS.contains(&effort)
+    crate::json::key_count(model.get("variants")) == 0 && DEFAULT_EFFORTS.contains(&effort)
 }
 
 /// 按请求内容筛出候选集（能力档位与推理档位，见模块头注释第 3、4 条）。候选层为空时退回全池。
@@ -206,12 +328,13 @@ fn candidates<'a>(body: &Value, pool: &'a [Value]) -> Vec<&'a Value> {
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     let images = has_images(messages);
+    let videos = has_videos(messages);
     let tools = has_tools(body);
     let effort = requested_effort(body);
 
     let matching: Vec<&Value> = pool
         .iter()
-        .filter(|model| fits(model, images, tools))
+        .filter(|model| fits(model, images, videos, tools))
         .filter(|model| effort.is_none_or(|name| accepts_effort(model, name)))
         .collect();
     // 退全池而非「报一个专用错误」：与用户手动选到能力不匹配的模型时的行为保持一致。
@@ -691,21 +814,52 @@ mod tests {
         assert_eq!(decayed_weight(20, SLOW_REQUEST_MS), 0);
         assert_eq!(decayed_weight(10, SLOW_REQUEST_MS), 0, "扣到 0 为止，不回负");
 
-        assert_eq!(next_weight(Some(100), true, "request", 5_000), Some(100));
-        assert_eq!(next_weight(Some(100), true, "request", 45_000), Some(80));
-        assert_eq!(next_weight(None, true, "request", 45_000), Some(80), "旧数据缺权重按满分起步");
-        assert_eq!(next_weight(Some(80), false, "request", 45_000), Some(80), "失败不改变权重");
-        assert_eq!(next_weight(None, false, "request", 45_000), None, "没有历史权重就不凭空造");
+        assert_eq!(next_weight(Some(100), true, "request", 5_000, false), Some(100));
+        assert_eq!(next_weight(Some(100), true, "request", 45_000, false), Some(80));
+        assert_eq!(
+            next_weight(None, true, "request", 45_000, false),
+            Some(80),
+            "旧数据缺权重按满分起步"
+        );
+        assert_eq!(
+            next_weight(Some(80), false, "request", 45_000, false),
+            Some(80),
+            "失败不改变权重"
+        );
+        assert_eq!(
+            next_weight(None, false, "request", 45_000, false),
+            None,
+            "没有历史权重就不凭空造"
+        );
+    }
+
+    /// 超时是「慢」的极端情况：降权而不是判死。缺历史权重时按满分起步扣分，
+    /// 扣到 0 为止不回负；与慢请求同额，连续 5 次超时归零。
+    #[test]
+    fn timeouts_lower_the_weight_instead_of_being_ignored() {
+        assert_eq!(timeout_weight(100), 80);
+        assert_eq!(timeout_weight(10), 0, "扣到 0 为止，不回负");
+        assert_eq!(next_weight(Some(100), false, "request", 60_000, true), Some(80));
+        assert_eq!(
+            next_weight(Some(100), false, "probe", 60_000, true),
+            Some(80),
+            "探测超时同样降权"
+        );
+        assert_eq!(
+            next_weight(None, false, "request", 60_000, true),
+            Some(80),
+            "缺历史权重时按满分起步再扣分"
+        );
     }
 
     /// 探测成功按本次耗时**重新定权**（即使上一份权重更高也会被覆盖），这是「重新分配权重」。
     #[test]
     fn a_successful_probe_reassigns_the_weight_from_its_own_latency() {
-        assert_eq!(next_weight(Some(20), true, "probe", 1_000), Some(100));
-        assert_eq!(next_weight(Some(100), true, "probe", 15_000), Some(40));
-        assert_eq!(next_weight(None, true, "probe", 12_000), Some(40));
+        assert_eq!(next_weight(Some(20), true, "probe", 1_000, false), Some(100));
+        assert_eq!(next_weight(Some(100), true, "probe", 15_000, false), Some(40));
+        assert_eq!(next_weight(None, true, "probe", 12_000, false), Some(40));
         // 探测失败保持原值：模型这次没通过，权重不参与选择，等下次通过再重定。
-        assert_eq!(next_weight(Some(60), false, "probe", 1_000), Some(60));
+        assert_eq!(next_weight(Some(60), false, "probe", 1_000, false), Some(60));
     }
 
     /// 「全池为 0」只在池非空时成立；缺 `weight` 的旧条目按满分处理，不能把旧状态误判成耗尽。
@@ -783,5 +937,288 @@ mod tests {
         let pool = vec![weighted("opencode/a", 100, false, false, false)];
         let got = select_weighted_with(&body(AUTO_MODEL_ID, json!("hi"), Value::Null), &pool, |_| None);
         assert_eq!(got, None);
+    }
+
+    // ------------------------------------------------------------------
+    // 视频档位与别名能力声明（2026-11-17：视频端到端 + 免费池如实声明）
+    // ------------------------------------------------------------------
+
+    /// 带视频能力位的池条目：`video` 与 `images` / `toolcall` 同形态（缺键即 false）。
+    fn video_entry(id: &str, video: bool, images: bool, toolcall: bool, chat_only: bool) -> Value {
+        json!({
+            "id": id,
+            "video": video,
+            "images": images,
+            "toolcall": toolcall,
+            "chatOnly": chat_only,
+        })
+    }
+
+    /// 视频走 `image_url` 通道进来，按 data URL 前缀分流：只有 `data:video/` 前缀算视频，
+    /// 图片 URL、https URL、缺失 url 与非 image_url part 都不算。
+    #[test]
+    fn has_videos_reads_only_video_data_urls_in_image_url_parts() {
+        assert!(has_videos(&[json!({
+            "content": [{ "type": "image_url", "image_url": { "url": "data:video/mp4;base64,AAAA" } }]
+        })]));
+        assert!(
+            !has_videos(&[json!({
+                "content": [{ "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } }]
+            })]),
+            "图片 data URL 不是视频"
+        );
+        assert!(
+            !has_videos(&[json!({
+                "content": [{ "type": "image_url", "image_url": { "url": "https://example.com/a.mp4" } }]
+            })]),
+            "非 data URL 的引用不得当成内联视频"
+        );
+        assert!(!has_videos(&[json!({ "content": [{ "type": "image_url" }] })]), "缺失 url 不算视频");
+        assert!(!has_videos(&[json!({ "content": [{ "type": "text", "text": "x" }] })]));
+        assert!(!has_videos(&[json!({ "content": "视频呢？" })]), "字符串 content 恒为无视频");
+
+        // 视频与图片混在一个请求里：两个谓词同时为真。
+        let mixed = [json!({ "content": [
+            { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+            { "type": "image_url", "image_url": { "url": "data:video/webm;base64,AAAA" } },
+        ] })];
+        assert!(has_videos(&mixed));
+        assert!(has_images(&mixed));
+    }
+
+    /// 纯视频请求不得被当成图片请求选模型；url 缺失 / 非字符串仍按图片计（落 prepare 的图片报错路径）。
+    #[test]
+    fn has_images_excludes_video_data_urls_but_keeps_missing_urls() {
+        let video = json!([{ "type": "image_url", "image_url": { "url": "data:video/mp4;base64,AAAA" } }]);
+        assert!(!has_images(&[json!({ "content": video })]), "纯视频请求不算图片请求");
+        assert!(
+            has_images(&[json!({ "content": [{ "type": "image_url" }] })]),
+            "url 缺失仍按图片计（与 prepare 的图片报错路径一致）"
+        );
+        assert!(
+            has_images(&[json!({
+                "content": [{ "type": "image_url", "image_url": { "url": 42 } }]
+            })]),
+            "url 非字符串仍按图片计"
+        );
+    }
+
+    /// 视频档路由：视频请求只落在声明了 video 的模型上；视频+tools、视频+images 的组合
+    /// 请求要求候选同时声明两个能力位（子集判定）。
+    #[test]
+    fn video_requests_select_models_that_declare_video_input() {
+        let pool = vec![
+            video_entry("opencode/video", true, false, false, false),
+            video_entry("opencode/video-tools", true, false, true, false),
+            video_entry("opencode/video-images", true, true, false, false),
+            video_entry("opencode/vision", false, true, false, false),
+        ];
+        let video_part = json!([{ "type": "image_url", "image_url": { "url": "data:video/mp4;base64,AAAA" } }]);
+        let got = select_with(&body(AUTO_MODEL_ID, video_part.clone(), Value::Null), &pool, first);
+        assert_eq!(got.as_deref(), Some("opencode/video"), "纯视频请求只落 video 模型");
+
+        let tools = json!([{ "type": "function", "function": { "name": "run" } }]);
+        let got = select_with(&body(AUTO_MODEL_ID, video_part.clone(), tools.clone()), &pool, first);
+        assert_eq!(
+            got.as_deref(),
+            Some("opencode/video-tools"),
+            "视频+工具的候选必须同时声明两个能力位"
+        );
+
+        let image_and_video = json!([
+            { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+            { "type": "image_url", "image_url": { "url": "data:video/mp4;base64,AAAA" } },
+        ]);
+        let got = select_with(&body(AUTO_MODEL_ID, image_and_video, Value::Null), &pool, first);
+        assert_eq!(
+            got.as_deref(),
+            Some("opencode/video-images"),
+            "图片+视频的组合候选必须同时声明两个能力位"
+        );
+
+        // 与其它档同一规矩：视频档候选为空时退全池，判决交回 prepare。
+        let only_images = vec![video_entry("opencode/vision", false, true, false, false)];
+        let got = select_with(&body(AUTO_MODEL_ID, video_part, Value::Null), &only_images, first);
+        assert_eq!(got.as_deref(), Some("opencode/vision"), "视频档无候选时退回全池而不是报新错");
+    }
+
+    /// 生产链把 `free_pool()` 的结果交给 any_*_capable：付费条目再全能也不为别名点亮任何声明。
+    #[test]
+    fn a_paid_only_pool_reports_no_capabilities_for_the_alias() {
+        let pool = vec![json!({
+            "id": "vendor/paid",
+            "images": true,
+            "video": true,
+            "toolcall": true,
+            "chatOnly": false,
+            "paid": true,
+        })];
+        let free = free_pool(&pool);
+        assert!(free.is_empty(), "付费-only 的池剔除后为空");
+        assert!(!any_tool_capable(&free));
+        assert!(!any_image_capable(&free));
+        assert!(!any_video_capable(&free));
+        // 对照组：同一条目转为免费后三个能力位如实点亮。
+        let turned_free = vec![json!({
+            "id": "vendor/paid", "images": true, "video": true, "toolcall": true, "chatOnly": false,
+        })];
+        assert!(any_tool_capable(&turned_free));
+        assert!(any_image_capable(&turned_free));
+        assert!(any_video_capable(&turned_free));
+    }
+
+    /// 推理档位并集：按 EFFORT_LEVELS 顺序（none 在首位）、medium 是首选默认档、含 none 即可关思考。
+    #[test]
+    fn auto_reasoning_unions_the_pool_efforts_in_canonical_order() {
+        let pool = vec![
+            entry("opencode/plain", false, false, false),
+            reasoning_entry("opencode/a", &["high"]),
+            reasoning_entry("opencode/b", &["none", "low"]),
+            reasoning_entry("opencode/c", &["medium", "max"]),
+        ];
+        assert_eq!(
+            auto_reasoning(&pool),
+            json!({
+                "supportsReasoning": true,
+                "onlyReasoning": false,
+                "reasoning": {
+                    "supportedEfforts": ["none", "low", "medium", "high", "max"],
+                    "defaultEffort": "medium",
+                    "canDisableThinking": true,
+                },
+            }),
+            "并集按 EFFORT_LEVELS 顺序排列，medium 是首选默认档"
+        );
+
+        // 并集里没有 medium 时取首个非 none 档。
+        let no_medium = vec![reasoning_entry("opencode/a", &["low", "none"])];
+        let declared = auto_reasoning(&no_medium);
+        assert_eq!(declared["reasoning"]["supportedEfforts"], json!(["none", "low"]));
+        assert_eq!(declared["reasoning"]["defaultEffort"], json!("low"));
+        assert_eq!(declared["reasoning"]["canDisableThinking"], json!(true));
+    }
+
+    /// 池里没有推理模型（含空池）→ 只声明 `supportsReasoning: false`。
+    #[test]
+    fn auto_reasoning_without_any_reasoning_model_stays_flat() {
+        assert_eq!(
+            auto_reasoning(&[entry("opencode/plain", false, false, false)]),
+            json!({ "supportsReasoning": false })
+        );
+        assert_eq!(auto_reasoning(&[]), json!({ "supportsReasoning": false }), "空池（付费-only 发布集）同样没有推理档位");
+    }
+
+    /// 并集里没有任何非 none 档（固定推理 / 仅 none 的模型）→ 复用 work_buddy_reasoning
+    /// 的「只推理」形态，不写 defaultEffort。
+    #[test]
+    fn auto_reasoning_without_usable_levels_declares_only_reasoning() {
+        let pool = vec![
+            json!({ "id": "opencode/fixed", "reasoning": true, "variants": {} }),
+            reasoning_entry("opencode/off", &["none"]),
+            entry("opencode/plain", false, false, false),
+        ];
+        assert_eq!(
+            auto_reasoning(&pool),
+            json!({
+                "supportsReasoning": true,
+                "onlyReasoning": true,
+                "reasoning": { "supportedEfforts": [], "canDisableThinking": false },
+            })
+        );
+    }
+
+    /// 生产链传的是 `free_pool()` 后的免费池：付费模型独有的档位不进并集
+    /// （口径镜像 dsh.rs::reasoning_levels_are_declared_per_model_and_unioned_on_auto）。
+    #[test]
+    fn auto_reasoning_never_lets_paid_models_donate_levels() {
+        let pool = vec![
+            entry("opencode/plain", false, false, false),
+            reasoning_entry("opencode/free-low", &["low"]),
+            {
+                let mut paid = reasoning_entry("opencode/paid-max", &["max"]);
+                paid["paid"] = json!(true);
+                paid
+            },
+        ];
+        let declared = auto_reasoning(&free_pool(&pool));
+        assert_eq!(
+            declared["reasoning"]["supportedEfforts"],
+            json!(["low"]),
+            "max 只在付费模型上，不得进并集"
+        );
+        assert_eq!(declared["reasoning"]["defaultEffort"], json!("low"));
+    }
+
+    /// 并集不含 none（全是有 variant 但没有 off 档的推理模型）时，`onlyReasoning` 必须与
+    /// 逐模型条目同式（= !canDisableThinking）：同一能力集在 models.json 里不得有两种说法。
+    #[test]
+    fn auto_reasoning_without_none_in_the_union_declares_only_reasoning() {
+        let pool = vec![reasoning_entry("opencode/a", &["low", "high"])];
+        let declared = auto_reasoning(&pool);
+        assert_eq!(declared["onlyReasoning"], json!(true), "并集不含 none 即「只推理」，与逐模型同式");
+        assert_eq!(declared["reasoning"]["canDisableThinking"], json!(false));
+        // 逐模型条目对同一能力集给出的是同一个值（同源语义，评审钉住的一致性）。
+        let per_model = crate::reasoning::work_buddy_reasoning(&pool[0]);
+        assert_eq!(declared["onlyReasoning"], per_model["onlyReasoning"]);
+        // 对照：并集含 none 时两者同为 false（unions 测试钉过完整块）。
+        let with_none = vec![reasoning_entry("opencode/b", &["none", "low"])];
+        assert_eq!(
+            auto_reasoning(&with_none)["onlyReasoning"],
+            crate::reasoning::work_buddy_reasoning(&with_none[0])["onlyReasoning"]
+        );
+    }
+
+    /// 豁免只给没有任何 variants 键的固定推理模型：variants 非空但全部被禁用 / 缺合法
+    /// reasoningEffort 时 `prepare` 判 400，路由不得把带档位的请求改写到那种模型上。
+    #[test]
+    fn disabled_variants_deny_the_default_efforts_exemption() {
+        let broken = json!({
+            "id": "opencode/broken",
+            "reasoning": true,
+            "variants": { "thinking": {} },
+        });
+        let disabled = json!({
+            "id": "opencode/disabled",
+            "reasoning": true,
+            "variants": { "max": { "reasoningEffort": "max", "disabled": true } },
+        });
+        let compatible = reasoning_entry("opencode/high", &["high"]);
+        let pool = vec![broken, disabled, compatible];
+        let mut request = body(AUTO_MODEL_ID, json!("hi"), Value::Null);
+        request["reasoning_effort"] = json!("high");
+        let mut domain = None;
+        let got = select_with(&request, &pool, |n| {
+            domain = Some(n);
+            Some(0)
+        });
+        assert_eq!(
+            got.as_deref(),
+            Some("opencode/high"),
+            "带档位的请求只落在能接住的模型上，豁免不得把空转 variants 的模型放进候选"
+        );
+        assert_eq!(domain, Some(1), "候选层只剩 variants 真正覆盖 high 的那一个");
+    }
+
+    /// 免费池只有 chatOnly 条目（无 images/video 声明）时不得声明视觉能力：路由的图片档
+    /// 虽放行 chatOnly，但 `prepare` 随后必判 400 `unsupported_content`——这正是
+    /// any_tool_capable 文档警告的「声明了却没有落点」。声明位真实存在时（chatOnly + 声明）
+    /// 仍如实点亮：prepare 的图片/视频闸门对 chatOnly 条目同样只看声明位。
+    #[test]
+    fn a_chat_only_pool_declares_no_vision_capabilities() {
+        let chat = vec![
+            json!({ "id": "vendor/a", "chatOnly": true }),
+            json!({ "id": "vendor/b", "chatOnly": true, "images": false, "video": false }),
+        ];
+        assert!(!any_tool_capable(&chat), "工具维度本就诚实（!tools 短路恰好给出 false）");
+        assert!(!any_image_capable(&chat), "chatOnly 短路不得把视觉声明成 true");
+        assert!(!any_video_capable(&chat), "chatOnly 短路不得把视频声明成 true");
+
+        // chatOnly 条目真实声明了能力位时仍可点亮（prepare 对它只看声明位）。
+        let chat_vision = vec![
+            json!({ "id": "vendor/a", "chatOnly": true }),
+            json!({ "id": "vendor/b", "chatOnly": true, "images": true, "video": true }),
+        ];
+        assert!(any_image_capable(&chat_vision));
+        assert!(any_video_capable(&chat_vision));
     }
 }

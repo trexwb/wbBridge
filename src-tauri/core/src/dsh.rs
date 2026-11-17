@@ -795,4 +795,59 @@ mod tests {
         assert!(fs::read_to_string(&patch).unwrap().contains("http://127.0.0.1:42000/v1"));
         assert!(fs::read_to_string(&credentials).unwrap().contains("'key-2'"));
     }
+
+    /// 认不出的 patch 形态（inline 非空 providers）：`merge_patch` 必报错，`sync_profile` 随之失败。
+    fn broken_patch() -> &'static str {
+        "- id: llm-pi-ai\n  config:\n    providers: !!js ctx.get('x')\n"
+    }
+
+    // 🔴 多 profile 的失败上报口径：部分失败不算顶层失败（与 `sync.error` 的「有成功就不算
+    // 失败」同口径），但必须在 ok 报告里附带 `error`，失败面板才有得显示。
+    #[test]
+    fn sync_all_reports_partial_failure_as_ok_with_error() {
+        let scratch = Scratch::new("partial-fail");
+        let broken = scratch.write(".dsh/profiles/broken/cordis.patch.yml", broken_patch());
+        let healthy = scratch.write(".dsh/profiles/desktop/cordis.patch.yml", "# mine\n[]\n");
+        let home = scratch.home();
+        let env = env_of(&[]);
+
+        let report = sync_all(&env, &home, "http://127.0.0.1:41980/v1", "key-1", &models());
+        assert_eq!(report["status"], json!("ok"), "有 profile 成功就不算整体失败");
+        assert_eq!(report["profiles"], json!(1), "只数成功的 profile");
+        assert_eq!(report["count"], json!(models().len()));
+        assert_eq!(report["changed"], json!(true));
+        let error = report["error"].as_str().expect("部分失败必须附带原因");
+        assert!(
+            error.contains("broken") && error.starts_with("broken: "),
+            "原因要能定位到失败的 profile：{error}"
+        );
+        assert!(
+            fs::read_to_string(&healthy).unwrap().contains("wbbridge:"),
+            "健康的 profile 照常写入"
+        );
+        assert!(
+            !fs::read_to_string(&broken).unwrap().contains("wbbridge:"),
+            "失败的 profile 不产生半成品写入"
+        );
+    }
+
+    // 全部 profile 失败 → 整体报 error：面板的逐目标 error 行与它对应，绝不能伪装成 ok。
+    #[test]
+    fn sync_all_reports_error_when_every_profile_fails() {
+        let scratch = Scratch::new("all-fail");
+        scratch.write(".dsh/profiles/alpha/cordis.patch.yml", broken_patch());
+        scratch.write(".dsh/profiles/beta/cordis.patch.yml", broken_patch());
+        let home = scratch.home();
+        let env = env_of(&[]);
+
+        let report = sync_all(&env, &home, "http://127.0.0.1:41980/v1", "key-1", &models());
+        assert_eq!(report["status"], json!("error"));
+        let error = report["error"].as_str().expect("整体失败必须给出原因");
+        assert!(error.contains("alpha: ") && error.contains("beta: "), "逐 profile 汇总：{error}");
+        assert!(report.get("count").is_none() && report.get("profiles").is_none(), "失败报告不带计数");
+        assert!(
+            !scratch.root.join(".dsh/.credentials.yaml").exists(),
+            "全部失败时连凭据引用都不该被创建"
+        );
+    }
 }

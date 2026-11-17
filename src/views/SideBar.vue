@@ -53,11 +53,8 @@ const groups = [
     items: [
       { id: 'logs', icon: 'logs', label: '运行日志' },
       { id: 'usage', icon: 'usage', label: '用量与额度' },
+      { id: 'workbuddy', icon: 'workbuddy', label: '插件集成' },
     ],
-  },
-  {
-    title: '集成',
-    items: [{ id: 'workbuddy', icon: 'workbuddy', label: '插件集成' }],
   },
   {
     title: '其他',
@@ -78,7 +75,7 @@ const NAV_INDEX = new Map(groups.flatMap((group) => group.items).map((item, i) =
   <aside>
     <img class="brand-mark" :src="logo" alt="WB Bridge" aria-hidden="true">
     <h1>WB Bridge</h1>
-    <p class="tagline">让 WorkBuddy / CodeBuddy 连接 OpenCode 免费模型</p>
+    <p class="tagline">让各类 AI 工具连接多平台的免费与付费模型</p>
 
     <nav class="nav" aria-label="主导航">
       <section v-for="group in groups" :key="group.title" class="nav-group">
@@ -171,7 +168,7 @@ h1 { font-size: 20px; margin: 0 0 6px; letter-spacing: -.6px; }
 
 .nav { margin-top: 20px; overflow: auto; min-height: 0; padding-right: 2px; }
 .nav-group + .nav-group { margin-top: 16px; }
-/* 分组标题：左侧加一道短竖标，让「模型 / 运行 / 集成 / 其他」的分组边界一眼可见 */
+/* 分组标题：左侧加一道短竖标，让「模型 / 运行 / 其他」的分组边界一眼可见 */
 .nav-group-title {
   position: relative;
   font-size: 11px;

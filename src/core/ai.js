@@ -85,7 +85,7 @@ const TOOL_DEFS = [
     name: 'list_models',
     write: false,
     label: '列出模型',
-    description: '列出已发现的免费模型及其探测结果。只读，立即执行。',
+    description: '列出已发现的模型（含免费模型与白名单付费模型）及其探测结果。只读，立即执行。',
     parameters: {
       type: 'object',
       properties: {
@@ -115,7 +115,7 @@ const TOOL_DEFS = [
     name: 'provider_status',
     write: false,
     label: '读取平台配置',
-    description: '读取各免费模型平台的配置状态（是否已配置 / 是否免密直连，不回任何 Key 内容）。只读，立即执行。',
+    description: '读取各模型平台的配置状态（是否已配置 / 是否免密直连，不回任何 Key 内容）。只读，立即执行。',
     parameters: { type: 'object', properties: {} },
   },
   {
@@ -145,7 +145,7 @@ const TOOL_DEFS = [
     name: 'probe_models',
     write: true,
     label: '检测模型',
-    description: '向模型发送简短请求以检测可用性（会消耗少量免费额度）。写入类提案，需用户确认后执行。',
+    description: '向模型发送简短请求以检测可用性（免费模型消耗免费额度、付费白名单模型按平台标价计费）。写入类提案，需用户确认后执行。',
     parameters: {
       type: 'object',
       properties: {
@@ -340,9 +340,9 @@ export function buildSnapshot(state) {
 // ── system prompt ───────────────────────────────────────────────────
 export function buildSystemPrompt(snapshot = '') {
   return [
-    '你是 WB Bridge 控制面板的 AI 助手。WB Bridge 通过隔离的 OpenCode 运行时为 WorkBuddy / CodeBuddy /',
-    'DSH 提供免费模型：自动发现免费模型 → 逐模型探测 → 只把可用的导入插件配置。你既可以回答使用问题，',
-    '也可以通过工具帮用户管理它。',
+    '你是 WB Bridge 控制面板的 AI 助手。WB Bridge 通过隔离的 OpenCode 运行时与多平台接入，为各类 AI 工具与',
+    '插件提供免费模型与白名单付费模型：自动发现免费模型 → 逐模型探测 → 只把可用的导入插件配置。',
+    '你既可以回答使用问题，也可以通过工具帮用户管理它。',
     '',
     '【工具纪律】',
     '1. 只读工具（get_status / list_models / get_usage / read_log / provider_status /',
@@ -468,7 +468,7 @@ export function summarizeToolCall(name, args = {}) {
     case 'refresh_models':
       return '重新读取免费模型（重启隔离子进程）'
     case 'probe_models':
-      return source.model ? `检测模型 ${source.model}` : '检测全部模型（消耗少量免费额度）'
+      return source.model ? `检测模型 ${source.model}` : '检测全部模型（会消耗对应额度）'
     case 'import_models':
       return '导入可用模型到 WorkBuddy / CodeBuddy / DSH'
     case 'set_provider_key':
